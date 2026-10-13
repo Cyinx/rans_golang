@@ -1,0 +1,192 @@
+{
+  "messages": [
+    {
+      "name": "Alpha",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Ref",
+          "wiretype": "message"
+        }
+      ]
+    },
+    {
+      "name": "HistoryReply",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Items",
+          "wiretype": "sequence"
+        }
+      ]
+    },
+    {
+      "name": "Point",
+      "fields": [
+        {
+          "id": 1,
+          "name": "X",
+          "wiretype": "varint"
+        },
+        {
+          "id": 2,
+          "name": "Y",
+          "wiretype": "varint"
+        }
+      ]
+    },
+    {
+      "name": "Zeta",
+      "fields": [
+        {
+          "id": 1,
+          "name": "V",
+          "wiretype": "varint"
+        }
+      ]
+    },
+    {
+      "name": "chat.History",
+      "fields": []
+    },
+    {
+      "name": "chat.Say",
+      "fields": [
+        {
+          "id": 1,
+          "name": "M",
+          "wiretype": "message"
+        }
+      ]
+    },
+    {
+      "name": "chatMsg",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Text",
+          "wiretype": "string"
+        }
+      ]
+    },
+    {
+      "name": "counter.Add",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Delta",
+          "wiretype": "varint"
+        }
+      ]
+    },
+    {
+      "name": "counter.Bump",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Arg1",
+          "wiretype": "varint"
+        }
+      ]
+    },
+    {
+      "name": "counter.Ping",
+      "fields": []
+    },
+    {
+      "name": "counter.Put",
+      "fields": [
+        {
+          "id": 1,
+          "name": "To",
+          "wiretype": "varint"
+        }
+      ]
+    },
+    {
+      "name": "counter.Reset",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Val",
+          "wiretype": "varint"
+        },
+        {
+          "id": 2,
+          "name": "Who",
+          "wiretype": "string"
+        }
+      ]
+    },
+    {
+      "name": "serial.Shape",
+      "fields": [
+        {
+          "id": 1,
+          "name": "Label",
+          "wiretype": "string"
+        },
+        {
+          "id": 2,
+          "name": "Count",
+          "wiretype": "varint"
+        },
+        {
+          "id": 3,
+          "name": "Max",
+          "wiretype": "fixed64"
+        },
+        {
+          "id": 4,
+          "name": "Ratio",
+          "wiretype": "fixed64"
+        },
+        {
+          "id": 5,
+          "name": "On",
+          "wiretype": "varint"
+        },
+        {
+          "id": 6,
+          "name": "Blob",
+          "wiretype": "bytes"
+        },
+        {
+          "id": 7,
+          "name": "Origin",
+          "wiretype": "message"
+        },
+        {
+          "id": 8,
+          "name": "Tags",
+          "wiretype": "sequence"
+        },
+        {
+          "id": 9,
+          "name": "Coords",
+          "wiretype": "sequence"
+        },
+        {
+          "id": 10,
+          "name": "Flags",
+          "wiretype": "sequence"
+        },
+        {
+          "id": 11,
+          "name": "Matrix",
+          "wiretype": "sequence"
+        },
+        {
+          "id": 12,
+          "name": "Weights",
+          "wiretype": "sequence"
+        },
+        {
+          "id": 13,
+          "name": "Ids",
+          "wiretype": "sequence"
+        }
+      ]
+    }
+  ]
+}

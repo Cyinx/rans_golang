@@ -1,0 +1,21 @@
+bin/
+*.test
+*.out
+.idea/
+.vscode/
+.superpowers/
+.video_agent/
+.worktrees/
+
+# Phase 6 密钥材料不进 git（docs/decisions/2026-09-30-phase6-security.md）
+*.key
+redis.local.env
+
+# 内部过程文档：本地保留、不入公开仓库（2026-10-13 开源剥离）
+.scratch/
+docs/superpowers/
+docs/porting/
+docs/decisions/
+docs/ROADMAP.md
+docs/agents/
+docs/ISSUES.md
