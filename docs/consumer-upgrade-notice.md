@@ -1,13 +1,11 @@
-# rans_golang 消费方升级通知（v0.7.0 → v0.23.0 合并稿）
+# rans_golang 消费方升级通知（v0.7.0 → v0.24.0 合并稿）
 
 > 面向：wanju_agent_server 等所有 `github.com/cyinx/rans_golang` 消费方。
 > 用途：一次性转达 v0.7.0 起的全部消费方可见变更；逐版本细节以仓库
 > `CHANGELOG.md` 与 tag 注记为准。**尚未接入的消费方直接按 v0.22.0 接入，
 > 只需读「新接入」一节。**
 
-## v0.24.0 专项升级要点（edge 部件退役，破坏性变更）
-
-> tag 未打、未推远端（发布时机另拍）；消费方以 commit 为准验证。
+## v0.24.0 专项升级要点（edge 退役 + 全仓审查修复批，2026-10-13）
 
 **删了什么**：`edge` 包整体（WS 接入/会话/外部帧/EventHub/鉴权接口）、
 `internal/edgesrv`、`node.Config.Edge` 字段族、`Node.EdgeAddr()`、纯接入
@@ -31,6 +29,29 @@
 agent_server gateway-ingress 票 08）**零动作**——其全仓已无 `rans_golang/edge`
 import；删除不涉线协议（edge 帧不在 Go/Rust 互通面），内部集群调用、目录、
 迁移、排空、testkit 面全部不变。
+
+**修复批的破坏性面（2026-10-13 全仓审查后修复，编译期即可暴露）**：
+
+| v0.23.0 | v0.24.0 | 说明 |
+|---|---|---|
+| `node.LeaseConfig.MaxConcurrentDestroys` / `DestroyTimeout` | **删除** | 长期零消费、设置即静默 no-op 的死配置（止损销毁已是实例级串行 + 内部固定预算）——已核实消费方零使用 |
+| `node.New` 接受 nil 工厂 / 非法 kind 键 / `Calls.Max < Default` | **构造期报错** | 此前 nil 工厂可让一帧远端消息 panic 于 TCP 读循环崩进程；Max<Default 时 Default 绕过封顶 |
+| `node.NameHeartbeatLost` 常量 | 删除 | 从未注册的幽灵指标 |
+| 新增 `rans.ValidKindName` | 公共 API | kind 字符集判据正本出口（与 `NewID` 共用），装配期校验可复用 |
+
+**修复批的行为面（消费方零动作，线上自动受益）**：接管通知真实接线（误判
+接管双活窗口从无界回到毫秒级 + SelfFence 兜底）、OwnerAlive 读错误保守判活
+（Redis 抖动不再误抢实体）、交接窗终快照不再丢 ReenterAfter 续体写、
+checkpoint 簿记换代守卫、随迁包携带源纪元（失败迁移不再留可回滚的过期包，
+扩展块新字段同 VerMax 向后兼容旧端跳过）、启动窗口 epoch-0 实体迁移修复、
+目录收养分支返回值=落库值（inmem/redis 双实现一致，直用 directory 的消费方
+注意）、条件注销删节点粒度通配（漏填 Owner 从「删光该节点条目」变安全
+no-op）、本地 Tell 的 ReenterAfter 不再 panic、acceptLoop 对 EMFILE 退避
+重试、ransgen 病态输入生成期报错。
+
+**升级路径**：v0.22.0 起的断点纪律不变——**同集群双端同版本，升级先停全部
+再升**（本版含目录 Lua 行为变更，混版本对同一 epoch-0 条目行为分叉，同样
+受该纪律管辖）。
 
 ## v0.23.0 专项升级要点（HR4 调用语义 + HR5 规模项，2026-10-12）
 

@@ -46,7 +46,7 @@ func main() {
 
 	switch {
 	case *check != "":
-		res, err := runCheck(dirs, *check)
+		res, err := runCheck(dirs, *out, *check)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ransgen:", err)
 			os.Exit(1)
@@ -62,16 +62,14 @@ func main() {
 		}
 		fmt.Println("ransgen: schema check ok（线面对基线兼容）")
 	case *schemaOut != "":
-		if err := runSchema(dirs, *schemaOut); err != nil {
+		if err := runSchema(dirs, *out, *schemaOut); err != nil {
 			fmt.Fprintln(os.Stderr, "ransgen:", err)
 			os.Exit(1)
 		}
 	default:
-		for _, dir := range dirs {
-			if err := run(dir, *out); err != nil {
-				fmt.Fprintln(os.Stderr, "ransgen:", err)
-				os.Exit(1)
-			}
+		if err := runAll(dirs, *out); err != nil {
+			fmt.Fprintln(os.Stderr, "ransgen:", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -83,6 +81,10 @@ type genModel struct {
 	Messages []messageModel
 	Entities []entityModel
 	Shapes   []string // 消息形状清单（完整指纹形态）：字典序 "TypeName:Field:Order:Type"
+	// Decls 合并后的完整消息声明清单（用户消息 + 方法派生/改名请求，含
+	// 声明位置）：跨包 wire 名唯一性检查的数据面（Messages 是纯模板数据
+	// messageModel，不携带位置）。
+	Decls []MessageDecl
 }
 
 // Imports 生成物导入行清单（空串条目 = 分组间空行；std 组 → 本仓组）。
@@ -131,21 +133,23 @@ func planGen(pkg *PackageDecl) (*genModel, error) {
 		Messages: mms,
 		Entities: ents,
 		Shapes:   planShapes(msgs),
+		Decls:    msgs,
 	}, nil
 }
 
-// run 执行一次生成：解析 → 计划（类型门卫）→ 渲染 → 差异落盘。内容与现存
-// 文件一致时不写（mtime 保持，generate 幂等的落盘半边）；门卫失败返回
-// 错误（main 转非零退出）。
-func run(dir, out string) error {
+// planDir 单目录完整计划：解析（排除 -out 生成物，防派生请求二跑回扫）→
+// 计划（注解/类型门卫）。
+func planDir(dir, out string) (*genModel, error) {
 	pkg, err := LoadPackage(dir, out)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	model, err := planGen(pkg)
-	if err != nil {
-		return err
-	}
+	return planGen(pkg)
+}
+
+// writeModel 渲染落盘：内容与现存文件一致时不写（mtime 保持，generate
+// 幂等的落盘半边）。
+func writeModel(dir, out string, model *genModel) error {
 	content, err := Render(model, ransgenTemplate)
 	if err != nil {
 		return err
@@ -155,4 +159,59 @@ func run(dir, out string) error {
 		return nil
 	}
 	return os.WriteFile(path, content, 0o644)
+}
+
+// run 单目录生成：计划 → 渲染 → 差异落盘；门卫失败返回错误（main 转非零
+// 退出）。
+func run(dir, out string) error {
+	model, err := planDir(dir, out)
+	if err != nil {
+		return err
+	}
+	return writeModel(dir, out, model)
+}
+
+// runAll 多目录生成（main 的 generate 入口）：全部目录先计划（任何目录
+// 门卫失败即整体失败），再查跨包 wire 名唯一性，最后逐目录渲染落盘——
+// 检查先于一切落盘，失败即零产出。
+func runAll(dirs []string, out string) error {
+	models := make([]*genModel, 0, len(dirs))
+	for _, dir := range dirs {
+		model, err := planDir(dir, out)
+		if err != nil {
+			return err
+		}
+		models = append(models, model)
+	}
+	if err := checkWireNamesAcrossPackages(models); err != nil {
+		return err
+	}
+	for i, dir := range dirs {
+		if err := writeModel(dir, out, models[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkWireNamesAcrossPackages 跨包 wire 注册名唯一性（generate 模式的
+// 跨包判据，与 -schema 的 buildSchema 同一语义）：各包生成物的 init 都向
+// 全局 codec 注册表登记，同名消息漏过生成期就延迟到运行期 init panic；
+// 错误带双方声明位置（file:line），笔误现场不靠运行期栈回溯。
+func checkWireNamesAcrossPackages(models []*genModel) error {
+	seen := make(map[string]MessageDecl)
+	for _, model := range models {
+		for _, m := range model.Decls {
+			if prev, dup := seen[m.Name]; dup {
+				return fmt.Errorf(
+					"ransgen: duplicate wire message %q across packages (types %s at %s and %s at %s) — "+
+						"wire registration names must be unique across the -dir set: every package's "+
+						"generated init registers into the same codec registry and the clash would "+
+						"panic at runtime init",
+					m.Name, prev.TypeName, prev.Pos, m.TypeName, m.Pos)
+			}
+			seen[m.Name] = m
+		}
+	}
+	return nil
 }

@@ -22,6 +22,10 @@ const (
 	// ExtFieldCtx 登记键值对象（H10 决策 5/8）：重复项字段——每个在场项
 	// 是 {1=name, 2=value} 的嵌套对象，重复即多键（登记序逐项书写）。
 	ExtFieldCtx = 4
+	// ExtFieldSrcIncarnation 随迁包源纪元（varint）：源端落库快照时的围栏
+	// incarnation，收端恢复时与 Store 高水位比较、包旧弃包；缺位（旧端
+	// 发送方）按无版本处理，恢复退回包优先历史行为。
+	ExtFieldSrcIncarnation = 5
 )
 
 // causal 对象的嵌套字段号：1 = 根 trace（string），2 = 单跳哈希（varint，重复即路径序列）。
@@ -56,6 +60,11 @@ type RequestExt struct {
 	HasTraceID bool               //
 	Causal     *ctxkey.CausalPath // 因果路径（nil = 字段不写——Tell 形态）
 	Ctx        []CtxItem          // 登记键值项（登记序；nil = 字段不写）
+	// SrcIncarnation 随迁包源纪元（HasSrcIncarnation 为 false 的字段不写）：
+	// 源端落库快照时的围栏 incarnation，收端恢复时与 Store per-id 高水位
+	// 比较（包旧弃包落 Store 梯级）。
+	SrcIncarnation    uint64
+	HasSrcIncarnation bool
 }
 
 // EncodeRequestExt 编码扩展块对象体（field-tag，计数终结）：无任何在场
@@ -69,6 +78,9 @@ func EncodeRequestExt(e RequestExt) []byte {
 		fields++
 	}
 	if e.Causal != nil {
+		fields++
+	}
+	if e.HasSrcIncarnation {
 		fields++
 	}
 	fields += len(e.Ctx)
@@ -92,6 +104,10 @@ func EncodeRequestExt(e RequestExt) []byte {
 			w.WriteTag(ExtCausalHop, codec.WireVarInt)
 			w.WriteVarUInt(hop)
 		}
+	}
+	if e.HasSrcIncarnation {
+		w.WriteTag(ExtFieldSrcIncarnation, codec.WireVarInt) // 非负纪元走裸 varuint
+		w.WriteVarUInt(e.SrcIncarnation)
 	}
 	for _, it := range e.Ctx {
 		w.WriteTag(ExtFieldCtx, codec.WireMessage)
@@ -145,6 +161,11 @@ func DecodeRequestExt(ext []byte) (RequestExt, error) {
 			if it != nil {
 				out.Ctx = append(out.Ctx, *it)
 			}
+		case id == ExtFieldSrcIncarnation && wt == codec.WireVarInt:
+			if out.SrcIncarnation, err = r.ReadVarUInt(); err != nil {
+				return out, err
+			}
+			out.HasSrcIncarnation = true
 		default:
 			if err := r.SkipField(wt); err != nil {
 				return out, err

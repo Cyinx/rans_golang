@@ -14,8 +14,7 @@ import (
 // （节点成员键与逐实体租约分离：键在 ⟺ 节点可见、值=监听地址、TTL 续期、
 // 节点注销顺带清键；值=JSON{addr,kinds}，NodesByKind 按声明过滤——
 // 决策出处：docs/decisions/2026-10-02-node-membership-key.md、2026-10-05-node-key-kinds.md）。
-// newReg 以套件注入的短过期阈值构造全新成员面；节点注销子测试在实现
-// 同时提供 Browser 视图时执行（类型断言探测）。阻塞到全部子测试完成；
+// newReg 以套件注入的短过期阈值构造全新成员面。阻塞到全部子测试完成；
 // 测试编排面——仅测试进程内使用，非运行时路径。
 func RunNodeMembershipSuite(t *testing.T, newReg func(t *testing.T, hbTTL time.Duration) directory.NodeRegistry) {
 	ctx := t.Context() // 契约套件：ctx 随测试生命期
@@ -292,7 +291,7 @@ const nodeEpochSuiteTTL = 300 * time.Millisecond
 // RunNodeEpochMonotonicSuite 节点代际单调契约（H13 决策 20 前半）：取号全
 // 局单调；同节点号「注册 → 停（注销/判活键过期）→ 再注册」新代际严格更
 // 大；重注册全程携带同一代际（注册面不二次取号）；优雅停机注销路径不触
-// 碰计数器（提供 Browser 视图的实现加验）。newReg 以注入的短过期阈值构造
+// 碰计数器。newReg 以注入的短过期阈值构造
 // 全新成员面。阻塞到全部子测试完成；测试编排面——仅测试进程内使用，非
 // 运行时路径。
 func RunNodeEpochMonotonicSuite(t *testing.T, newReg func(t *testing.T, hbTTL time.Duration) directory.NodeRegistry) {
@@ -322,7 +321,7 @@ func RunNodeEpochMonotonicSuite(t *testing.T, newReg func(t *testing.T, hbTTL ti
 		if e, ok, err := d.NodeEpoch(ctx, 61); err != nil || !ok || e != e1 {
 			t.Fatalf("NodeEpoch(61) after re-register = (%d,%v,%v), want carried %d", e, ok, err, e1)
 		}
-		// 停：注销优先（优雅停机路径），无 Browser 视图的实现等判活键过期
+		// 停：注销优先（优雅停机路径——nodeDown 即时退出成员视图）
 		nodeDown(ctx, t, d, 61, hbTTL)
 		// 再注册：同节点号，新代际严格更大（全局计数器跨节点死亡存续）
 		e2, err := d.NextNodeEpoch(ctx)

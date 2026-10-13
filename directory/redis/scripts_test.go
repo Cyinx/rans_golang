@@ -10,9 +10,6 @@ import "testing"
 // 测试不读规格文件（规格可能移动/改版），以本文件常量为正本副本，
 // 与 scripts.go 的实现常量逐字符比对，防止实现被手抖改写。
 // 若规格语义需要变更，必须同时改这里与 scripts.go，并过契约套件。
-//
-// 批量归属校验（HeartbeatBatch）在键值 v3 下是纯读 pipeline（无 Lua 正
-// 本），其行为由 contract.RunLeaseSuite 锁定。
 const specLuaRegister = `-- luaRegister（注册/收养/接管原子域，单键四分支）：
 -- KEYS=[主键]  ARGV=[selfNode, selfEpoch, expNode(0=无期望), expEpoch, expInc]
 local v = redis.call('GET', KEYS[1])
@@ -25,7 +22,7 @@ end
 local sn = tonumber(ARGV[1])
 if cn ~= 0 and cn == sn and (ce == tonumber(ARGV[2]) or ce == 0) then
   local inc = ci + 1
-  redis.call('SET', KEYS[1], string.format('{"node":%d,"epoch":%d,"inc":%d,"v":3}', sn, ce, inc))
+  redis.call('SET', KEYS[1], string.format('{"node":%d,"epoch":%d,"inc":%d,"v":3}', sn, tonumber(ARGV[2]), inc))
   return {1, inc, 0, 0}
 end
 local en = tonumber(ARGV[3])
@@ -42,17 +39,15 @@ end
 return {0, cn, ce, ci}
 `
 
-const specLuaUnregister = `-- 条件注销为墓碑:三元（节点粒度模式 epoch/inc 通配）匹配才改写
+const specLuaUnregister = `-- 条件注销为墓碑:三元全等匹配才改写
 local v = redis.call('GET', KEYS[1])
 if not v then return 0 end
 local cn = tonumber(string.match(v, '"node":(%d+)')) or 0
 if cn == 0 or cn ~= tonumber(ARGV[1]) then return 0 end
 local ce = tonumber(string.match(v, '"epoch":(%d+)')) or 0
-local we = tonumber(ARGV[2])
-if we ~= 0 and ce ~= we then return 0 end
+if ce ~= tonumber(ARGV[2]) then return 0 end
 local ci = tonumber(string.match(v, '"inc":(%d+)')) or 0
-local wi = tonumber(ARGV[3])
-if wi ~= 0 and ci ~= wi then return 0 end
+if ci ~= tonumber(ARGV[3]) then return 0 end
 redis.call('SET', KEYS[1], string.format('{"node":0,"epoch":0,"inc":%d,"v":3}', ci))
 return 1
 `

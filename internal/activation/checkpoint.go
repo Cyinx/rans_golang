@@ -27,14 +27,16 @@ const checkpointSettlePollInterval = 2 * time.Millisecond
 // 即等价于「清零后不会再有更旧的同纪元快照落库」。
 //
 // 实例不在本地表（未激活/已逐出/他端持有）视为已落定并返回 nil——本表
-// 没有以该实例名义在飞的周期 Put。返回非 nil 错误时实例状态未被改动
-// （纯读面）。
+// 没有以该实例名义在飞的周期 Put。命中条目但实例已换代（inst.p != p）同
+// 视为已落定：在飞门是实例内簿记，随旧实例逐出一并作废，调用方持有的是
+// 陈旧引用，不得阻塞在新 incarnation 的门上。返回非 nil 错误时实例状态
+// 未被改动（纯读面）。
 func (m *Table) AwaitCheckpointSettled(ctx context.Context, p *pawnite.Pawnite) error {
 	if p == nil {
 		return nil
 	}
 	inst := m.peekLocal(p.UUID())
-	if inst == nil {
+	if inst == nil || inst.p != p {
 		return nil
 	}
 	for inst.ckptInFlight.Load() {
@@ -51,9 +53,11 @@ func (m *Table) AwaitCheckpointSettled(ctx context.Context, p *pawnite.Pawnite) 
 // （活动纪元 > 已 checkpoint 纪元——闲置实体永不重写）与在飞 CAS 合一，
 // 命中即占住在飞门并报告 true；调用方必须以 EndCheckpoint（落库收妥）或
 // AbortCheckpoint（捕获被拒/失败）收尾，门才归还。
+// 实例身份守卫：扫轮从 Locals() 快照到占门之间条目可能已换代，陈旧 p
+// 不得占住新实例的门（否则新实例的捕获被永占——收尾守卫不再代放）。
 func (m *Table) TryBeginCheckpoint(p *pawnite.Pawnite) bool {
 	inst := m.peekLocal(p.UUID())
-	if inst == nil {
+	if inst == nil || inst.p != p {
 		return false
 	}
 	if inst.ckptInFlight.Load() {
@@ -67,16 +71,22 @@ func (m *Table) TryBeginCheckpoint(p *pawnite.Pawnite) bool {
 
 // EndCheckpoint 占门后的成功收尾：把已 checkpoint 纪元抬到捕获纪元并归还
 // 在飞门。空快照同此路径（该纪元无内容可写：视为已 checkpoint）。
+// 实例身份守卫：收尾 goroutine 与实例生命周期解耦（慢 Put 窗内强弃/迁移
+// 换代），陈旧 p 不得把旧实例纪元抬进新实例的 ckptEpoch——否则新
+// incarnation 的脏门控长期判净，变更被系统性跳过 checkpoint。不匹配即
+// no-op（先例同包 FinalizeEviction/evict）。
 func (m *Table) EndCheckpoint(p *pawnite.Pawnite, epoch int64) {
-	if inst := m.peekLocal(p.UUID()); inst != nil {
+	if inst := m.peekLocal(p.UUID()); inst != nil && inst.p == p {
 		inst.ckptEpoch.Store(epoch)
 		inst.ckptInFlight.Store(false)
 	}
 }
 
 // AbortCheckpoint 占门后的失败收尾：不记纪元（下轮重扫重试）只归还门。
+// 实例身份守卫同 EndCheckpoint：陈旧 p 不得误放新实例的在飞门（同实体
+// IO 永不重叠），不匹配即 no-op。
 func (m *Table) AbortCheckpoint(p *pawnite.Pawnite) {
-	if inst := m.peekLocal(p.UUID()); inst != nil {
+	if inst := m.peekLocal(p.UUID()); inst != nil && inst.p == p {
 		inst.ckptInFlight.Store(false)
 	}
 }

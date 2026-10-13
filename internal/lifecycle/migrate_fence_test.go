@@ -22,13 +22,14 @@ import (
 	"github.com/cyinx/rans_golang/internal/activation"
 )
 
-// fenceProbeStore 计数装饰 Store：Put/Get 全透传 InMemory（真围栏语义：
-// per-id 高水位 + ErrStaleIncarnation），逐次记录 Put 的 (纪元, 快照拷贝)
+// fenceProbeStore 计数装饰 Store：Put 全透传内嵌 InMemory（真围栏语义：
+// per-id 高水位 + ErrStaleIncarnation，HighWater 能力面随内嵌提升——随迁包
+// 恢复的版本比较消费它），Get 透传；逐次记录 Put 的 (纪元, 快照拷贝)
 // 供次数/内容断言。
 type fenceProbeStore struct {
-	inner *checkpoint.InMemory
-	mu    sync.Mutex
-	puts  []fencePutRecord
+	*checkpoint.InMemory
+	mu   sync.Mutex
+	puts []fencePutRecord
 }
 
 type fencePutRecord struct {
@@ -37,15 +38,15 @@ type fencePutRecord struct {
 }
 
 func newFenceProbeStore() *fenceProbeStore {
-	return &fenceProbeStore{inner: checkpoint.New()}
+	return &fenceProbeStore{InMemory: checkpoint.New()}
 }
 
 func (s *fenceProbeStore) Get(ctx context.Context, id rans.ID) ([]byte, bool, error) {
-	return s.inner.Get(ctx, id)
+	return s.InMemory.Get(ctx, id)
 }
 
 func (s *fenceProbeStore) Put(ctx context.Context, id rans.ID, incarnation uint64, snap []byte) error {
-	err := s.inner.Put(ctx, id, incarnation, snap)
+	err := s.InMemory.Put(ctx, id, incarnation, snap)
 	cp := append([]byte(nil), snap...)
 	s.mu.Lock()
 	s.puts = append(s.puts, fencePutRecord{inc: incarnation, snap: cp})
@@ -54,7 +55,7 @@ func (s *fenceProbeStore) Put(ctx context.Context, id rans.ID, incarnation uint6
 }
 
 func (s *fenceProbeStore) Delete(ctx context.Context, id rans.ID) error {
-	return s.inner.Delete(ctx, id)
+	return s.InMemory.Delete(ctx, id)
 }
 
 func (s *fenceProbeStore) putRecords() []fencePutRecord {
@@ -65,24 +66,25 @@ func (s *fenceProbeStore) putRecords() []fencePutRecord {
 	return out
 }
 
-// chanLoader 激活期装载桩：LoadState 返回注入的随迁包字节（模拟 remote
-// PackageCache 的 Put→Take 链路——单次消费语义下等价直读）。
+// chanLoader 激活期装载桩：LoadState 返回注入的随迁包字节与源纪元（模拟
+// remote PackageCache 的 Put→Take 链路——单次消费语义下等价直读）。
 type chanLoader struct {
-	mu sync.Mutex
-	b  []byte
-	ok bool
+	mu     sync.Mutex
+	b      []byte
+	srcInc uint64
+	ok     bool
 }
 
-func (l *chanLoader) supply(b []byte) {
+func (l *chanLoader) supply(b []byte, srcInc uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.b, l.ok = b, true
+	l.b, l.srcInc, l.ok = b, srcInc, true
 }
 
-func (l *chanLoader) LoadState(context.Context, rans.ID) ([]byte, bool) {
+func (l *chanLoader) LoadState(context.Context, rans.ID) ([]byte, uint64, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.b, l.ok
+	return l.b, l.srcInc, l.ok
 }
 
 // fenceCluster 双 manager 迁移夹具：源（node 1）/目标（node 2）共享目录与
@@ -108,8 +110,8 @@ func newFenceCluster(t *testing.T, kind string, ent *fakeCarrierEntity) *fenceCl
 			activation.Options{
 				Store:     store,
 				Placement: func(string, rans.NodeID) (rans.NodeID, bool) { return 2, true },
-				SendPackage: func(_ context.Context, _ rans.NodeID, _ rans.ID, snap []byte) error {
-					loader.supply(append([]byte(nil), snap...))
+				SendPackage: func(_ context.Context, _ rans.NodeID, _ rans.ID, snap []byte, srcInc uint64) error {
+					loader.supply(append([]byte(nil), snap...), srcInc)
 					return nil
 				},
 			}),
@@ -168,6 +170,13 @@ func TestMigrationFence_WindowClosesAtTargetFirstPersist(t *testing.T) {
 	// incarnation 重试允许语义；内容覆写为迟到的 straggler 快照）。
 	if err := c.store.Put(ctx, id, srcInc, []byte("state-straggler")); err != nil {
 		t.Fatalf("pre-persist stale-epoch put must pass (equal high-water), got %v", err)
+	}
+	// 复位快照内容：同纪元异内容的 Store 残留是「判输迁移后源端已前进」的
+	// 版本比较签名（M6 修复）——恢复侧会弃包落 Store 梯级，恢复即落库不再
+	// 发生。成功迁移的运行时可达态里包与 Store 同内容（migCore 先落库后
+	// 发包），复位即把夹具拉回该形态，围栏时点断言保持原义。
+	if err := c.store.Put(ctx, id, srcInc, []byte("state-v1")); err != nil {
+		t.Fatalf("snapshot content restore must pass (equal high-water), got %v", err)
 	}
 
 	// 目标端激活：自指向收养升纪元 → 随迁包恢复 → 恢复即落库（新纪元）。

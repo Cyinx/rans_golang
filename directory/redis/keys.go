@@ -19,17 +19,8 @@ import (
 //	                                      永不清删——注销写无主墓碑（inc 保留，
 //	                                      单调跨墓碑存续），崩溃残留无害躺置
 //	                                      （有效性由调用方按成员代际判定）
-//	class 索引 <p>rans:{dir}:idx:class:<kind>  SET；成员=键成分 "<kind>/<inst>"
-//	node 索引  <p>rans:{dir}:idx:node:<nodeID> SET；成员=键成分 "<kind>/<inst>"
+//	注册总表  <p>rans:{reg}:nodes          Hash；field=节点号，value=续命时间戳
 //
-// 索引是暂留面（票 17 随续租拆除一并退役）：注册/换锁/注销的主键变更在
-// 单键 Lua 内原子完成后，Go 侧以单键命令（SADD/SREM/PEXPIRE pipeline）
-// 容忍撕裂地维护索引——cluster 合法（跨 slot 的只有 pipeline 分发，非
-// 原子域），撕裂残骸由 CleanupExpired 按值判活收敛。索引键集中 {dir}
-// tag 是历史形态（多键 Lua 已不存在，tag 不再承担 cluster 合法性），仅
-// 作为暂存键族的命名空间保留。
-//
-// 注册总表  <p>rans:{reg}:nodes          Hash；field=节点号，value=续命时间戳
 // 判活键    <p>rans:{reg}:node:<nodeID>  string；SET PX=心跳 TTL（存活的
 //
 //	                                      唯一权威；值=JSON{addr,kinds,
@@ -39,14 +30,9 @@ import (
 //
 // 键族裁定的决策出处：docs/decisions/2026-10-02-node-membership-key.md。
 // 键值 v3 与逐实体 tag 的裁定出处：《规格》§11.1 与 HR4 票 15（H13 决策
-// 19/21/23）；{dir} 集中 tag 的旧形态（四 Lua 多键原子）随本票消亡。
+// 19/21/23）。
 func (d *Directory) primaryKey(id rans.ID) string {
 	return d.prefix + "rans:e:{" + id.String() + "}"
-}
-
-// primaryKeyByComponent 由索引成员（键成分 "<kind>/<inst>"）重建主键。
-func (d *Directory) primaryKeyByComponent(component string) string {
-	return d.prefix + "rans:e:{" + component + "}"
 }
 
 // registryTag 是 registry 键族的 hash tag：总表与全部节点键共享同一 slot
@@ -54,11 +40,6 @@ func (d *Directory) primaryKeyByComponent(component string) string {
 // （判活三件套的宣告/票据面）。新 registry 键必须沿用本 tag（AGENTS.md
 // 硬规则 5）。
 const registryTag = "{reg}"
-
-// directoryIndexTag 是暂留索引键族的 hash tag（见文件头键方案注记：索引
-// 暂居 {dir} 单 slot，票 17 随索引退役一并消亡；实体主键已改逐实体 tag，
-// 不在本族）。
-const directoryIndexTag = "{dir}"
 
 // nodeKey 是 node 的判活键（键在=节点活，值=JSON{addr,kinds}——存活的唯一
 // 权威，地址与形态声明的唯一承载）。

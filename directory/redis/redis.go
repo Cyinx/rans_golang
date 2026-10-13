@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/cyinx/rans_golang"
@@ -21,8 +22,8 @@ const defaultHeartbeatTTL = 2 * time.Minute
 // 按 MOVED 重定向/按哨兵发现分片）；单地址（Addr 或 Addrs 长度 1）行为
 // 与普通客户端完全一致。⚠️ Cluster 模式的 DB 必须为 0（Redis 侧约束）。
 // 目录三 Lua 是单键操作（逐实体 hash tag，键方案见 keys.go）——任意
-// slot 合法，cluster 下无需集中；registry 面与暂留索引为单键命令族，
-// 同兼容。KeyPrefix 供测试注入独立前缀做键隔离（默认空）。
+// slot 合法，cluster 下无需集中；registry 面为单键命令族，同兼容。
+// KeyPrefix 供测试注入独立前缀做键隔离（默认空）。
 type Options struct {
 	Addr         string
 	Addrs        []string // 多地址：cluster/哨兵种子列表；非空优先于 Addr
@@ -34,8 +35,7 @@ type Options struct {
 }
 
 // Directory 是目录的 Redis 实现，提供全部能力面：
-// 基础 Directory（合并端口）+ LeaseDirectory（暂留）+
-// Browser（暂留）+ NodeRegistry。
+// 基础 Directory（合并端口）+ NodeRegistry。
 //
 // 并发约定（本类型全部导出方法共同契约，方法注释不再重复——spec §5.8）：
 // 阻塞至 Redis 应答或 ctx 结束（耗尽返回包装 ctx.Err() 的错误；goredis
@@ -114,10 +114,9 @@ func parseEntry(val string) (entryJSON, bool) {
 
 // Register 注册/收养/接管原子域（luaRegister 单键四分支，KEYS/ARGV 见
 // scripts.go；directory.Directory 契约）。主键无值/墓碑 → 按墓碑残值+1
-// 写自归属；现值归属即本实例（node+epoch）→ 重注册 inc+1；expected 与现
-// 值全等 → CAS 接管 inc+1；否则输并返回现归属。赢后 Go 侧以单键命令容忍
-// 撕裂地维护 class/node 索引（SADD+PEXPIRE——暂留面，票 17 退役；撕裂残
-// 骸由 CleanupExpired 按值判活收敛，索引失败不影响注册结果）。
+// 写自归属；现值归属即本实例（node+epoch，含 epoch=0 未接代际条目的收养
+// 形态）→ inc+1 升写调用方纪元（返回值=落库值）；expected 与现值全等 →
+// CAS 接管 inc+1；否则输并返回现归属。
 func (d *Directory) Register(ctx context.Context, id rans.ID, self directory.Owner, expected *directory.Owner) (bool, directory.Owner, error) {
 	var en, ee, ei uint64
 	if expected != nil {
@@ -154,6 +153,17 @@ func (d *Directory) UnregisterIfOwner(ctx context.Context, id rans.ID, owner dir
 		return false, err
 	}
 	return res == 1, nil
+}
+
+// UnregisterNode 成员注销（H13 收敛形态）：删除判活键 + 注册总表 field
+// ——节点即时退出成员视图。实体条目不清扫：本地逐实体销毁已各自条件
+// 注销，残留由死 owner 自愈承接（有效性判定 + CAS 接管）。
+func (d *Directory) UnregisterNode(ctx context.Context, node rans.NodeID) error {
+	pipe := d.cli.Pipeline()
+	pipe.Del(ctx, d.nodeKey(node))
+	pipe.HDel(ctx, d.rosterKey(), strconv.Itoa(int(node)))
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // Lookup 读取归属位置（实例级 Owner 三元组）。miss/墓碑/值解析失败 →

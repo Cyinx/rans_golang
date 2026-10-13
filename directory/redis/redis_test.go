@@ -31,7 +31,7 @@ func redisPassword() string { return os.Getenv("RANS_TEST_REDIS_PASSWORD") }
 
 // sweepTestKeys 登记测试残键清扫：t.Cleanup 里 SCAN+DEL 本
 // KeyPrefix 前缀下全部键——设计性无 TTL 的键族（实体主键（墓碑）、
-// {dir} 索引、{reg}:nodes 注册总表、{reg}:epoch 代际 Hash）随测试结束
+// {reg}:nodes 注册总表、{reg}:epoch 代际 Hash）随测试结束
 // 物理清除，共享 Redis 实例不随测试轮次累积。仅测试侧使用：生产 Close
 // 只关客户端绝不清键（红线）。必须在夹具构造点调用（登记早于其余
 // Cleanup）——LIFO 保证清扫在目录 Close 之后执行，届时本前缀已无写入方。
@@ -84,8 +84,8 @@ func mustConnect(t *testing.T) *goredis.Client {
 }
 
 // newTestDir 以独立 KeyPrefix 构造被测目录：前缀含 t.Name() + UnixNano，
-// 子测试间隔离、-count=N 重跑间也隔离（设计性无 TTL 的主键/索引键不会
-// 串场）。leaseTTL<=0 时落到实现默认值（5min / 2min）。
+// 子测试间隔离、-count=N 重跑间也隔离（设计性无 TTL 的主键不会串场）。
+// hbTTL<=0 时落到实现默认值（2min）。
 func newTestDir(t *testing.T, hbTTL time.Duration) *Directory {
 	t.Helper()
 	prefix := fmt.Sprintf("rans:test:%s:%d:", t.Name(), time.Now().UnixNano())
@@ -656,8 +656,7 @@ func TestEntryValueV3Format(t *testing.T) {
 // TestTransferStates 所有权转移四态（luaTransfer 返回四元组的 Go 映射，
 // 实例级形态——期望归属是 Owner 三元组整体）：
 // 无条目→(false, zero, nil)；归属不符（他节点/陈旧纪元/墓碑）→ ErrNotOwner
-// +现归属；成功→新纪元严格大于旧值+索引搬移；搬移后 Lookup 指向新归属
-// （node+epoch）。
+// +现归属；成功→新纪元严格大于旧值，Lookup 指向新归属（node+epoch）。
 func TestTransferStates(t *testing.T) {
 	mustConnect(t)
 	ctx := context.Background()
@@ -880,7 +879,7 @@ func TestRegistryRosterTimestampValue(t *testing.T) {
 // TestDirectoryClusterSlotUnity 键值 v3 的 slot 形态（单实例确定性断言，
 // cluster 实测补全见 TestKeyTag_PerEntitySharding）：实体主键携带**逐实体
 // hash tag**（tag = 完整实体身份——同实体单键操作同 slot、异实体互异分
-// 片）；暂留索引仍居 {dir}（单键命令族，tag 不再承担多键合法性）。
+// 片）。
 func TestDirectoryClusterSlotUnity(t *testing.T) {
 	mustConnect(t)
 	d := newTestDir(t, time.Minute)
@@ -946,7 +945,7 @@ func mustConnectCluster(t *testing.T) []string {
 }
 
 // newClusterTestDir 以 cluster 种子构造被测目录（KeyPrefix 隔离同单实例
-// 口径；DB 恒 0——cluster 的 Redis 侧约束）。leaseTTL<=0 取实现默认。
+// 口径；DB 恒 0——cluster 的 Redis 侧约束）。hbTTL<=0 取实现默认。
 func newClusterTestDir(t *testing.T, addrs []string, hbTTL time.Duration) *Directory {
 	t.Helper()
 	prefix := fmt.Sprintf("rans:test:%s:%d:", t.Name(), time.Now().UnixNano())
@@ -1025,8 +1024,8 @@ func TestClusterNodeMembershipSuite(t *testing.T) {
 }
 
 // TestClusterDirectoryE2E 目录全链路 cluster 冒烟：多实体散布分片（逐实体
-// tag）→ BrowseAll 全量可见（SCAN 跨 master 聚合）→ 迁移换锁（单键
-// luaTransfer 实跑）→ CleanupExpired（SCAN+索引维护）→ registry 全量快照。
+// tag）→ Lookup 逐实体可见 → 迁移换锁（单键 luaTransfer 实跑）→ registry
+// 全量快照 + 节点注销。
 func TestClusterDirectoryE2E(t *testing.T) {
 	addrs := mustConnectCluster(t)
 	ctx := context.Background()

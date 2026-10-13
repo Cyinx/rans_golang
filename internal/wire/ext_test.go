@@ -21,6 +21,34 @@ func TestRequestExtRoundTripBothFields(t *testing.T) {
 	}
 }
 
+// 随迁包源纪元字段：单字段在场的编解码回环；与既有字段混编互不干扰；
+// 缺场（旧端发送方形态）解码为零值不在场——同 VerMax 只追加字段号的演进
+// 语义由未知字段跳过测试与本测试共同锚定。
+func TestRequestExtSrcIncarnationRoundTrip(t *testing.T) {
+	e := RequestExt{HasSrcIncarnation: true, SrcIncarnation: 42}
+	got, err := DecodeRequestExt(EncodeRequestExt(e))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasSrcIncarnation || got.SrcIncarnation != 42 {
+		t.Fatalf("mismatch: %+v", got)
+	}
+
+	mixed := RequestExt{BudgetMS: 7, HasBudget: true, HasSrcIncarnation: true, SrcIncarnation: 1 << 40}
+	got, err = DecodeRequestExt(EncodeRequestExt(mixed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BudgetMS != 7 || !got.HasBudget || !got.HasSrcIncarnation || got.SrcIncarnation != 1<<40 {
+		t.Fatalf("mismatch: %+v", got)
+	}
+
+	got, err = DecodeRequestExt(nil)
+	if err != nil || got.HasSrcIncarnation {
+		t.Fatalf("absent field must decode zero-value not-present: %+v, %v", got, err)
+	}
+}
+
 func TestRequestExtBudgetOnly(t *testing.T) {
 	e := RequestExt{BudgetMS: 999, HasBudget: true}
 	got, err := DecodeRequestExt(EncodeRequestExt(e))

@@ -1,6 +1,7 @@
 package activation
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -16,13 +17,16 @@ import (
 
 // StateLoader 激活期状态装载契约（规格 §13.3 目标端恢复的运行时半边）：
 // GetOrActivate 的激活闭包在 ent.Activate 之前查询（load-first：实体先
-// 就绪，Activate 观测到的即恢复后的状态）。命中返回 (快照字节, true)；
-// consume-on-read 语义由实现自带（如 rpc 的随迁包缓存：包恢复恰一次，
-// 后续激活 miss 落 Store 兜底）。manager 不假设字节形状——形状校验归
-// rans.Snapshotter.Restore。注入面：Options.StateLoader（构造期）与
-// BindMigrationPackages（rpc 装配期唯一补写点）——运行中不可变。
+// 就绪，Activate 观测到的即恢复后的状态）。命中返回 (快照字节, 源纪元,
+// true)；consume-on-read 语义由实现自带（如 rpc 的随迁包缓存：包恢复恰一次，
+// 后续激活 miss 落 Store 兜底）。srcInc 是包的源端围栏 incarnation（发送方
+// 落库快照时的 Store 纪元；0 = 未携带——旧端发送方或未围栏形态），恢复侧
+// 据此与 Store per-id 高水位比较、包旧弃包（见 restoreState）。manager 不
+// 假设字节形状——形状校验归 rans.Snapshotter.Restore。注入面：
+// Options.StateLoader（构造期）与 BindMigrationPackages（rpc 装配期唯一
+// 补写点）——运行中不可变。
 type StateLoader interface {
-	LoadState(ctx context.Context, id rans.ID) ([]byte, bool)
+	LoadState(ctx context.Context, id rans.ID) (snap []byte, srcInc uint64, ok bool)
 }
 
 // restoreSource restoreState 的恢复来源（恢复即落库，《加固 spec》§5.2
@@ -34,12 +38,14 @@ type restoreSource uint8
 
 const (
 	restoreNone    restoreSource = iota // 未命中任何状态面（或包弃包落 Store 前的各失败路径）：裸激活
-	restorePackage                      // 随迁包命中且恢复成功：返回包字节原样，实体状态=包字节，可能比 Store 新
+	restorePackage                      // 随迁包命中且经版本比较判新：返回包字节原样，实体状态=包字节，可能比 Store 新
 	restoreStore                        // Store 命中且恢复成功：实体状态与持久层一致
 )
 
 // restoreState 激活期状态恢复（load-first，规格 §13.3「实体先就绪」）：在
-// ent.Activate 之前执行。随迁包是快路径，包恢复失败退回 Store；Store 是
+// ent.Activate 之前执行。随迁包是快路径，包恢复失败退回 Store；包经版本
+// 比较判旧（packageStale）同样弃包退回 Store——「包优先」前提是包不旧于
+// Store（该前提只对成功迁移成立，判输迁移留下的是过期包）；Store 是
 // 正确性依赖——Get 的 IO 错误与快照解码错误都让激活失败（ErrRestoreFailed
 // 包装原错误），绝不以空状态对外服务。未命中 → 裸激活。需要宽容不兼容
 // 快照的实体在 Restore 里自行吞掉并返回 nil。运行在
@@ -62,7 +68,7 @@ func (m *Table) restoreState(ctx context.Context, id rans.ID, ent rans.Entity) (
 		return restoreNone, nil, nil // 未接线任何状态面：裸激活零开销
 	}
 	if m.stateLoader != nil {
-		if b, ok := m.stateLoader.LoadState(ctx, id); ok {
+		if b, srcInc, ok := m.stateLoader.LoadState(ctx, id); ok {
 			carrier, isCarrier := ent.(rans.Snapshotter)
 			if !isCarrier {
 				log.Warn("rans/activation: activation state loaded but entity lacks migration carrier face; bytes ignored",
@@ -73,8 +79,13 @@ func (m *Table) restoreState(ctx context.Context, id rans.ID, ent rans.Entity) (
 				// 随迁包是加速面而非正确性依赖：弃包落到 Store 梯级。
 				log.Warn("rans/activation: activation state restore failed; falling back to checkpoint store",
 					"uuid", id.String(), "err", err)
+			} else if !m.packageStale(ctx, id, srcInc, b) {
+				return restorePackage, b, nil // 包命中且判新：不读 Store 内容（包可能比 Store 新）
 			} else {
-				return restorePackage, b, nil // 包命中且恢复成功：不读 Store（包可能比 Store 新）
+				// 包旧于 Store（判输迁移的过期包）：弃包落 Store 梯级——
+				// 接管恢复必须读最新已确认状态，过期包不得以新纪元写回。
+				log.Warn("rans/activation: stale migration package dropped in favor of checkpoint store",
+					"uuid", id.String(), "src_incarnation", srcInc)
 			}
 		}
 	}
@@ -93,6 +104,45 @@ func (m *Table) restoreState(ctx context.Context, id rans.ID, ent rans.Entity) (
 		return restoreNone, nil, fmt.Errorf("%w: snapshot decode: %w", ErrRestoreFailed, err)
 	}
 	return restoreStore, nil, nil // Store 命中且恢复成功：实体状态与持久层一致
+}
+
+// highWaterStore Store 高水位只读能力面（checkpoint.HighWaterReader 的本包
+// 视图，可选能力经类型断言发现）：未实现者恢复侧退回「包优先」历史行为。
+type highWaterStore interface {
+	HighWater(ctx context.Context, id rans.ID) (uint64, bool, error)
+}
+
+// packageStale 随迁包陈旧判定（restoreState 包命中时调用，与 Store per-id
+// 高水位比较）：包旧于 Store 高水位即弃包——失败迁移（CAS 判输/预算耗尽）
+// 留下的过期包不再让接管恢复静默回滚已确认变更。判定序：
+//  1. srcInc == 0：发送方未携带版本（旧端形态）——不弃（无法判定，包优先）；
+//  2. Store 未实现 HighWaterReader：能力缺席——不弃（同 1 的保守回退）；
+//  3. 包纪元 < 高水位：Store 已接受更新的 incarnation——弃包；
+//  4. 包纪元 > 高水位：Store 无更新写，包不旧——不弃；
+//  5. 包纪元 == 高水位：同纪元分不出快照先后（成功迁移：源端先落库后发包，
+//     同内容；判输迁移：源端同纪元续落了更新的快照）——内容比对定胜负，
+//     Store 内容不同即源端已前进，弃包；Get 失败/未命中不弃（比较是加速
+//     判定，不可用时不损快路径——Store IO 错误由恢复梯/落库面既有语义收口）。
+func (m *Table) packageStale(ctx context.Context, id rans.ID, srcInc uint64, pkg []byte) bool {
+	if srcInc == 0 || m.store == nil {
+		return false
+	}
+	hwr, can := m.store.(highWaterStore)
+	if !can {
+		return false
+	}
+	hw, ok, err := hwr.HighWater(ctx, id)
+	if err != nil || !ok || hw < srcInc {
+		return false
+	}
+	if hw > srcInc {
+		return true
+	}
+	cur, hit, err := m.store.Get(ctx, id)
+	if err != nil || !hit {
+		return false
+	}
+	return !bytes.Equal(cur, pkg)
 }
 
 // activationFailedCounter 懒建的激活失败计数器（metrics.Default 进程级共享

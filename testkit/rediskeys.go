@@ -1,7 +1,7 @@
 package testkit
 
 // 共享测试 Redis 的残键兜底：测试族 KeyPrefix 下存在设计性无 TTL 的键族
-// ——{dir}:inc 纪元 Hash（纪元序列必须跨条目死亡存续）与 {reg}:nodes 注册
+// ——{reg}:epoch 代际 Hash（纪元序列必须跨条目死亡存续）与 {reg}:nodes 注册
 // 总表（枚举面，value=续命时间戳）——加上未到期的 TTL 键，测试结束即残留
 // 在共享实例上并随轮次累积。清扫只在测试侧：生产 Directory.Close 只关客户端
 // 绝不清键（红线）；测试夹具在构造点登记 t.Cleanup，LIFO 保证清扫在节点

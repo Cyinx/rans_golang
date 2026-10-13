@@ -10,8 +10,7 @@ import (
 
 // TestRegisterSuite 目录合并端口契约（键值 v3 基座套件）：Register 四分支
 // （收养/重注册/CAS 接管/输返回现归属）、注销写墓碑且纪元跨墓碑单调、
-// Transfer 三态、Lookup（inmem 全实跑）；批量归属校验子测试归 RunLeaseSuite
-// （inmem 不实现 LeaseDirectory，假实现自测见 directory/contract）。
+// Transfer 三态、Lookup（inmem 全实跑）。
 func TestRegisterSuite(t *testing.T) {
 	contract.RunRegisterSuite(t, func(t *testing.T) directory.Directory {
 		return New()
@@ -19,8 +18,8 @@ func TestRegisterSuite(t *testing.T) {
 }
 
 // TestNodeMembershipSuite 节点成员键契约（inmem registry 同语义：记录在 ⟺
-// 节点可见、TTL 惰性过期退出视图、draining 过滤、注销路径经 Browser 探测
-// 跳过——注销面归目录条目实现，进程内注册表的停机路径由过期收敛）。
+// 节点可见、TTL 惰性过期退出视图、draining 过滤、节点注销即时退出成员
+// 视图——进程内注册表的停机路径由过期收敛兜底）。
 func TestNodeMembershipSuite(t *testing.T) {
 	contract.RunNodeMembershipSuite(t, func(t *testing.T, hbTTL time.Duration) directory.NodeRegistry {
 		return NewNodeRegistry(hbTTL)

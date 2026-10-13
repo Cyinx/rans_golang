@@ -37,3 +37,12 @@ type Store interface {
 	// Delete 删除快照。未命中为 no-op（幂等），不返回错误。
 	Delete(ctx context.Context, id rans.ID) error
 }
+
+// HighWaterReader 是 Store 的可选能力面：只读 per-id 已接受的最大纪元
+// （围栏高水位）。随迁包恢复用它做版本比较，包旧弃包落 Store 梯级；未
+// 实现本面的 Store 恢复侧退回「包优先」历史行为（保守不弃包）。
+type HighWaterReader interface {
+	// HighWater 返回该 id 已接受的最大 incarnation。(0, false, nil) =
+	// 从未接受过非零纪元写入（0 直通不参与比较，Delete 不撤销高水位）。
+	HighWater(ctx context.Context, id rans.ID) (uint64, bool, error)
+}

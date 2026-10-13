@@ -454,9 +454,18 @@ func (d *localOneWay) DeliveryDeadline() (time.Time, bool) { return d.ctx.Deadli
 // Deliver 在 Pawnite loop goroutine 上执行（串行语义落点）。Handle ctx
 // 携带执行实例的 fencing 纪元（与 callDelivery/remoteDelivery 同一接线
 // 面：zombie 迟回的 Handle 续体直写消费方存储时可凭 ctx 令牌被拒；值取
-// 自实际执行投递的 pawnite，而非投递构造时刻的实例引用）。
+// 自实际执行投递的 pawnite，而非投递构造时刻的实例引用）与让出重入登记
+// 点（请求与单向投递均携带，ReenterAfter 不随到达路径分叉）。
 func (d *localOneWay) Deliver(p *pawnite.Pawnite) {
-	if _, err := d.ent.Handle(ctxkey.WithSelf(ctxkey.WithIncarnation(d.ctx, p.Incarnation()), d.id.Kind, d.id.Key), d.req); err != nil {
+	ctx := ctxkey.WithSelf(ctxkey.WithIncarnation(d.ctx, p.Incarnation()), d.id.Kind, d.id.Key)
+	// 让出面注入（H12 决策 16 后半，与 remoteDelivery 单向腿同构）：单向无
+	// 应答面，只注入 reenter 不注入 defer（远端单向同分野）；detached 腿
+	// ——投递 ctx 的取消面归发送腿（预算派生的 cancel 随入箱返回触发），
+	// wctx 脱钩派生并重挂请求 deadline（deriveWctx），与远端腿同一收场形
+	// 态。缺注入时实体 ReenterAfter panic 折叠回绝，单向无回执面即静默丢。
+	arm := p.NewReenterArm(ctx, true)
+	ctx = ctxkey.WithReenterPoint(ctx, arm)
+	if _, err := d.ent.Handle(ctx, d.req); err != nil {
 		log.Warn("rans/rpc: local one-way handler error",
 			"uuid", d.id.String(), "err", err)
 	}

@@ -160,10 +160,26 @@ func (p *Pawnite) popReenter() (func(), bool) {
 	return fn, true
 }
 
-// runContinuation 续体任务的 loop 执行段：计入执行停驻时钟（then 回 loop 后
-// 重新计入执行看门狗）；panic 监管与 invoke 同口径（Default 服役；Isolate 销毁）。
+// continuationUnit 续体执行的在途执行槽标记（executing 槽的续体形态）：
+// 续体无投递载体，登记只为统一「执行时钟非零 ⟹ 在途槽有绑」的不变量——
+// 看门狗强弃的解绑面（unbindExecuting）对标记的回绝无悬挂调用方可解，
+// no-op 即正确语义。
+type continuationUnit struct{ p *Pawnite }
+
+func (u *continuationUnit) UUID() rans.ID                 { return u.p.id }
+func (u *continuationUnit) Deliver(*Pawnite)              {}
+func (u *continuationUnit) Reject(rans.Code, rans.Reason) {}
+
+// runContinuation 续体任务的 loop 执行段：计入活动纪元（脏门控由此覆盖续
+// 体写——捕获放行判据同源双空，见 activityQuiescedLocked）与执行停驻时钟
+// + 在途执行槽（then 回 loop 后重新计入执行看门狗；强弃解绑面统一）；
+// panic 监管与 invoke 同口径（Default 服役；Isolate 销毁）。
 func (p *Pawnite) runContinuation(fn func()) {
+	marker := InboundDelivery(&continuationUnit{p: p})
+	p.executing.Store(&marker)
 	p.executingSinceNano.Store(time.Now().UnixNano())
+	p.activityEpoch.Add(1)
+	defer p.executing.Store(nil)
 	defer p.executingSinceNano.Store(0)
 	defer func() {
 		if r := recover(); r != nil {
@@ -177,22 +193,31 @@ func (p *Pawnite) runContinuation(fn func()) {
 	fn()
 }
 
+// activityQuiescedLocked 静默判据（调用方必须已持 mu）：在飞 work 与续体
+// 队列双空——交接 core 与周期捕获放行的唯一依据。works 空而 reenterQ 非
+// 空是「work 已完成、续体未执行」的一致态窗口：此刻拍终快照/捕获即静默
+// 丢已确认写（completeWork 在单临界区内清登记并入队，两表同源观测）。
+func (p *Pawnite) activityQuiescedLocked() bool {
+	return len(p.works) == 0 && len(p.reenterQ) == 0
+}
+
 // heldHandoff 挂起等待在途 work 的交接请求（mu 保护）；stopBudget 解除预算看护。
 type heldHandoff struct {
 	req        handoffReq
 	stopBudget func()
 }
 
-// holdHandoffForWorks 交接信号到达时有在飞 work：请求挂起，loop 只服务续体
-// 任务，静默判据满足后续体分支驱动 core（H12 决策 17）。预算看护先起后挂：
-// req.ctx 完成（deadline 到点或调用方取消）即取消全部在飞 wctx，work 协作
-// 返回后续体排尽、core 照常驱动。返回 false = 无在飞 work：core 立即执行。
+// holdHandoffForWorks 交接信号到达时未达静默（在飞 work 或续体排队——判据
+// 见 activityQuiescedLocked）：请求挂起，loop 只服务续体任务，静默判据满足
+// 后续体分支驱动 core（H12 决策 17）。预算看护先起后挂：req.ctx 完成
+// （deadline 到点或调用方取消）即取消全部在飞 wctx，work 协作返回后续体
+// 排尽、core 照常驱动。返回 false = 已静默：core 立即执行。
 func (p *Pawnite) holdHandoffForWorks(req handoffReq) bool {
 	watch := context.AfterFunc(req.ctx, p.cancelWorks)
 	stop := func() { watch() }
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.works) == 0 {
+	if p.activityQuiescedLocked() {
 		stop()
 		return false
 	}
@@ -201,13 +226,14 @@ func (p *Pawnite) holdHandoffForWorks(req handoffReq) bool {
 }
 
 // releaseHeldHandoffIfQuiesced 静默判据满足时取回挂起的交接请求（续体分支
-// 调用）：works 空 && 续体队空——work 完成且续体已落地（状态一致点）。挂起
-// /取回在 loop、清场（abort）在任意 goroutine，互斥由 mu 保证，result 恰送一次。
+// 调用）：判据与挂起判据同源（activityQuiescedLocked）——work 完成且续体
+// 已落地（状态一致点）。挂起/取回在 loop、清场（abort）在任意 goroutine，
+// 互斥由 mu 保证，result 恰送一次。
 func (p *Pawnite) releaseHeldHandoffIfQuiesced() (handoffReq, func(), bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	h := p.heldHandoff
-	if h == nil || len(p.works) > 0 || len(p.reenterQ) > 0 {
+	if h == nil || !p.activityQuiescedLocked() {
 		return handoffReq{}, nil, false
 	}
 	p.heldHandoff = nil

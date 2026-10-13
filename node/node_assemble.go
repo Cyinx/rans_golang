@@ -39,10 +39,11 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	// 节点自有指标注册表（观测面）先行：本节点装配期注册的全部仪表
-	//（rpc 五面 + 续租丢失）落此处，Metrics() 快照即其读数。
-	// 进程级聚合面（activation.failed / checkpoint.final_failed /
-	// lease.self_fenced 三项 Counter）仍在 metrics.Default()——它们按设计
-	// 跨节点聚合（包级 OnceValue 单例）。
+	//（rpc 五面 + lease.self_fenced）落此处，Metrics() 快照即其读数——
+	// 自检止损是逐节点事实（哪个节点成员写失联就告警谁），不进进程级
+	// 聚合面。进程级聚合面（activation.failed / checkpoint.final_failed
+	// 两项 Counter）仍在 metrics.Default()——它们由 internal 包直接注册
+	//（包级 OnceValue 单例），按设计跨节点聚合。
 	mreg := metrics.New("")
 	dir, closeDir, err := openDirectory(cfg.Directory)
 	if err != nil {

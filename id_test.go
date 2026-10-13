@@ -85,3 +85,16 @@ func TestID_ValueEqualityAsMapKey(t *testing.T) {
 		t.Fatal("IsZero semantics: zero value true, constructed false")
 	}
 }
+
+func TestValidKindName(t *testing.T) {
+	for _, s := range []string{"chat", "a", "_x", "K-9", strings.Repeat("k", 64)} {
+		if !rans.ValidKindName(s) {
+			t.Fatalf("ValidKindName(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "9k", "k$", "k d", strings.Repeat("k", 65), "{x}", "a/b"} {
+		if rans.ValidKindName(s) {
+			t.Fatalf("ValidKindName(%q) = true, want false", s)
+		}
+	}
+}

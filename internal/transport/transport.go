@@ -1,6 +1,6 @@
-// Package transport 定义传输端口的六边形接口（hexagonal port）：上层
-// （远端端点、连接管理）只依赖本包抽象，不依赖具体网络实现；
-// transport/tcp 是其适配器。
+// Package transport 定义传输端口（hexagonal port）：Conn 是真正的抽象半边
+// ——上层经它收发帧、不触具体网络实现，transport/tcp 是其适配器；连接管理
+// （Manager）属装配面而非端口——rpc 直接构造并驱动 *tcp.Manager（未抽象）。
 package transport
 
 import (

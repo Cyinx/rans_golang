@@ -45,13 +45,16 @@ var wireTypeNames = map[fieldKind]string{
 }
 
 // buildSchema 对每个 dir 走完整生成管线（LoadPackage 排除生成物 + planGen
-// 类型门卫），合并各包消息面为全量清单。wire 注册名跨包必须唯一（清单按
-// 名索引，重名即歧义）；字段已由 planGen 门卫过支持集，此处只做线型映射。
-func buildSchema(dirs []string) (*ransSchema, error) {
+// 类型门卫），合并各包消息面为全量清单。skip 为生成物排除名，跟随 -out
+// 旗标（排除的必须正是 generate 模式将要写出的那份文件——生成物回扫会让
+// 派生请求的注册名落回类型名，清单失真），不得硬编码缺省名。wire 注册名
+// 跨包必须唯一（清单按名索引，重名即歧义）；字段已由 planGen 门卫过支持
+// 集，此处只做线型映射。
+func buildSchema(dirs []string, skip string) (*ransSchema, error) {
 	byName := map[string]string{} // wire 名 → 首见来源（Go 类型名，报重名用）
 	var out []schemaMessage
 	for _, dir := range dirs {
-		pkg, err := LoadPackage(dir, "rans_gen.go")
+		pkg, err := LoadPackage(dir, skip)
 		if err != nil {
 			return nil, err
 		}
@@ -153,10 +156,11 @@ func checkSchema(base, cur *ransSchema) checkResult {
 	return res
 }
 
-// runCheck 载入基线并对 dirs 的当前清单做兼容比对。基础设施错误（清单
-// 不可建、基线不可读/非法）走 error；兼容结论走 checkResult。
-func runCheck(dirs []string, baselinePath string) (checkResult, error) {
-	cur, err := buildSchema(dirs)
+// runCheck 载入基线并对 dirs 的当前清单做兼容比对。skip 为生成物排除名
+// （跟随 -out 旗标，见 buildSchema）。基础设施错误（清单不可建、基线不可
+// 读/非法）走 error；兼容结论走 checkResult。
+func runCheck(dirs []string, skip, baselinePath string) (checkResult, error) {
+	cur, err := buildSchema(dirs, skip)
 	if err != nil {
 		return checkResult{}, err
 	}
@@ -167,9 +171,10 @@ func runCheck(dirs []string, baselinePath string) (checkResult, error) {
 	return checkSchema(base, cur), nil
 }
 
-// runSchema 产出 dirs 合并清单到 outPath（内容一致不写，mtime 保持）。
-func runSchema(dirs []string, outPath string) error {
-	s, err := buildSchema(dirs)
+// runSchema 产出 dirs 合并清单到 outPath（skip 为生成物排除名，跟随 -out
+// 旗标；内容一致不写，mtime 保持）。
+func runSchema(dirs []string, skip, outPath string) error {
+	s, err := buildSchema(dirs, skip)
 	if err != nil {
 		return err
 	}

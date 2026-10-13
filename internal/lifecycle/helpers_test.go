@@ -124,14 +124,15 @@ func (a *acctEntity) Restore(b []byte) error {
 	return nil
 }
 
-// stubStateLoader 恒命中的装载器道具（随迁包快路径模拟）。
+// stubStateLoader 恒命中的装载器道具（随迁包快路径模拟；srcInc=0：未携带
+// 版本的包形态——恢复侧退回包优先历史行为）。
 type stubStateLoader struct {
 	b  []byte
 	ok bool
 }
 
-func (s *stubStateLoader) LoadState(ctx context.Context, id rans.ID) ([]byte, bool) {
-	return s.b, s.ok
+func (s *stubStateLoader) LoadState(ctx context.Context, id rans.ID) ([]byte, uint64, bool) {
+	return s.b, 0, s.ok
 }
 
 // fakeCarrierEntity 同时实现 rans.Entity 最小面与 rans.Snapshotter（与

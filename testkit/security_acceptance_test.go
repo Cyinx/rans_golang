@@ -13,8 +13,9 @@ package testkit
 //   - 指纹失配的观测/拒连用例 = TestAcceptance_SchemaDigestObservationAndStrict
 //    （握手 SchemaDigest 观测 + Security.StrictSchema 严格拒连）；
 //   - redis 指标可见性断言在 node 包（node/redis_metrics_test.go）：指标
-//     接线随组装根内置（heartbeat_lost 归 node.wireLease、gateway pending
-//     归 rpc 装配），断言需要 internal/metrics 读数——testkit 依赖面不含它；
+//     接线随组装根内置（gateway pending / transport reconnects 归 rpc 装
+//     配，仪表落节点自有注册表、经 Node.Metrics() 读），断言需要
+//     internal/metrics 读数——testkit 依赖面不含它；
 //   - NoHMAC 不安全告警的 log 捕获断言不在 testkit 依赖面（文案/条数锚点
 //     在 tcp/conn_test.go；本文件保留双端 NoHMAC 行为面）。
 

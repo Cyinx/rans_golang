@@ -3,7 +3,8 @@ package testkit
 // HR4 验收落点（H12 决策 16/17 后半，票 12）：ReenterAfter 让出重入——
 // 让出期间邮箱照常服务（可重入；-race 无锁状态锚）、work 调回不判环、
 // work 调回同步等待上游立即判环、交接窗等待在途 work（预算取消 wctx）、
-// MsgCancel 取消面扩展（wctx 取消 + 已 Deferred 未 Reply 标记）。
+// MsgCancel 取消面扩展（wctx 取消 + 已 Deferred 未 Reply 标记）、本地
+// Tell 到达腿的登记点（单向形态只注入让出面，与远端单向同构）。
 
 import (
 	"context"
@@ -302,5 +303,118 @@ func TestReenterAfter_WorkCallsWaitingUpstreamCycle(t *testing.T) {
 	}
 	if rans.ReasonOf(err) != rans.ReasonHandler || !strings.Contains(err.Error(), hexHash(aID)) {
 		t.Fatalf("outer fold = %v, want ReasonHandler with the ring text preserved", err)
+	}
+}
+
+// tellArmEntity 本地 Tell 让出形态的道具实体：Handle 内 ReenterAfter（无
+// Defer 的单向形态——契约「只 ReenterAfter 不 Defer 也合法」），续体 then
+// 落 flag。逐激活独立实例（factory 逐次新建），起跑/放行信号通道跨实例
+// 共享（测试侧握把）；两闸皆 nil 的实例 work 即刻返回（对照组形态）。
+// flag 无锁：Handle 与续体都回实体 loop 串行读写。
+type tellArmEntity struct {
+	started chan struct{} // work 起跑信号（缓冲 1 非阻塞——时序锚）
+	release chan struct{} // work 放行闸（close = work 返回；nil = 即刻返回）
+	flag    bool          // 续体落地标记（loop 串行读写）
+}
+
+func (e *tellArmEntity) Activate(context.Context) error   { return nil }
+func (e *tellArmEntity) Deactivate(context.Context) error { return nil }
+
+func (e *tellArmEntity) Handle(ctx context.Context, req any) (any, error) {
+	switch cmd, _ := req.(string); cmd {
+	case "arm":
+		rans.ReenterAfter(ctx, func(wctx context.Context) (any, error) {
+			e.signalStarted()
+			if e.release != nil {
+				select {
+				case <-e.release:
+				case <-wctx.Done():
+					return nil, wctx.Err()
+				}
+			}
+			return nil, nil
+		}, func(any, error) { e.flag = true })
+		return nil, nil
+	case "get":
+		return e.flag, nil
+	case "ping":
+		return "ok", nil
+	}
+	return nil, nil
+}
+
+func (e *tellArmEntity) signalStarted() {
+	if e.started == nil {
+		return
+	}
+	select {
+	case e.started <- struct{}{}:
+	default:
+	}
+}
+
+// TestReenterAfter_LocalTellArm 本地 Tell 到达腿的让出登记点验收：同一实体
+// 代码在本地 Tell 到达时 ReenterAfter 正常让出——work 起跑、让出窗邮箱照常
+// 服务（与 Call 腿同语义的可重入）、续体 then 回 loop 落 flag；对照组本地
+// Call 同一断言面常绿（登记点不随消息到达路径分叉）。缺登记点时 Handle 于
+// ReenterAfter 调用点 panic（pawnite recover 折叠回绝，单向无回执面 →
+// 静默丢），started 永不到达——本测试红。
+func TestReenterAfter_LocalTellArm(t *testing.T) {
+	sig := &tellArmEntity{started: make(chan struct{}, 1), release: make(chan struct{})}
+	c := NewCluster(t, 1, map[string]rans.Factory{
+		"reent": func(id rans.ID) rans.Entity {
+			if id.Key == "arm-call" {
+				return &tellArmEntity{} // 对照组：work 即刻返回
+			}
+			return &tellArmEntity{started: sig.started, release: sig.release}
+		},
+	})
+	n := c.Node(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// 对照组：本地 Call 携带登记点 → then 落地（回归锚）。
+	idCall := mustID(t, "reent", "arm-call")
+	if _, err := n.Call(ctx, idCall, "arm"); err != nil {
+		t.Fatalf("call arm: %v", err)
+	}
+	waitTellArmFlag(t, n, ctx, idCall)
+
+	// 实验组：本地 Tell 携带登记点 → work 起跑（让出成立）。
+	idTell := mustID(t, "reent", "arm-tell")
+	if err := n.Tell(ctx, idTell, "arm"); err != nil {
+		t.Fatalf("tell arm: %v", err)
+	}
+	select {
+	case <-sig.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tell arm: work never started (ReenterAfter must not panic on tell delivery)")
+	}
+	// 让出窗判据：同实体他消息照常服务。
+	if v, err := n.Call(ctx, idTell, "ping"); err != nil || v != "ok" {
+		t.Fatalf("ping during tell yield = (%v, %v), want (ok, nil)", v, err)
+	}
+	close(sig.release) // 放行 work：续体回 loop
+	waitTellArmFlag(t, n, ctx, idTell)
+}
+
+// waitTellArmFlag 有界轮询续体落地标记（then 回 loop 与查询的相对时序不定，
+// 窗口内必须可见）。
+func waitTellArmFlag(t *testing.T, n *Node, ctx context.Context, id rans.ID) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		v, err := n.Call(ctx, id, "get")
+		if err != nil {
+			t.Fatalf("get flag: %v", err)
+		}
+		if b, _ := v.(bool); b {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("reenter continuation never landed (flag stayed false)")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

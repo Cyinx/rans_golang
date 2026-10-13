@@ -23,7 +23,7 @@ import (
 // 态不再可表示，目标端恢复梯子按契约锚定 rpc 装配）。
 func (m *Table) BindStateLoader(loader StateLoader) { m.stateLoader = loader }
 
-func (m *Table) BindPackageSender(send func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte) error) {
+func (m *Table) BindPackageSender(send func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error) {
 	m.sendPackage = send
 }
 
@@ -47,8 +47,9 @@ func (m *Table) Placement() func(kind string, exclude rans.NodeID) (rans.NodeID,
 	return m.placement
 }
 
-// PackageSender 返回随迁包直发函数（nil = 未接线 → 跳过快路径）。
-func (m *Table) PackageSender() func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte) error {
+// PackageSender 返回随迁包直发函数（nil = 未接线 → 跳过快路径）。srcInc
+// 形参是源端落库快照时的围栏 incarnation（随迁包源纪元，恢复侧版本比较用）。
+func (m *Table) PackageSender() func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error {
 	return m.sendPackage
 }
 

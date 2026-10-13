@@ -1,14 +1,12 @@
 package lifecycle
 
-// 周期任务族（规格 §15 P0 周期 checkpoint + 目录残骸清理；
+// 周期任务族（规格 §15 P0 周期 checkpoint；
 // 扫描经 *activation.Table 协作）：
 //   - CheckpointSweeper：周期驱动 checkpoint 复合体（枚举本地 Active 且有
 //     快照能力的实体，按脏纪元门控——活动纪元 > 已 checkpoint 纪元，闲置
 //     实体永不重写；捕获经 pawnite loop 任务执行——串行即静默（捕获与
 //     Handle 无并发）；Store.Put 在捕获结果收妥后进行、in-flight CAS 门保证
-//     同实体 IO 永不重叠。间隔默认 1min、单轮上限 1000，规格附录 A）；
-//   - CleanupSweeper：周期驱动注入的清理面（directory.CleanupExpired——
-//     SCAN 索引 → 主键探活 → SREM 死成员的兜底卫生任务）。
+//     同实体 IO 永不重叠。间隔默认 1min、单轮上限 1000，规格附录 A）。
 //
 // 与 Watchdog/Drainer 同族：编排器持有注入面，表驱动的复合体由本包装配
 // 函数接线（NewCheckpointSweeper），宿主负责 Run 的生命

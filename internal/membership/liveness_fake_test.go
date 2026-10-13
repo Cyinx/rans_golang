@@ -33,10 +33,12 @@ type fakeNodeRegistry struct {
 		node rans.NodeID
 		info directory.NodeInfo
 	}
-	errReg    error
-	nextEpoch uint64
-	okTimes   []time.Time
-	waitSeen  int
+	errReg     error
+	errEpoch   error
+	nextEpoch  uint64
+	epochFails uint64
+	okTimes    []time.Time
+	waitSeen   int
 }
 
 func newFakeNodeRegistry(entries map[rans.ID]directory.Owner) *fakeNodeRegistry {
@@ -107,6 +109,10 @@ func (f *fakeNodeRegistry) UnregisterNode(_ context.Context, _ rans.NodeID) erro
 func (f *fakeNodeRegistry) NextNodeEpoch(_ context.Context) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errEpoch != nil {
+		f.epochFails++
+		return 0, f.errEpoch
+	}
 	f.nextEpoch++
 	return f.nextEpoch, nil
 }
@@ -150,6 +156,27 @@ func (f *fakeNodeRegistry) healWrites() {
 	f.mu.Lock()
 	f.errReg = nil
 	f.mu.Unlock()
+}
+
+// failEpoch / healEpoch 取号错误注入（errEpoch 在 NextNodeEpoch 的锁内
+// 读取，与 failWrites 同纪律）；epochFailCount 返回取号失败次数快照
+// （取号失败形态下 RegisterNode 永不被调用，写计数不能当节拍证据）。
+func (f *fakeNodeRegistry) failEpoch(err error) {
+	f.mu.Lock()
+	f.errEpoch = err
+	f.mu.Unlock()
+}
+
+func (f *fakeNodeRegistry) healEpoch() {
+	f.mu.Lock()
+	f.errEpoch = nil
+	f.mu.Unlock()
+}
+
+func (f *fakeNodeRegistry) epochFailCount() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.epochFails
 }
 
 // waitCalled 阻塞至下一次 RegisterNode 调用发生（含失败调用——写失败

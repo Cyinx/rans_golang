@@ -3,10 +3,20 @@ package tcp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/cyinx/rans_golang/internal/log"
+)
+
+// acceptRetryMin/Max 临时 Accept 错误的重试退避边界：毫秒级起步、指数
+// 增长封顶——资源耗尽窗口通常短暂，长退避反伤入站恢复；封顶防持续耗尽
+// 时的日志洪水。成功接入即复位。
+const (
+	acceptRetryMin = time.Millisecond
+	acceptRetryMax = 20 * time.Millisecond
 )
 
 // dialFlight 单飞拨号结果槽：done 关闭后 mc/err 可读（channel close 的
@@ -48,26 +58,49 @@ func (m *Manager) Listen(ctx context.Context, addr string) (string, error) {
 	return l.Addr().String(), nil
 }
 
-// acceptLoop 后台接入循环：listener 关闭（Manager.Close 或错误）即退出。
-// 接入失败不致命（单条连接失败不影响后续 Accept）；TLS 握手失败（明文
-// 探测等）连接已关、静默丢弃——不回错帧（静默错位门闸），继续接后续连接。
-// 逐连接 goroutine 处理（决策出处：
+// acceptLoop 后台接入循环：Accept 错误三分——监听器已关闭（Manager.Close
+// 的常规收尾）静默终止；临时类（net.Error.Temporary 语义，EMFILE/ENFILE
+// 等资源耗尽形态）退避重试 + Warn 留痕——一次 fd 耗尽不得让入站永久失聪；
+// 其余持久错误终止 + Warn 留痕。接入失败不致命（单条连接失败不影响后续
+// Accept）；TLS 握手失败（明文探测等）连接已关、静默丢弃——不回错帧（静默
+// 错位门闸），继续接后续连接。逐连接 goroutine 处理（决策出处：
 // docs/decisions/2026-09-30-phase6-security.md）：startConn 内联 TLS 握手（阻塞
 // 至 HandshakeTimeout），同步处理会让慢握手/僵死探测串行限流 accept 吞吐
 // （slowloris 形态）；处理 goroutine 生命周期有界——握手超时与 hsTimer
 // 都以 HandshakeTimeout 封顶。
 func (m *Manager) acceptLoop(l net.Listener) {
+	backoff := acceptRetryMin
 	for {
 		nc, err := l.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if isTemporaryAcceptErr(err) {
+				log.Warn("rans/tcp: temporary accept error, retrying",
+					"node", m.cfg.NodeID, "reason", err)
+				time.Sleep(backoff)
+				backoff = min(backoff*2, acceptRetryMax)
+				continue
+			}
+			log.Warn("rans/tcp: accept loop terminated",
+				"node", m.cfg.NodeID, "reason", err)
 			return
 		}
+		backoff = acceptRetryMin
 		go func(nc net.Conn) {
 			// 失败路径 startConn 内已关连接（握手失败/包装前拒绝），
 			// 此处无须再处置；Close 兜底一切残余。
 			_, _ = m.startConn(nc, "", false)
 		}(nc)
 	}
+}
+
+// isTemporaryAcceptErr 报告 Accept 错误是否临时类（net.Error.Temporary
+// 语义——EMFILE/ENFILE 等资源耗尽可自愈形态）；关闭类错误已在上游分流。
+func isTemporaryAcceptErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Temporary()
 }
 
 // GetOrConnect 按地址懒建连接（单飞：同地址并发只拨一次，后来者共享

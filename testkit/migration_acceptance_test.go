@@ -436,9 +436,9 @@ func TestAcceptance_MigrationWindowZeroLoss(t *testing.T) {
 // 落败（ErrNotOwner）→ 迁移输：pawnite 回退 Active、源继续服役；随后销毁源
 // 实例（cleanup 条件注销）不得误删第三方条目。
 //
-// 长租约/长心跳（60s/60s）：本测试锁 CAS 输回退语义而非租约语义——外部翻转
-// 后不给心跳续租失败→自毁路径介入的窗口（该路径由 cluster_redis_test.go 的
-// TestAcceptance_HeartbeatSelfDestroyOnLeaseLoss 单独锁定）。
+// 长成员键存活期/存活节拍（60s/60s）：本测试锁 CAS 输回退语义而非成员失效
+// 面——外部翻转只动目录条目、不动成员视图，长参数保证窗口内不叠加接管/
+// 止损路径（成员键写持续失败的自检止损属独立语义，自有故障套件锁定）。
 func TestAcceptance_TransferFailRollback(t *testing.T) {
 	mustRedis(t)
 	// 有状态实体的迁移以 Store 落库为前提（spec §5.1 第 3 点 core 矩阵）：

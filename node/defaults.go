@@ -10,7 +10,7 @@ const (
 	// DefaultListenAddr 非 Standalone 形态的缺省监听地址（内核分配端口）。
 	DefaultListenAddr = "127.0.0.1:0"
 	// DefaultShutdownBudget Run 的停机预算缺省（Shutdown 的 ctx 窗口：
-	// 心跳/变更轮询等待 + 排空四段的合计上限）。
+	// 心跳等待 + 排空四段的合计上限）。
 	DefaultShutdownBudget = 15 * time.Second
 	// DefaultRedisKeyPrefix 自建 redis 目录的生产缺省键前缀。
 	DefaultRedisKeyPrefix = "rans:"

@@ -12,8 +12,9 @@ import (
 
 // RunRegisterSuite 对目录实现（directory.Directory 合并端口）跑全部契约
 // 断言（键值 v3 语义）：Register 单键四分支（无值/墓碑收养、同 node+epoch
-// 重注册、CAS 接管、输返回现归属）、注销写墓碑且纪元单调跨墓碑存续、
-// Transfer 三态（匹配赢/不符 ErrNotOwner/缺失 nil）与目标 epoch 写入。
+// 重注册、CAS 接管、输返回现归属）、epoch-0 未接代际条目的收养自愈、同节
+// 点换代 CAS 重占、注销写墓碑且纪元单调跨墓碑存续、条件注销三元全等无通
+// 配、Transfer 三态（匹配赢/不符 ErrNotOwner/缺失 nil）与目标 epoch 写入。
 // 并发用例钉死取号原子性（异节点竞争恰一赢、同节点收养纪元无重复）与输
 // 者观测一致性。归属三元 Owner{node, epoch, inc}：套件以 (node, epoch) 线
 // 注记身份（每节点独立 epoch，模拟成员代际）。阻塞到全部子测试完成；
@@ -119,6 +120,36 @@ func RunRegisterSuite(t *testing.T, newDir func(t *testing.T) directory.Director
 		}
 	})
 
+	t.Run("分支 2 epoch-0 收养：升写调用方纪元，返回值与落库一致且可注销", func(t *testing.T) {
+		d := newDir(t)
+		id := mkID("adoptzero")
+		// epoch-0 是受支持形态（节点未接代际窗口内的激活注册面）
+		if won, _, err := d.Register(ctx, id, self(1, 0), nil); err != nil || !won {
+			t.Fatalf("epoch-0 register: won=%v err=%v", won, err)
+		}
+		// 同节点携非零纪元收养：条目升写调用方纪元（自愈），current 是含新
+		// 纪元的自归属——返回值必须与 Lookup 落库值全等（按返回值簿记与
+		// 条件注销的前提）
+		won, owner, err := d.Register(ctx, id, self(1, 5), nil)
+		if err != nil || !won {
+			t.Fatalf("epoch-0 adoption: won=%v err=%v", won, err)
+		}
+		if owner.Node != 1 || owner.Epoch != 5 {
+			t.Fatalf("adopted owner = %v, want {1,5,inc} (caller epoch)", owner)
+		}
+		got, found, err := d.Lookup(ctx, id)
+		if err != nil || !found {
+			t.Fatalf("lookup: found=%v err=%v", found, err)
+		}
+		if got != owner {
+			t.Fatalf("returned owner %v must equal stored owner %v (return = stored)", owner, got)
+		}
+		// 按返回值注销必须命中（返回值≠落库值时此处恒 false，成幽灵条目）
+		if ok, err := d.UnregisterIfOwner(ctx, id, owner); err != nil || !ok {
+			t.Fatalf("unregister by returned owner: ok=%v err=%v", ok, err)
+		}
+	})
+
 	t.Run("分支 2 反例：同 node 异 epoch（换代）不收养——输返回旧代归属", func(t *testing.T) {
 		d := newDir(t)
 		id := mkID("genlost")
@@ -137,6 +168,29 @@ func RunRegisterSuite(t *testing.T, newDir func(t *testing.T) directory.Director
 		}
 		if owner != before {
 			t.Fatalf("lost register owner = %v, want old-generation holder %v", owner, before)
+		}
+	})
+
+	t.Run("同节点换代 CAS 重占：expected 三元全等赢且写新纪元自归属", func(t *testing.T) {
+		d := newDir(t)
+		id := mkID("genrecas")
+		_, holder, err := d.Register(ctx, id, self(1, 11), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 同节点换代（epoch 11→12）裸注册不收养（分支 2 反例）；携与现值
+		// 三元全等的 expected 则按分支 3 接管——写调用方新纪元，返回值与
+		// 落库一致
+		won, owner, err := d.Register(ctx, id, self(1, 12), &holder)
+		if err != nil || !won {
+			t.Fatalf("same-node next-generation CAS: won=%v err=%v", won, err)
+		}
+		if owner.Node != 1 || owner.Epoch != 12 || owner.Incarnation <= holder.Incarnation {
+			t.Fatalf("re-occupied owner = %v, want {1,12,inc>%d}", owner, holder.Incarnation)
+		}
+		got, found, err := d.Lookup(ctx, id)
+		if err != nil || !found || got != owner {
+			t.Fatalf("lookup after re-occupancy: %v found=%v err=%v, want %v", got, found, err, owner)
 		}
 	})
 
@@ -292,6 +346,24 @@ func RunRegisterSuite(t *testing.T, newDir func(t *testing.T) directory.Director
 		}
 		if _, found, _ := d.Lookup(ctx, id); found {
 			t.Fatal("entry must be invisible after exact-instance unregister")
+		}
+	})
+
+	t.Run("条件注销无通配：零值 epoch/inc 的 Owner 不命中任何条目", func(t *testing.T) {
+		d := newDir(t)
+		id := mkID("nowild")
+		_, owner, err := d.Register(ctx, id, self(1, 11), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 仅 node 匹配、epoch/inc 缺省的 Owner 是漏填形态：三元全等判据下
+		// 必须 no-op false（条目完好）——不存在按 node 通配的节点粒度清扫
+		if ok, err := d.UnregisterIfOwner(ctx, id, directory.Owner{Node: 1}); err != nil || ok {
+			t.Fatalf("wildcard-shaped unregister: ok=%v err=%v, want false no-op", ok, err)
+		}
+		got, found, err := d.Lookup(ctx, id)
+		if err != nil || !found || got != owner {
+			t.Fatalf("entry must survive wildcard-shaped unregister: %v found=%v err=%v, want %v", got, found, err, owner)
 		}
 	})
 

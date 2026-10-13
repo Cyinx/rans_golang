@@ -25,7 +25,9 @@ import (
 // 的恢复梯；consume-on-read 语义由真实 rpc 缓存承载，测试面恒命中即可）。
 type pkgLoader struct{ payload []byte }
 
-func (l *pkgLoader) LoadState(context.Context, rans.ID) ([]byte, bool) { return l.payload, true }
+func (l *pkgLoader) LoadState(context.Context, rans.ID) ([]byte, uint64, bool) {
+	return l.payload, 0, true
+}
 
 // sweepStore 记账型 Store：注入 N 次 Put 失败 + 终值/纪元台账（断言面）。
 type sweepStore struct {

@@ -45,7 +45,7 @@ func (fixedLocalPlacement) Pick(string, rans.NodeID, []rans.NodeID) (rans.NodeID
 }
 
 // clusterNode 节点私有状态：Slow 注入的每帧读写延迟（原子读，WrapConn 包装
-// 的已建立连接即时生效）。心跳/轮询归 node 内置（redis 形态自动接线）。
+// 的已建立连接即时生效）。心跳归 node 内置（redis 形态自动接线）。
 type clusterNode struct {
 	node    Node
 	latency atomic.Int64 // ns；0 = 无延迟
@@ -53,7 +53,7 @@ type clusterNode struct {
 
 // NewCluster 拉起 n 个节点（节点号 1..n）：逐个 node.New（注入 TestHooks：
 // 拨号/连接包装/解析全部逐节点闭包）→ Start → 回填地址表。共享目录与
-// kinds 贯穿全集群；redis 模式（WithRedis）每节点的心跳/轮询由 node 内置。
+// kinds 贯穿全集群；redis 模式（WithRedis）每节点的心跳由 node 内置。
 // t.Cleanup 统一 Close 所有节点与自建目录（幂等，Kill 过的节点重复 Close
 // 无害）。阻塞到全部节点 Start 完成（监听就绪）；并发安全（测试装配面）。
 func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Option) *Cluster {
@@ -61,12 +61,15 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 	if n < 1 {
 		t.Fatal("testkit: cluster needs at least 1 node")
 	}
-	o := options{callDefault: defaultCallTimeout}
+	o := options{callDefault: defaultCallTimeout, epochFailNode: -1}
 	for _, f := range opts {
 		f(&o)
 	}
 	if o.dir != nil && o.redis != nil {
 		t.Fatal("testkit: WithDirectory and WithRedis are mutually exclusive (redis mode brings its own directory)")
+	}
+	if o.epochFailNode < -1 || o.epochFailNode >= n {
+		t.Fatalf("testkit: WithNodeEpochFailure node index %d out of range (n=%d)", o.epochFailNode, n)
 	}
 	// redis 模式：目录由 testkit 构建并注入（测试持有——外部干预面与
 	// Kill 语义都靠它；node 只在 Directory.Redis 自建形态才拥有关闭权）。
@@ -85,8 +88,8 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 		})
 		o.dir = redisDir
 		// 残键清扫登记先于其余 Cleanup——LIFO 下最后执行：节点停机与
-		// 目录 Close 之后 SCAN+DEL 本前缀（含设计性无 TTL 的 {dir}:inc
-		// 纪元 Hash 与 {reg}:nodes 注册总表）。仅测试侧：生产 Close 只关
+		// 目录 Close 之后 SCAN+DEL 本前缀（含设计性无 TTL 的 {reg}:epoch
+		// 代际 Hash 与 {reg}:nodes 注册总表）。仅测试侧：生产 Close 只关
 		// 客户端绝不清键（红线）。
 		t.Cleanup(func() {
 			if err := sweepRedisTestKeys([]string{o.redis.addr}, os.Getenv("RANS_TEST_REDIS_PASSWORD"), redisPrefix); err != nil {
@@ -108,6 +111,17 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 	if o.redis != nil {
 		c.redisAddr = o.redis.addr
 		c.redisPrefix = redisPrefix
+		// FakeDeath 的落定等待基准：节点实际生效的心跳周期（≤0 → node 侧
+		// membership 缺省 30s；测试一律显式配短值）。
+		c.hbInterval = o.redis.heartbeatInterval
+		if c.hbInterval <= 0 {
+			c.hbInterval = 30 * time.Second
+		}
+	}
+	// 成员视图注入面（WithFakeDeath / WithNodeEpochFailure 装配）：逐节点
+	// 成员写门控句柄，与 nodes 平行（下标同序）；未启用时 gates 为 nil。
+	if o.fakeDeath || o.epochFailNode >= 0 {
+		c.gates = make([]*membershipGate, n)
 	}
 	// 清理先于构造注册：构造中途 Fatal 时已起的节点 goroutine 也能被收掉。
 	// LIFO 下它先于 redis 目录的 Close（更早登记）执行——节点先停、目录后关。
@@ -141,11 +155,26 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 			resolve = nil
 			tableResolve = false
 		}
+		// 假死注入面：本节点的目录换成成员写门控包装（其余节点直用共享
+		// 目录；门控布防前行为与裸目录全等）。取号失败布防在此落定——
+		// 先于 node.New/Start 的唯一确定性时机。
+		dirFor := o.dir
+		if c.gates != nil {
+			g, err := newMembershipGate(o.dir)
+			if err != nil {
+				t.Fatalf("testkit: node %d: %v", id, err)
+			}
+			if idx == o.epochFailNode {
+				g.failEpoch()
+			}
+			c.gates[idx] = g
+			dirFor = g
+		}
 		cfg := node.Config{
 			NodeID:      id,
 			ClusterName: clusterName,
 			Kinds:       kinds,
-			Directory:   node.DirectoryConfig{Injected: o.dir},
+			Directory:   node.DirectoryConfig{Injected: dirFor},
 			Security:    node.SecurityConfig{HMACKey: clusterSecret},
 			Calls:       node.CallConfig{Default: o.callDefault, Max: o.callMax},
 			Store:       o.store,
@@ -177,10 +206,14 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 			cfg.Placement = fixedLocalPlacement{}
 		}
 		if o.redis != nil {
-			// 续租/轮询共用周期（node 内置接线同源：Lease.Interval 驱动
-			// 心跳批与变更轮询；≤0 → membership 缺省 30s——测试注入短值
-			// 即缩短失效传播延迟）。
+			// 存活节拍周期（node 内置接线：Lease.Interval 驱动成员键刷新；
+			// ≤0 → membership 缺省 30s——测试注入短值即缩短失效传播延迟）。
 			cfg.Lease.Interval = o.redis.heartbeatInterval
+			// 存活节拍自围栏阈值逐节点覆盖（WithNodeSelfFence）：取号失败
+			// 形态的止损时长控制面。
+			if d, ok := o.nodeSelfFences[idx]; ok {
+				cfg.Lease.SelfFence = d
+			}
 		}
 		if o.watchdog != nil {
 			wd := *o.watchdog

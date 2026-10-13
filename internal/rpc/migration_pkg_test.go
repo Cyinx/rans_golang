@@ -198,6 +198,23 @@ func (e *migEnv) feedPackage(inst string, snap []byte) {
 	e.disp.HandleMessage(hdr, page)
 }
 
+// feedPackageVersioned 带源纪元扩展块的 MigrationPackage（新版发送方形态：
+// ext 携带源端落库快照时的围栏 incarnation——恢复侧版本比较的版本依据）。
+func (e *migEnv) feedPackageVersioned(inst string, snap []byte, srcInc uint64) {
+	hdr := wire.Header{
+		Type:         protocol.MsgMigrationPackage,
+		Flags:        protocol.FlagHasTargetUUID | protocol.FlagHasSourceNodeID | protocol.FlagHasExtensions,
+		MessageID:    9003,
+		SourceNodeID: 1,
+		TargetKind:   "counter",
+		TargetInst:   inst,
+		Ext:          wire.EncodeRequestExt(wire.RequestExt{HasSrcIncarnation: true, SrcIncarnation: srcInc}),
+	}
+	page := e.pool.Get(len(snap))
+	copy(page, snap)
+	e.disp.HandleMessage(hdr, page)
+}
+
 // migSnap 构造计数快照（8 字节大端）。
 func migSnap(v int64) []byte {
 	b := make([]byte, 8)
@@ -238,10 +255,10 @@ func TestPackageCachePutCopiesIn(t *testing.T) {
 	c := NewPackageCache(0)
 	id := migID(t, "cache-copy")
 	snap := migSnap(7)
-	c.Put(id, snap)
+	c.Put(id, snap, 0)
 	snap[7] ^= 0xFF // 调用方后续改写
-	got, ok := c.Take(id)
-	if !ok || int64(binary.BigEndian.Uint64(got)) != 7 {
+	got, srcInc, ok := c.Take(id)
+	if !ok || srcInc != 0 || int64(binary.BigEndian.Uint64(got)) != 7 {
 		t.Fatalf("Take = (%v, %v), want copied snapshot of 7", got, ok)
 	}
 }
@@ -250,11 +267,11 @@ func TestPackageCachePutCopiesIn(t *testing.T) {
 func TestPackageCacheTakeConsumesOnce(t *testing.T) {
 	c := NewPackageCache(0)
 	id := migID(t, "cache-once")
-	c.Put(id, migSnap(1))
-	if _, ok := c.Take(id); !ok {
+	c.Put(id, migSnap(1), 0)
+	if _, _, ok := c.Take(id); !ok {
 		t.Fatal("first Take must hit")
 	}
-	if _, ok := c.Take(id); ok {
+	if _, _, ok := c.Take(id); ok {
 		t.Fatal("second Take must miss (consume-on-read)")
 	}
 }
@@ -265,14 +282,14 @@ func TestPackageCacheTTLExpiryLazy(t *testing.T) {
 	c := NewPackageCache(0) // 0 → DefaultPackageTTL
 	c.now = clock.Now
 	id := migID(t, "cache-ttl")
-	c.Put(id, migSnap(2))
+	c.Put(id, migSnap(2), 0)
 	clock.Advance(DefaultPackageTTL - time.Second)
-	if _, ok := c.Take(id); !ok {
+	if _, _, ok := c.Take(id); !ok {
 		t.Fatal("entry must survive TTL minus one second")
 	}
-	c.Put(id, migSnap(3))
+	c.Put(id, migSnap(3), 0)
 	clock.Advance(DefaultPackageTTL + time.Second)
-	if _, ok := c.Take(id); ok {
+	if _, _, ok := c.Take(id); ok {
 		t.Fatal("entry must be lazily expired after TTL")
 	}
 }
@@ -454,6 +471,103 @@ func TestMigrationPackageNoCarrierIgnoresBytes(t *testing.T) {
 	}
 	if v != "bare-ok" {
 		t.Fatalf("call returned %v, want bare-ok (bare activation, bytes ignored)", v)
+	}
+}
+
+// ---- 版本比较：判输迁移的过期包弃包落 Store 梯级 ----
+
+// 11. 过期包（M6）：包与 Store 同纪元但 Store 内容已前进（判输后源端同
+// incarnation 续落新快照）→ 弃包：恢复取 Store 内容而非首跑快照。
+func TestMigrationPackageStaleByContentDropped(t *testing.T) {
+	env := newMigEnv(t)
+	id := migID(t, "pkg-stale-content")
+	if err := env.store.Put(context.Background(), id, 5, migSnap(9)); err != nil {
+		t.Fatal(err)
+	}
+	env.feedPackageVersioned("pkg-stale-content", migSnap(5), 5) // 判输迁移留下的首跑快照
+
+	v, err := env.mgr.InvokeLocal(context.Background(), id, nil)
+	if err != nil {
+		t.Fatalf("call after stale package: %v", err)
+	}
+	if v != int64(10) {
+		t.Fatalf("call returned %v, want 10 (store snapshot 9 restored; stale package 5 dropped)", v)
+	}
+	if at, _ := env.led.get(t, 0).activateView(); at != 9 {
+		t.Fatalf("Activate observed count %d, want 9 (stale package dropped, store carried)", at)
+	}
+}
+
+// 12. 包纪元低于 Store 高水位（Store 已被更高 incarnation 写过）→ 版本即弃。
+func TestMigrationPackageStaleByVersionDropped(t *testing.T) {
+	env := newMigEnv(t)
+	id := migID(t, "pkg-stale-version")
+	if err := env.store.Put(context.Background(), id, 7, migSnap(9)); err != nil {
+		t.Fatal(err)
+	}
+	env.feedPackageVersioned("pkg-stale-version", migSnap(5), 5) // 旧 incarnation 的包
+
+	v, err := env.mgr.InvokeLocal(context.Background(), id, nil)
+	if err != nil {
+		t.Fatalf("call after stale-by-version package: %v", err)
+	}
+	if v != int64(10) {
+		t.Fatalf("call returned %v, want 10 (store snapshot 9 restored; old-incarnation package 5 dropped)", v)
+	}
+	if at, _ := env.led.get(t, 0).activateView(); at != 9 {
+		t.Fatalf("Activate observed count %d, want 9 (old-incarnation package dropped)", at)
+	}
+}
+
+// 13. 版本化包不旧于 Store：同纪元同内容 → 包优先且恢复即落库（高水位被
+// 抬到接管实例纪元）；Store 未命中（高水位缺位）→ 包优先。
+func TestMigrationPackageVersionedFreshWins(t *testing.T) {
+	ctx := context.Background()
+
+	// 同纪元同内容：包优先，激活完成时 Store 高水位 = 接管实例纪元
+	//（恢复即落库的标记——restoreStore 路径不会写 Store）。先耗 5 个纪元，
+	// 接管实例取号 6 > 源纪元 5——恢复即落库的 Put 得以通过围栏（真实迁移
+	// 里接管取号与源纪元同源单调，恒大于包纪元）。
+	env := newMigEnv(t)
+	id := migID(t, "pkg-ver-fresh")
+	for i := 0; i < 5; i++ {
+		won, cur, err := env.dir.Register(ctx, id, directory.Owner{Node: 99}, nil)
+		if err != nil || !won {
+			t.Fatalf("epoch draw %d: won=%v err=%v", i, won, err)
+		}
+		if _, err := env.dir.UnregisterIfOwner(ctx, id, cur); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := env.store.Put(ctx, id, 5, migSnap(5)); err != nil {
+		t.Fatal(err)
+	}
+	env.feedPackageVersioned("pkg-ver-fresh", migSnap(5), 5)
+	v, err := env.mgr.InvokeLocal(ctx, id, nil)
+	if err != nil {
+		t.Fatalf("call on fresh versioned package: %v", err)
+	}
+	if v != int64(6) {
+		t.Fatalf("call returned %v, want 6 (package 5 restored)", v)
+	}
+	p, ok := env.mgr.GetLocal(id)
+	if !ok {
+		t.Fatal("instance missing after activation")
+	}
+	if hw, hit, err := env.store.HighWater(ctx, id); err != nil || !hit || hw != p.Incarnation() {
+		t.Fatalf("store high water = (%d, %v, %v), want takeover incarnation %d (restore-persist marker)", hw, hit, err, p.Incarnation())
+	}
+
+	// Store 未命中：包是唯一状态面，版本化包照常优先。
+	env2 := newMigEnv(t)
+	id2 := migID(t, "pkg-ver-nostore")
+	env2.feedPackageVersioned("pkg-ver-nostore", migSnap(5), 5)
+	v, err = env2.mgr.InvokeLocal(ctx, id2, nil)
+	if err != nil {
+		t.Fatalf("call with versioned package and empty store: %v", err)
+	}
+	if v != int64(6) {
+		t.Fatalf("call returned %v, want 6 (versioned package restored)", v)
 	}
 }
 
@@ -701,7 +815,7 @@ func TestRemoteLoopbackMigrationPackageLostStoreCarries(t *testing.T) {
 
 	// 注入包发送失败（装配期覆写 rpc.New 的直发接线——BindPackageSender 是
 	// 该槽唯一写入点，无运行期 Set 面）。
-	node1.mgr.BindPackageSender(func(context.Context, rans.NodeID, rans.ID, []byte) error {
+	node1.mgr.BindPackageSender(func(context.Context, rans.NodeID, rans.ID, []byte, uint64) error {
 		return errors.New("migration package lost (injected)")
 	})
 	if err := node1.rem.Migrate(ctx, id); err != nil {

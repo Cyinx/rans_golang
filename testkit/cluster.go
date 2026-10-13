@@ -118,6 +118,12 @@ type Cluster struct {
 	// redis 模式参数（KillMembership 的成员键操纵面；非 redis 模式为零值）。
 	redisAddr   string
 	redisPrefix string
+	// 成员视图注入面（WithFakeDeath / WithNodeEpochFailure 装配；未启用时
+	// gates 为 nil）：逐节点成员门控句柄，与 nodes 平行（下标同序）。
+	gates []*membershipGate
+	// hbInterval 生效心跳周期（redis 模式记录，FakeDeath 的落定等待基准；
+	// 配置 ≤0 归一化为 membership 缺省 30s——测试一律显式配短值）。
+	hbInterval time.Duration
 }
 
 // KillMembership 模拟节点成员死亡（确定性快路径）：关闭节点（停存活刷新/

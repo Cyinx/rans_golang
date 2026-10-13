@@ -55,13 +55,16 @@ func (p *Pawnite) CaptureOnLoop(capture func() ([]byte, error), done chan<- Capt
 }
 
 // runCapture loop 任务侧执行：复验 Active（入队与拾取之间可能已让渡给
-// 销毁/迁移）→ 捕获闭包（静默语境）→ 回捕获时刻纪元。纪元在 loop 上
-// 只由 invoke/转入 Active 写，本读取无并发写方。
+// 销毁/迁移）与静默判据（在飞 work 或续体排队时 Skipped——此刻放行会把未
+// 含续体写的快照连同覆盖该写的纪元一起入账，脏门控自此判净）→ 捕获闭包
+// （静默语境）→ 回捕获时刻纪元。纪元在 loop 上只由 invoke/转入 Active/
+// 续体执行写，本读取无并发写方。
 func (p *Pawnite) runCapture(req *captureReq) {
 	p.mu.Lock()
 	active := p.state == StateActive
+	quiesced := p.activityQuiescedLocked()
 	p.mu.Unlock()
-	if !active {
+	if !active || !quiesced {
 		req.done <- CaptureOutcome{Skipped: true}
 		return
 	}
@@ -105,6 +108,6 @@ func (p *Pawnite) drainPendingCaptures() {
 	}
 }
 
-// Epoch 活动纪元（脏门控依据）：进入 Active 记 1，此后每次投递 +1。
-// 原子读无锁。
+// Epoch 活动纪元（脏门控依据）：进入 Active 记 1，此后每次投递与每次续体
+// 执行各 +1。原子读无锁。
 func (p *Pawnite) Epoch() int64 { return p.activityEpoch.Load() }

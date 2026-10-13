@@ -31,10 +31,11 @@ type LivenessConfig struct {
 	// Interval 是成员键刷新周期（≤0 → 30s）。
 	Interval time.Duration
 
-	// SelfFence 自围栏阈值（H13 自 LeaseKeeper 迁入）：成员键写持续失败
-	// 超过该时长 → LocalIDs 全集关准入 + OnSelfFenceLost 止损销毁（接管
-	// 误判的兜底）。0 → max(MemberTTL−2×Interval, Interval)；<0 关闭；
-	// 每失败幕恰一次（写恢复复位）。
+	// SelfFence 自围栏阈值（H13 自 LeaseKeeper 迁入）：存活节拍（成员键
+	// 写/节点代际取号）持续失败超过该时长 → LocalIDs 全集关准入 +
+	// OnSelfFenceLost 止损销毁（接管误判的兜底）。0 →
+	// max(MemberTTL−2×Interval, Interval)；<0 关闭；每失败幕恰一次（写
+	// 恢复复位）。
 	SelfFence time.Duration
 
 	// MemberTTL 判活键存活期（SelfFence 缺省推导基准；≤0 → 2×Interval）。
@@ -244,7 +245,7 @@ func (l *Liveness) registerSelf(ctx context.Context) {
 		if err != nil {
 			log.Warn("rans/membership: node epoch allocation failed, retry next tick (node stays invisible until it succeeds)",
 				"self", l.self, "err", err)
-			l.noteWriteOutcome(false, time.Time{})
+			l.noteWriteOutcome(false, time.Now())
 			return
 		}
 		l.epoch.Store(e)
@@ -263,12 +264,18 @@ func (l *Liveness) registerSelf(ctx context.Context) {
 	l.noteWriteOutcome(err == nil, time.Now())
 }
 
-// noteWriteOutcome 成员键写结果记账；持续失败超 SelfFence 触发自围栏
-// （成功复位失败幕；首次失败起算基准；fence CAS 保证每幕恰一次；止损
-// 销毁独立 goroutine——本循环永不等待实体级工作，INV5）。
+// noteWriteOutcome 存活节拍失败记账（成员键写失败与节点代际取号失败同一
+// 入账——两形态经 Warn 日志可区分，记账统一按真实时刻推进同一 SelfFence
+// 时钟）；持续失败超 SelfFence 触发自围栏（成功复位失败幕；首次失败起算
+// 基准；零值入参时刻按当下真实时刻入账——垃圾时刻既不得生成垃圾基线也不
+// 得豁免入账；fence CAS 保证每幕恰一次；止损销毁独立 goroutine——本循环
+// 永不等待实体级工作，INV5）。
 func (l *Liveness) noteWriteOutcome(ok bool, now time.Time) {
 	if l.selfFence <= 0 {
 		return
+	}
+	if now.IsZero() {
+		now = time.Now() // 零值时刻按当下入账：失败既不豁免也不产生垃圾基线
 	}
 	if ok {
 		l.fenced.Store(false)

@@ -282,14 +282,13 @@ func planRPCMethod(e EntityDecl, m MethodDecl, pkg *PackageDecl, msgs []MessageD
 	}
 
 	args := m.Args[1:]
+	// 字段名合成唯一源 requestFieldNames（解析层参数名门卫同一函数，两处
+	// 规则不得漂移）；参数名门卫已在解析层拦掉空白名与归一碰撞。
+	names := requestFieldNames(args)
 	fields := make([]requestField, len(args))
 	for i, a := range args {
-		name := capitalize(a.Name)
-		if a.Name == "" {
-			name = "Arg" + strconv.Itoa(i+1) // 未命名参数：按参数位合成字段名
-		}
 		fields[i] = requestField{
-			Name:  name,
+			Name:  names[i],
 			Type:  a.Type,
 			Order: i + 1,
 			Tag:   orderTagLit(i + 1),
@@ -344,7 +343,8 @@ func planRPCMethod(e EntityDecl, m MethodDecl, pkg *PackageDecl, msgs []MessageD
 		for i, f := range fields {
 			declFields[i] = FieldDecl{Name: f.Name, Type: f.Type, Order: f.Order}
 		}
-		msgs = append(msgs, MessageDecl{Name: rpc.WireName, TypeName: rpc.ReqType, Fields: declFields})
+		// 派生请求的声明位置 = 方法声明处（跨包 wire 名冲突定位用）。
+		msgs = append(msgs, MessageDecl{Name: rpc.WireName, TypeName: rpc.ReqType, Pos: m.Pos, Fields: declFields})
 	}
 	rpc.Fields = fields
 

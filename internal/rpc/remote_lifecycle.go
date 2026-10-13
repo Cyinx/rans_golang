@@ -55,11 +55,10 @@ func (r *Remote) Start(ctx context.Context) error {
 //   - 看门狗（规格 §14.2 三形态）：缺省参数开跑，cfg.Watchdog 提供则覆盖
 //     （零值字段回落缺省）；激活卡死的收敛兜底（强弃）在此部署——
 //     无需进程重启；
-//   - 目录残骸清理：Dir 实现 CleanupExpired 能力才接线（inmem 跳过）；
 //   - 周期 checkpoint：CheckpointStore 已配置才接线（脏纪元门控在
 //     lifecycle.CheckpointSweep 复合体内）。
 //
-// 三者共享 runCtx（Shutdown/Close 停序收口）。Start 的 listen 对二次调用
+// 两者共享 runCtx（Shutdown/Close 停序收口）。Start 的 listen 对二次调用
 // 本就报错，本方法只在 listen 成功后到达恰一次。
 func (r *Remote) startPeriodicTasks() {
 	wdCfg := lifecycle.WatchdogConfig{}
@@ -107,7 +106,7 @@ func (r *Remote) Close() error {
 		if r.outbox != nil { // 装配失败路径发件箱尚未就绪
 			r.outbox.Close()
 		}
-		r.runCancel() // 收口周期任务族（看门狗/清理/checkpoint）
+		r.runCancel() // 收口周期任务族（看门狗/checkpoint）
 	})
 	return nil
 }
@@ -132,9 +131,9 @@ func (r *Remote) Close() error {
 //	③ 出站 flush：FlushWindow（500ms）有界窗口内轮询网关 pending 表与
 //	   发件箱深度清空——在途请求的最终响应与在箱单向帧全部收口后才关门；
 //	④ 停序：Config.ShutdownTeardown 登记的宿主组件收口（membership 续租/
-//	   轮询——阶段②③期间照常续租）→ 目录节点注销（Browser 能力
-//	   best-effort，兜住②中注销失败的残条目）→ listener+连接+心跳环
-//	   （conns.Close）→ 网关 deadline 扫描器（gw.Close）→ 周期任务族
+//	   轮询——阶段②③期间照常续租）→ 目录节点注销（实现 NodeRegistry 才
+//	   接线，best-effort——兜住②中注销失败的残条目）→ listener+连接+心跳
+//	   环（conns.Close）→ 网关 deadline 扫描器（gw.Close）→ 周期任务族
 //	   （runCancel）。
 //
 // 预算语义（spec §5.1 第 1 条）：ctx 是阶段②/③的预算而非总开关——排空
@@ -190,8 +189,8 @@ func teardownErr(fn func()) func() error {
 
 // unregisterNode 停序回调①：目录节点注销（规格 §14.1 ④ 兜底清扫）。
 // 阶段②的逐实体销毁已各自条件注销（UnregisterIfOwner），此处整节点清扫
-// 兜住注销失败/竞态残留的条目。best-effort：目录实现 Browser 能力（redis）
-// 时执行；inmem 等基础目录无此能力直接跳过（逐实体注销已覆盖）。独立小
+// 兜住注销失败/竞态残留的条目。best-effort：目录实现 NodeRegistry 能力
+// （redis）时执行；无成员面的目录直接跳过（逐实体注销已覆盖）。独立小
 // 超时——Drain ctx 可能已耗尽（注销不该因父预算枯竭被跳过），也不能因
 // 目录僵死挂死停序。
 func (r *Remote) unregisterNode() {

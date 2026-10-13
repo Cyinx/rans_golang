@@ -102,7 +102,10 @@ func TestCall_BudgetSynthesis(t *testing.T) {
 
 	t.Run("max_caps_option", func(t *testing.T) {
 		p := &budgetProbe{}
-		c := NewCluster(t, 1, budgetProbeKinds(p), WithCallMax(600*time.Millisecond))
+		// Default ≤ Max 是构造期不变量（node validate 拒绝 Max < Default）：
+		// 压低 Default 换取小 Max 的合法装配——封顶断言面不变。
+		c := NewCluster(t, 1, budgetProbeKinds(p),
+			WithCallDefault(300*time.Millisecond), WithCallMax(600*time.Millisecond))
 		id := mustID(t, "probe", "budget-max-opt")
 		if _, err := c.Node(0).CallOpts(context.Background(), id, nil, rans.Timeout(5*time.Second)); err != nil {
 			t.Fatal(err)
@@ -112,7 +115,8 @@ func TestCall_BudgetSynthesis(t *testing.T) {
 
 	t.Run("max_caps_caller_ctx", func(t *testing.T) {
 		p := &budgetProbe{}
-		c := NewCluster(t, 1, budgetProbeKinds(p), WithCallMax(600*time.Millisecond))
+		c := NewCluster(t, 1, budgetProbeKinds(p),
+			WithCallDefault(300*time.Millisecond), WithCallMax(600*time.Millisecond))
 		id := mustID(t, "probe", "budget-max-ctx")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

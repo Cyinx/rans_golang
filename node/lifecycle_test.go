@@ -50,6 +50,14 @@ func TestNewValidation(t *testing.T) {
 			Directory: DirectoryConfig{Redis: &redis.Options{Addr: "unused"}, Injected: mustInjected()}}, "mutually exclusive"},
 		{"standalone with listen addr", Config{NodeID: 1, Standalone: true, ListenAddr: "127.0.0.1:0",
 			Kinds: testKinds()}, "ListenAddr"},
+		{"nil factory", Config{NodeID: 1, Security: SecurityConfig{Insecure: true},
+			Kinds: map[string]rans.Factory{"counter": nil}}, `Kinds["counter"] factory is nil`},
+		{"invalid kind key", Config{NodeID: 1, Security: SecurityConfig{Insecure: true},
+			Kinds: map[string]rans.Factory{"bad!": func(rans.ID) rans.Entity { return &testCounter{} }}},
+			`Kinds["bad!"] is not a valid kind name`},
+		{"calls max below default", Config{NodeID: 1, Security: SecurityConfig{Insecure: true},
+			Kinds: testKinds(), Calls: CallConfig{Default: time.Minute, Max: time.Second}},
+			"must not be below"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

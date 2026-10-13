@@ -3,8 +3,8 @@
 // 前置：先 `make test-redis-up` 拉起测试 Redis（127.0.0.1:16379，可用环境变量
 // RANS_TEST_REDIS_ADDR 覆盖——与 Makefile/测试同口径），再 `go run ./examples/arbitration`。
 //
-// 每节点经 node.New 装配（短租约演示参数：租约 4s / 心跳 1s / 心跳键存活 8s）：
-// node 内部即 QUICKSTART 手工装配序（心跳续租/位置缓存+变更轮询/放置/地址
+// 每节点经 node.New 装配（短周期演示参数：心跳 1s / 成员键存活 8s）：
+// node 内部即 QUICKSTART 手工装配序（存活节拍/位置缓存/放置/地址
 // 解析全内置），各节点 Config.Directory.Redis 自建同前缀目录实例（逻辑同库
 // 同前缀，等价共享）。放置 = preferSelf（self 在候选中即选自身——种子与
 // 接管确定性落本节点，新鲜身份的并发首请求在两侧同时本地激活、撞同一把目

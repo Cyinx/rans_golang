@@ -426,7 +426,7 @@ func TestMigrate_WonFullPipeline(t *testing.T) {
 	migrated := make(chan migMigrated, 4)
 	m = activation.New(dir, 1, map[string]rans.Factory{
 		"carrier": func(_ rans.ID) rans.Entity { return &fakeCarrierEntity{state: []byte("state-v1")} },
-	}, activation.Options{Store: store, SendPackage: func(_ context.Context, target rans.NodeID, pid rans.ID, snap []byte) error {
+	}, activation.Options{Store: store, SendPackage: func(_ context.Context, target rans.NodeID, pid rans.ID, snap []byte, _ uint64) error {
 		pkgs <- migPackage{target: target, id: pid, snap: append([]byte(nil), snap...)}
 		return nil
 	}, Placement: func(string, rans.NodeID) (rans.NodeID, bool) { return 7, true }, OnMigrated: func(got rans.ID, to rans.NodeID) {
@@ -832,7 +832,7 @@ func TestMigrate_BareDirectorySupportsMigration(t *testing.T) {
 	pkgs := make(chan migPackage, 4)
 	m := activation.New(inmem.New(), 1, map[string]rans.Factory{
 		"carrier": func(_ rans.ID) rans.Entity { return &fakeCarrierEntity{state: []byte("state-v1")} },
-	}, activation.Options{Store: store, SendPackage: func(_ context.Context, target rans.NodeID, pid rans.ID, snap []byte) error {
+	}, activation.Options{Store: store, SendPackage: func(_ context.Context, target rans.NodeID, pid rans.ID, snap []byte, _ uint64) error {
 		pkgs <- migPackage{target: target, id: pid, snap: append([]byte(nil), snap...)}
 		return nil
 	}, Placement: func(string, rans.NodeID) (rans.NodeID, bool) { return 7, true }})
@@ -918,7 +918,7 @@ func TestMigrate_PutFailureLoses(t *testing.T) {
 	sends := make(chan struct{}, 4)
 	m := activation.New(dir, 1, map[string]rans.Factory{
 		"carrier": func(_ rans.ID) rans.Entity { return &fakeCarrierEntity{state: []byte("state-v9")} },
-	}, activation.Options{Store: store, SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte) error {
+	}, activation.Options{Store: store, SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte, uint64) error {
 		sends <- struct{}{}
 		return errors.New("network partition (injected)")
 	}, Placement: func(string, rans.NodeID) (rans.NodeID, bool) { return 7, true }})
@@ -957,7 +957,7 @@ func TestMigrate_SendFailureStillWins(t *testing.T) {
 	store := &migStore{}
 	m := activation.New(dir, 1, map[string]rans.Factory{
 		"carrier": func(_ rans.ID) rans.Entity { return &fakeCarrierEntity{state: []byte("state-v8")} },
-	}, activation.Options{Store: store, SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte) error {
+	}, activation.Options{Store: store, SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte, uint64) error {
 		return errors.New("network partition (injected)")
 	}, Placement: func(string, rans.NodeID) (rans.NodeID, bool) { return 7, true }})
 	id, _ := rans.NewID("carrier", "mig-sendfail")
@@ -998,7 +998,7 @@ func TestMigrate_CarrierlessSkipsStoreAndPackage(t *testing.T) {
 	m, id := newArbManager(1, dir, "mig-nocarrier",
 		activation.Options{
 			Store: store,
-			SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte) error {
+			SendPackage: func(context.Context, rans.NodeID, rans.ID, []byte, uint64) error {
 				sends <- struct{}{}
 				return nil
 			},

@@ -34,8 +34,6 @@ const DefaultMeterName = "rans"
 // 指标名常量（规格 §16 + 网关/传输扩展；接线方一律引用常量，
 // 不在业务包散落字符串）。
 const (
-	// NameHeartbeatLost 租约续租失败累计（Counter，规格 §16）。
-	NameHeartbeatLost = "rans.cluster.heartbeat_lost"
 	// NameQueueDepth 本地实体数（ObservableGauge，规格 §16 queue_depth）。
 	NameQueueDepth = "rans.pawnite.queue_depth_total"
 	// NameInboxDepth 各 pawnite 收件箱积压深度之和（ObservableGauge，
@@ -49,8 +47,10 @@ const (
 	// NameTransportBatchSize 最近一次写冲刷的帧数（ObservableGauge——
 	// writeLoop 队列清空即冲刷，读数即最近批量）。
 	NameTransportBatchSize = "rans.transport.batch_size"
-	// NameLeaseSelfFenced 本节点自检触发轮数累计（Counter——续租连续失败
-	// 超 SelfFence 阈值、对全部本地实体执行止损的轮数，每触发一轮 +1）。
+	// NameLeaseSelfFenced 本节点自检触发轮数累计（Counter——成员键写连续
+	// 失败超 SelfFence 阈值、对全部本地实体执行止损的轮数，每触发一轮
+	// +1）。注册在节点自有注册表（node 装配期），经 Node.Metrics() 逐节点
+	// 读数——自检是逐节点事实，进程级聚合会抹掉「哪个节点在失联」。
 	NameLeaseSelfFenced = "rans.lease.self_fenced"
 	// NameActivationFailed 实体激活失败累计（Counter——激活流程以失败
 	// 收场、实体从未进入 Active 的次数；reason 属性区分失败面）。

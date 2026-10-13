@@ -389,10 +389,9 @@ go run ./cmd/ransgen \
   | `rans.transport.batch_size` | Gauge | **最近一次**写冲刷帧数（非均值/累计；不引入 histogram） | `Node.Metrics()` |
   | `rans.handshake.schema_mismatch` | Counter | 握手 SchemaDigest 失配累计（观测模式：告警+计数、连接保持；StrictSchema 拒连不计入） | `Node.Metrics()` |
   | `rans.call.expired` | Counter | 出队过期即弃累计（出队执行前预算已耗尽、未执行按 Timeout+Expired 回绝） | `Node.Metrics()` |
-  | `rans.cluster.heartbeat_lost` | Counter | 续租失败批累计（+len(failed)；租约目录形态才注册） | `Node.Metrics()` |
   | `rans.activation.failed` | Counter | 实体激活失败累计（进程内跨节点聚合） | 进程级注册表（OTel 导出/宿主 SDK 同源可见） |
   | `rans.checkpoint.final_failed` | Counter | 停机终快照预算内重试后仍失败累计（同上） | 进程级注册表 |
-  | `rans.lease.self_fenced` | Counter | 续租连续失败触发自检轮数累计（同上） | 进程级注册表 |
+  | `rans.lease.self_fenced` | Counter | 成员键连续写失败触发自围栏轮数累计（逐节点告警可归因） | `Node.Metrics()` |
 
   节点配置面无任何运行期 `Set*`——全部配置在
   `node.New(Config)` 构造时一次给全，运行中不可变；`rans.SetLogger` 是唯一

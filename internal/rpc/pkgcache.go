@@ -57,9 +57,10 @@ type PackageCache struct {
 	order []rans.ID
 }
 
-// pkgEntry 单个待消费包：快照字节（缓存独占）+ 过期时刻。
+// pkgEntry 单个待消费包：快照字节（缓存独占）+ 源端围栏纪元 + 过期时刻。
 type pkgEntry struct {
 	snap     []byte
+	srcInc   uint64 // 源端落库快照时的围栏 incarnation（0 = 未携带版本）
 	deadline time.Time
 }
 
@@ -72,9 +73,10 @@ func NewPackageCache(ttl time.Duration) *PackageCache {
 }
 
 // Put 拷贝入快照并刷新 TTL（同 id 重复投递为覆盖——at-most-once 投递语义下
-// 不应发生，覆盖是防御口径）。新 id 准入致满员时按容量策略腾位（先清过期
-// 再 FIFO 逐出，见 PackageCache 注释）。
-func (c *PackageCache) Put(id rans.ID, snap []byte) {
+// 不应发生，覆盖是防御口径）。srcInc 是包的源端围栏纪元（0 = 未携带版本）。
+// 新 id 准入致满员时按容量策略腾位（先清过期再 FIFO 逐出，见 PackageCache
+// 注释）。
+func (c *PackageCache) Put(id rans.ID, snap []byte, srcInc uint64) {
 	cp := make([]byte, len(snap))
 	copy(cp, snap)
 	c.mu.Lock()
@@ -83,7 +85,7 @@ func (c *PackageCache) Put(id rans.ID, snap []byte) {
 		c.ensureCapacityLocked()
 		c.order = append(c.order, id)
 	}
-	c.m[id] = pkgEntry{snap: cp, deadline: c.now().Add(c.ttl)}
+	c.m[id] = pkgEntry{snap: cp, srcInc: srcInc, deadline: c.now().Add(c.ttl)}
 	c.compactOrderLocked()
 }
 
@@ -147,19 +149,20 @@ func (c *PackageCache) compactOrderLocked() {
 }
 
 // Take 取出并消费快照（consume-on-read）：命中即删除条目并移交字节所有权
-// （缓存不再引用，调用方可安全持有）；未命中或已惰性过期返回 (nil, false)。
-func (c *PackageCache) Take(id rans.ID) ([]byte, bool) {
+// （缓存不再引用，调用方可安全持有）；srcInc 为包的源端围栏纪元；未命中
+// 或已惰性过期返回 (nil, 0, false)。
+func (c *PackageCache) Take(id rans.ID) ([]byte, uint64, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[id]
 	if !ok {
-		return nil, false
+		return nil, 0, false
 	}
 	delete(c.m, id)
 	if c.now().After(e.deadline) {
-		return nil, false // 惰性过期：过期包视同 miss，调用方走 Store 兜底
+		return nil, 0, false // 惰性过期：过期包视同 miss，调用方走 Store 兜底
 	}
-	return e.snap, true
+	return e.snap, e.srcInc, true
 }
 
 // peek 只读探查（不消费、拷贝出）：测试等包到达的确定性握手点，非运行时 API。
@@ -185,7 +188,8 @@ type cacheStateLoader struct {
 // 编译期断言：cacheStateLoader 满足激活期装载契约。
 var _ activation.StateLoader = (*cacheStateLoader)(nil)
 
-// LoadState 消费式装载（见 Take 的 consume-on-read 契约）。
-func (l *cacheStateLoader) LoadState(_ context.Context, id rans.ID) ([]byte, bool) {
+// LoadState 消费式装载（见 Take 的 consume-on-read 契约）；srcInc 原样
+// 透传给激活侧的包版本比较。
+func (l *cacheStateLoader) LoadState(_ context.Context, id rans.ID) ([]byte, uint64, bool) {
 	return l.cache.Take(id)
 }

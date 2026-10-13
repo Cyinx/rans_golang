@@ -2,7 +2,7 @@ package node
 
 // redis 目录形态的接线与行为回归（自 host/redis_test.go 迁入，断言不弱化）：
 // 心跳/成员视图收敛、kind 感知放置（未承载目标 kind 的节点永不被放置选中）、
-// 变更轮询失效陈旧路由、手工装配等价性。目录经 DirectoryConfig.Injected 注入
+// 手工装配等价性。目录经 DirectoryConfig.Injected 注入
 // （测试持有——node 自建形态的关闭行为由 Shutdown 生命周期覆盖，观察面不
 // 依赖私有把手）。
 
@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -46,7 +45,7 @@ func redisGate(t *testing.T) string {
 }
 
 // sweepTestKeys 登记测试残键清扫：t.Cleanup 里 SCAN+DEL 本
-// KeyPrefix 前缀下全部键——设计性无 TTL 的键族（{dir}:inc 纪元 Hash、
+// KeyPrefix 前缀下全部键——设计性无 TTL 的键族（{reg}:epoch 代际 Hash、
 // {reg}:nodes 注册总表）与未到期的 TTL 键随测试结束物理清除，共享 Redis
 // 实例不随测试轮次累积。仅测试侧使用：生产 Close 只关客户端绝不清键
 // （红线）。在 nodeRedisOptions（夹具铸造点）登记——早于各测试的节点停机
@@ -99,8 +98,7 @@ type localPlacement struct{}
 
 func (localPlacement) Pick(string, rans.NodeID, []rans.NodeID) (rans.NodeID, bool) { return 0, false }
 
-// mkRedisNode 注入共享目录的标准节点（1s 心跳/轮询、5s 请求超时，Start 后
-// 返回）。
+// mkRedisNode 注入共享目录的标准节点（1s 心跳、5s 请求超时，Start 后返回）。
 func mkRedisNode(t *testing.T, dir directory.Directory, id rans.NodeID, mut func(*Config)) *Node {
 	t.Helper()
 	cfg := Config{
@@ -159,8 +157,8 @@ func TestRedisFullWiring(t *testing.T) {
 		t.Fatalf("node2 local call (owner after placement): v=%v err=%v", v, err)
 	}
 
-	// 心跳接线可观察：实体在 Track 集（经激活计数侧证——激活成功且无租约
-	// 失败自毁即间接成立；直接断言面私有，不越界）。
+	// 心跳接线可观察：实体在 Track 集（经激活计数侧证——激活成功且无自围
+	// 止损销毁即间接成立；直接断言面私有，不越界）。
 	// 优雅停机后节点即时退视图（Drain 目录注销顺带清节点成员键）。
 	sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer scancel()
@@ -183,29 +181,8 @@ func TestRedisFullWiring(t *testing.T) {
 	}
 }
 
-// lookupCountingDir Lookup 计数目录（包装注入目录，只加观测不改语义）：
-// 变更轮询失效陈旧路由的探针——「外部注销后下一次路由必须重查目录」。
-// 具体内嵌 *redis.Directory（非接口——能力面断言 LeaseDirectory/BrowseAll/
-// NodeAddrResolver 靠方法提升穿透包装，节点续租/轮询/解析缺一不可）。
-type lookupCountingDir struct {
-	*redis.Directory
-	mu     sync.Mutex
-	byKind map[string]int
-}
-
-func (c *lookupCountingDir) Lookup(ctx context.Context, id rans.ID) (directory.Owner, bool, error) {
-	c.mu.Lock()
-	c.byKind[id.Kind+"/"+id.Key]++
-	c.mu.Unlock()
-	return c.Directory.Lookup(ctx, id)
-}
-
-func (c *lookupCountingDir) count(id rans.ID) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.byKind[id.Kind+"/"+id.Key]
-}
-
+// TestEquivalenceWithManualQUICKSTART node.New 装配与 README QUICKSTART
+// 手工装配的等价性（行为断言两侧逐一成立，装配面不许有暗差异）。
 func TestEquivalenceWithManualQUICKSTART(t *testing.T) {
 	base := nodeRedisOptions(t)
 

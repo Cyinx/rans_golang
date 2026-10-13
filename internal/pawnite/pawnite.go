@@ -92,8 +92,8 @@ type Pawnite struct {
 	evictOnce  sync.Once // 终局效应（OnEvict）恰一次守卫：finish 与强弃竞争单胜
 
 	// 快照捕获面（规格 §15）：loop 任务单飞通道 + 活动纪元（脏门控依据：
-	// 进入 Active 记 1、每次投递 +1；manager 侧比对已 checkpoint 纪元，
-	// 闲置实体永不重写）。机制见 checkpoint.go。
+	// 进入 Active 记 1、每次投递与每次续体执行各 +1；manager 侧比对已
+	// checkpoint 纪元，闲置实体永不重写）。机制见 checkpoint.go。
 	// 注意：activityEpoch 是实例内相对纪元（脏门控专用），与 incarnation
 	//（跨 incarnation 单调的 fencing 纪元）语义不同层。
 	captureCh     chan *captureReq

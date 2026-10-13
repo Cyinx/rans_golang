@@ -112,8 +112,6 @@ type Config struct {
 	// queue/inbox 深度、transport 重拨计数与写批量、握手摘要失配计数）——
 	// 构造点集中注入，业务包不散落 metrics 引用。同名仪表在共享注册表上
 	// 聚合（观察值求和/计数器共用——多 Remote 单进程形态即 testkit 集群）。
-	// 心跳类指标（rans.cluster.heartbeat_lost）归拥有 HeartbeatService 的
-	// 宿主接（rpc 不拥有续租），接线示范见 testkit redis 模式。
 	Metrics *metrics.Registry
 
 	// ---- 周期任务族（规格 §14.2/§15/§11.1）：Start 起跑、
@@ -313,12 +311,13 @@ func New(cfg Config) (*Remote, error) {
 	// 表构造，无法进 Options；Start 前单写一次，之后不可变。目标端恢复
 	// 梯子（包缓存优先 + Store 兜底）锚定于此。
 	cfg.Manager.BindStateLoader(&cacheStateLoader{cache: r.pkgs})
-	// 源端半边：随迁包直发（body = 原始快照字节，不套外封；
-	// Header 常规条件字段：TargetUUID 寻址 + SourceNodeID 留源，MessageID
-	// 取网关序）。失败仅记录（migCore 尽力而为）；发送成功即快照缓冲所有
-	// 权移交连接（writeFrame 编码后归还页池），失败时缓冲归 migCore 局部。
+	// 源端半边：随迁包直发（body = 原始快照字节，不套外封；Header 条件
+	// 字段：TargetUUID 寻址 + SourceNodeID 留源；扩展块携带源纪元——源端
+	// 落库围栏 incarnation，收端恢复时与 Store 高水位比较、包旧弃包）。
+	// 失败仅记录（migCore 尽力而为）；发送成功即快照缓冲所有权移交连接
+	//（writeFrame 编码后归还页池），失败时缓冲归 migCore 局部。
 	cfg.Manager.BindPackageSender(
-		func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte) error {
+		func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error {
 			hdr := wire.Header{
 				Type:         protocol.MsgMigrationPackage,
 				Flags:        protocol.FlagHasTargetUUID | protocol.FlagHasSourceNodeID,
@@ -327,7 +326,32 @@ func New(cfg Config) (*Remote, error) {
 				TargetKind:   id.Kind,
 				TargetInst:   id.Key,
 			}
+			if srcInc != 0 {
+				hdr.Flags |= protocol.FlagHasExtensions
+				hdr.Ext = wire.EncodeRequestExt(wire.RequestExt{
+					HasSrcIncarnation: true,
+					SrcIncarnation:    srcInc,
+				})
+			}
 			return r.gw.SendOneWay(ctx, target, hdr, snap)
+		})
+	// 接管通知发送半边（H13 决策 22）：CAS 接管赢方经发件箱以 MsgOwnershipLost
+	// 控制帧直发原归属节点（帧类型在控制面集合内，传输层入控道优先写出；
+	// 收端处置见 dispatcher handleOwnershipLost）。best-effort：TryPut 满箱
+	// 即丢、关箱拒绝——通知丢失由 SelfFence 兜底（既定语义，不重试）。装配
+	// 位与随迁包两端同族：发件箱是本组合体内部构件，Start 前单写一次。
+	cfg.Manager.BindTakeoverNotifier(
+		func(target rans.NodeID, id rans.ID, prev directory.Owner) {
+			hdr := wire.Header{
+				Type:         protocol.MsgOwnershipLost,
+				Flags:        protocol.FlagHasTargetUUID | protocol.FlagHasSourceNodeID,
+				MessageID:    r.gw.NextMessageID(),
+				SourceNodeID: uint16(r.cfg.NodeID),
+				TargetKind:   id.Kind,
+				TargetInst:   id.Key,
+			}
+			_ = r.outbox.TryPut(target, hdr, wire.EncodeOwnershipLost(
+				wire.OwnershipLost{Epoch: prev.Epoch, Incarnation: prev.Incarnation}))
 		})
 	return r, nil
 }

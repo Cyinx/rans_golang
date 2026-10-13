@@ -50,6 +50,12 @@ var (
 	ErrMigrationNoStore = errors.New("rans: migrate: refusing stateful entity without checkpoint store")
 )
 
+// errOwnerNotCaptured 迁移换锁的前置失败：本实例无捕获归属（注册从未
+// 完成——core 在 loop 上串行运行，在册实例必有捕获值；miss 是条目已被
+// 终局清理的极端交错）。无目录主张不得换锁：确定性拒绝，错误链经
+// migrationLossError 保留具体输因（无取消签名，不被预算错误遮蔽）。
+var errOwnerNotCaptured = errors.New("rans: migrate: ownership not captured")
+
 // Migrate 把本地实体迁移到 placement 选出的目标节点（规格 §13.1
 // PawniteManager.Migrate 同构；阻塞至裁决）：
 //
@@ -152,9 +158,10 @@ func Migrate(ctx context.Context, tbl *activation.Table, id rans.ID) error {
 //  1. 有状态且配置 Store：捕获快照（失败按 Put 失败处理——判输）；snap 非空
 //     → store.Put（围栏携带源端 incarnation；失败判输）→ 随迁包
 //     直发（可缺席/失败）；
-//  2. TryTransferOwnership(self,inc → target)（实例级：期望归属
-//     是本实例的 Owner{node, inc}——同 node 新实例不被本实例的迟到换锁
-//     误伤；换锁成功即目录升纪元 K）。换锁能力经类型断言发现（实例级换锁
+//  2. TryTransferOwnership(captured → target)（实例级：期望归属是激活
+//     时刻捕获的本实例归属（Table.InstanceOwner，node+epoch+inc 三元）——
+//     同 node 新实例不被本实例的迟到换锁误伤；换锁成功即目录升纪元 K）。
+//     换锁能力经类型断言发现（实例级换锁
 //     是可选能力面 directory.TransferDirectory；仓库自带
 //     实现 inmem/redis 均具备，自定义目录缺该面时迁移输——错误链响亮
 //     留痕）。返回的 newInc 供观测
@@ -188,27 +195,39 @@ func migCore(ctx context.Context, tbl *activation.Table, id rans.ID, ent rans.En
 				return pawnite.MigrationOutcome{}, fmt.Errorf("rans: migrate: checkpoint put failed: %w", err)
 			}
 			// 随迁包直发（规格 §13.3 E1 快路径）：at-most-once，失败仅记录
-			// ——目标端未命中包时从刚落库的 Store 恢复，语义无损。
+			// ——目标端未命中包时从刚落库的 Store 恢复，语义无损。包头扩展
+			// 块携带源纪元（本 Store.Put 的围栏 incarnation）：目标端恢复时
+			// 与 Store 高水位比较，判输迁移留下的过期包被弃（落 Store 梯级）。
 			if send := tbl.PackageSender(); send != nil {
-				if err := send(ctx, target, id, b); err != nil {
+				if err := send(ctx, target, id, b, p.Incarnation()); err != nil {
 					log.Warn("migration package send failed (best effort)",
 						"uuid", id.String(), "target", target, "err", err)
 				}
 			}
 		}
 	}
-	// 换锁（Directory 合并端口本面方法，无能力断言形态）：期望归属三元组
-	//（本实例 node+epoch+inc），目标归属 node+epoch——目标代际从成员注册
-	// 面取（目录实现 NodeRegistry 即查；未实现/未注册回落 0 形态，条目
-	// 有效性判定按「未接代际」处理）。
+	// 换锁（Directory 合并端口本面方法，无能力断言形态）：期望归属用激活
+	// 时刻捕获的实例归属（Table.InstanceOwner——注册原子域返回的自归属，
+	// node+epoch+inc 三元与目录条目现值同源）。条目纪元是捕获值而非当下
+	// 节点代际：启动窗口（节点即刻可服务先于 liveness 首轮取号）内激活的
+	// 实体以 Epoch=0 落目录，期望纪元若读当下 SelfEpoch()，代际就位后
+	// 三元比对恒 ErrNotOwner——窗口条目迁移永久失败且静默。目标归属
+	// node+epoch——目标代际从成员注册面取（目录实现 NodeRegistry 即查；
+	// 未实现/未注册回落 0 形态，条目有效性判定按「未接代际」处理）。
+	expected, ok := tbl.InstanceOwner(id)
+	if !ok {
+		// 防御：core 在 loop 上串行运行，在册实例必有捕获归属（注册成功
+		// 先于 Active 转移）；miss 即条目已被终局清理的极端交错——无目录
+		// 主张不得换锁，按确定性拒绝判输（无取消签名，输因不被预算遮蔽）。
+		return pawnite.MigrationOutcome{}, errOwnerNotCaptured
+	}
 	targetEpoch := uint64(0)
 	if reg, ok := tbl.Directory().(directory.NodeRegistry); ok {
 		if ep, alive, err := reg.NodeEpoch(ctx, target); err == nil && alive {
 			targetEpoch = ep
 		}
 	}
-	won, newInc, _, err := tbl.Directory().Transfer(ctx, id,
-		directory.Owner{Node: tbl.SelfNode(), Epoch: tbl.SelfEpoch(), Incarnation: p.Incarnation()},
+	won, newInc, _, err := tbl.Directory().Transfer(ctx, id, expected,
 		directory.Owner{Node: target, Epoch: targetEpoch})
 	if err != nil {
 		// 含 ErrNotOwner（归属不符）：输因随 core 错误链上行——调用方

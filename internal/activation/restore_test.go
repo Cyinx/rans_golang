@@ -69,6 +69,9 @@ type recStore struct {
 	// putDelay >0 时前 N 次 Put 进入即睡眠 recStorePutDelay（慢 IO 注入，
 	// 模拟在飞周期 checkpoint 与终快照的次序竞争）。
 	putDelay atomic.Int32
+	// putHold 非 nil 时 Put 进入即阻塞直至通道关闭（可控慢 Put 收尾窗：
+	// 测试在窗内完成换代，精确复现「Put 期间实例被强弃重激活」的交错）。
+	putHold chan struct{}
 	// putEntered 非 nil 时首次 Put 进入即关闭（「Put 已在飞」的控制信号）。
 	putEntered   chan struct{}
 	putEnterOnce sync.Once
@@ -92,6 +95,9 @@ func (s *recStore) Put(ctx context.Context, id rans.ID, incarnation uint64, snap
 		case <-ctx.Done():
 		case <-time.After(recStorePutDelay):
 		}
+	}
+	if s.putHold != nil {
+		<-s.putHold
 	}
 	err := s.Store.Put(ctx, id, incarnation, snapshot)
 	s.mu.Lock()
@@ -239,14 +245,28 @@ func (s *errStore) Get(context.Context, rans.ID) ([]byte, bool, error) {
 func (s *errStore) Put(context.Context, rans.ID, uint64, []byte) error { return nil }
 func (s *errStore) Delete(context.Context, rans.ID) error              { return nil }
 
-// stubStateLoader 固定返回注入字节的 StateLoader 桩。
+// stubStateLoader 固定返回注入字节的 StateLoader 桩（srcInc 缺省 0：未携带
+// 版本的包形态——恢复侧退回包优先历史行为；版本化包显式注入）。
 type stubStateLoader struct {
-	b  []byte
-	ok bool
+	b      []byte
+	srcInc uint64
+	ok     bool
 }
 
-func (l *stubStateLoader) LoadState(context.Context, rans.ID) ([]byte, bool) {
-	return l.b, l.ok
+func (l *stubStateLoader) LoadState(context.Context, rans.ID) ([]byte, uint64, bool) {
+	return l.b, l.srcInc, l.ok
+}
+
+// hwStore errStore 的高水位能力面变体（packageStale 的版本消费点）：高水位
+// 可注入，内容命中沿用 errStore 的 snap/hit。
+type hwStore struct {
+	errStore
+	hw   uint64
+	hwOK bool
+}
+
+func (s *hwStore) HighWater(context.Context, rans.ID) (uint64, bool, error) {
+	return s.hw, s.hwOK, nil
 }
 
 // TestRestoreState_Classification：包内直调 restoreState 的单元分类——
@@ -359,6 +379,115 @@ func TestRestoreState_Classification(t *testing.T) {
 		}
 		if src != restoreNone {
 			t.Fatalf("未接线任何状态面恢复来源应为 restoreNone，得到 %v", src)
+		}
+	})
+}
+
+// TestRestoreState_StalePackageVersionCompare：随迁包版本比较（M6 修复的
+// 单元分类）——包命中且恢复成功后与 Store per-id 高水位比较，判定序逐分支
+// 钉死：包旧（版本低于高水位 / 同纪元但 Store 内容已前进）弃包落 Store
+// 梯级；包不旧（版本高于高水位 / 同纪元同内容 / 比较不可用）保持包优先。
+func TestRestoreState_StalePackageVersionCompare(t *testing.T) {
+	ctx := context.Background()
+	X := mustTestID(t, "acct", "stale-cmp")
+
+	t.Run("EqualIncStoreAdvancedDropsPackage", func(t *testing.T) {
+		// 判输迁移的 M6 签名：包与 Store 同纪元（源端判输后同 incarnation
+		// 续落了更新的快照），内容前进即源端已推进——弃包。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{snap: []byte("1000"), hit: true}, hw: 5, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, b, err := m.restoreState(ctx, X, ent)
+		if err != nil {
+			t.Fatalf("弃包后应退 Store 成功，得到 %v", err)
+		}
+		if src != restoreStore || b != nil || ent.bal != 1000 {
+			t.Fatalf("过期包必须弃：src=%v bal=%d b=%d bytes", src, ent.bal, len(b))
+		}
+	})
+
+	t.Run("EqualIncSameContentKeepsPackage", func(t *testing.T) {
+		// 成功迁移形态：migCore 先落库后发包，同纪元同内容——包优先。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{snap: []byte("500"), hit: true}, hw: 5, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, b, err := m.restoreState(ctx, X, ent)
+		if err != nil {
+			t.Fatalf("包不旧应包优先成功，得到 %v", err)
+		}
+		if src != restorePackage || string(b) != "500" || ent.bal != 500 {
+			t.Fatalf("包优先必须保持：src=%v bal=%d b=%q", src, ent.bal, b)
+		}
+	})
+
+	t.Run("LowerVersionDropsPackage", func(t *testing.T) {
+		// Store 已被更高 incarnation 写过：版本即弃（不读内容）。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{snap: []byte("1000"), hit: true}, hw: 7, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, _, err := m.restoreState(ctx, X, ent)
+		if err != nil || src != restoreStore || ent.bal != 1000 {
+			t.Fatalf("旧 incarnation 的包必须弃：src=%v bal=%d err=%v", src, ent.bal, err)
+		}
+	})
+
+	t.Run("HigherVersionKeepsPackage", func(t *testing.T) {
+		// Store 高水位低于包纪元：Store 无更新写，包优先（Get 注入 IO 错误
+		// 证明不读内容——版本比较已裁完）。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{getErr: errors.New("store io down")}, hw: 3, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, _, err := m.restoreState(ctx, X, ent)
+		if err != nil || src != restorePackage || ent.bal != 500 {
+			t.Fatalf("版本高于高水位的包必须优先：src=%v bal=%d err=%v", src, ent.bal, err)
+		}
+	})
+
+	t.Run("UnversionedPackageKeepsPackage", func(t *testing.T) {
+		// 旧端发送方未携带版本：无法判定，保守包优先（历史行为）。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{snap: []byte("1000"), hit: true}, hw: 9, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), ok: true},
+		})
+		ent := &acctEntity{}
+		src, _, err := m.restoreState(ctx, X, ent)
+		if err != nil || src != restorePackage || ent.bal != 500 {
+			t.Fatalf("无版本包必须保持包优先：src=%v bal=%d err=%v", src, ent.bal, err)
+		}
+	})
+
+	t.Run("NoHighWaterCapabilityKeepsPackage", func(t *testing.T) {
+		// Store 未实现 HighWaterReader：能力缺席，保守包优先（历史行为）。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &errStore{snap: []byte("1000"), hit: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, _, err := m.restoreState(ctx, X, ent)
+		if err != nil || src != restorePackage || ent.bal != 500 {
+			t.Fatalf("能力缺席必须保持包优先：src=%v bal=%d err=%v", src, ent.bal, err)
+		}
+	})
+
+	t.Run("EqualIncGetErrorKeepsPackage", func(t *testing.T) {
+		// 同纪元内容比对不可用（Get IO 错误）：比较是加速判定，不损包优先
+		// ——Store IO 错误由其后的恢复梯/落库面按既有语义收口。
+		m := New(inmem.New(), 1, nil, Options{
+			Store:       &hwStore{errStore: errStore{getErr: errors.New("store io down")}, hw: 5, hwOK: true},
+			StateLoader: &stubStateLoader{b: []byte("500"), srcInc: 5, ok: true},
+		})
+		ent := &acctEntity{}
+		src, _, err := m.restoreState(ctx, X, ent)
+		if err != nil || src != restorePackage || ent.bal != 500 {
+			t.Fatalf("比对不可用必须保持包优先：src=%v bal=%d err=%v", src, ent.bal, err)
 		}
 	})
 }

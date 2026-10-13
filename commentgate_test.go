@@ -28,6 +28,7 @@ import (
 // generatedFiles 生成物豁免清单：重生成即覆写，一切本门禁不适用。
 var generatedFiles = map[string]bool{
 	"examples/chat/rans_gen.go":                    true,
+	"testkit/genfixture/rans_gen.go":               true,
 	"cmd/ransgen/testdata/entity_demo/rans_gen.go": true,
 	"cmd/ransgen/testdata/serial_demo/rans_gen.go": true,
 }

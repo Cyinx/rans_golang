@@ -3,7 +3,9 @@ package rpc
 // 所有权丢失通知（MsgOwnershipLost，H13 决策 22 收端半边）的 dispatcher
 // 验收：本地实例归属与被夺走旧归属三元全等 → Fence（毫秒级关准入）+
 // 有界异步销毁（LocalIDs 收敛）；归属不符/无实例（迟到/重复/换代）→
-// 幂等 no-op。发送半边（接管赢方单调用点）经 testkit 接管链与终审复核。
+// 幂等 no-op。发送半边（接管赢方单调用点）不在本套件覆盖内——它由
+// testkit 的 TestFault_TakeoverForm1MemberKeyDeleted e2e 经真实发送链
+// 锁定（活体假死 → CAS 接管 → 通知在真 wire 上到达活接收方）。
 
 import (
 	"context"

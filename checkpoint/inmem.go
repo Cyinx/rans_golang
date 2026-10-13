@@ -69,3 +69,15 @@ func (s *InMemory) Delete(ctx context.Context, id rans.ID) error {
 	delete(s.data, id)
 	return nil
 }
+
+// HighWater 只读 per-id 已接受的最大 incarnation（HighWaterReader 能力面）：
+// (0, false, nil) = 从未接受过非零纪元写入；Delete 不撤销（单调跨删除存续）。
+func (s *InMemory) HighWater(_ context.Context, id rans.ID) (uint64, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inc, ok := s.inc[id]
+	return inc, ok, nil
+}
+
+// 编译期断言：InMemory 具备高水位只读能力面。
+var _ HighWaterReader = (*InMemory)(nil)

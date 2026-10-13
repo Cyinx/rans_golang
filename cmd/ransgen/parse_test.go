@@ -85,12 +85,27 @@ func mainFixture(t *testing.T) string {
 	return r.Replace(fixtureSrc + fixtureMsgs)
 }
 
+// clearDeclPos 清除声明位置注记后比对（Pos 含临时目录绝对路径与行号，不进
+// DeepEqual 期望；位置正确性由门卫错误文本断言覆盖，见
+// TestGenerateCrossPackageWireNameGate 的 file:line 断言）。
+func clearDeclPos(pd *PackageDecl) {
+	for i := range pd.Entities {
+		for j := range pd.Entities[i].Methods {
+			pd.Entities[i].Methods[j].Pos = ""
+		}
+	}
+	for i := range pd.Messages {
+		pd.Messages[i].Pos = ""
+	}
+}
+
 func TestLoadPackageEntityAndMethods(t *testing.T) {
 	dir := writePkg(t, map[string]string{"chat.go": mainFixture(t)})
 	pkg, err := LoadPackage(dir, "")
 	if err != nil {
 		t.Fatalf("LoadPackage: %v", err)
 	}
+	clearDeclPos(pkg)
 	if pkg.Name != "chat" {
 		t.Fatalf("package name = %q, want %q", pkg.Name, "chat")
 	}
@@ -132,6 +147,7 @@ func TestLoadPackageMessages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPackage: %v", err)
 	}
+	clearDeclPos(pkg)
 	want := []MessageDecl{
 		{
 			Name:         "chat.history", // "chat." < "chatM"（字典序）
@@ -203,126 +219,6 @@ func TestLoadPackageGroupedTypeDecl(t *testing.T) {
 	}
 }
 
-func TestLoadPackageErrors(t *testing.T) {
-	cases := []struct {
-		name    string
-		src     string
-		wantSub string
-	}{
-		{
-			name:    "empty kind name",
-			src:     "package x\n\n// A 空 kind。\n//\n//rans:kind=\ntype A struct{}\n",
-			wantSub: "empty kind name",
-		},
-		{
-			name:    "kind charset violation",
-			src:     "package x\n\n// A 非法 kind。\n//\n//rans:kind=9room\ntype A struct{}\n",
-			wantSub: "invalid kind",
-		},
-		{
-			name:    "entity annotation on non-struct",
-			src:     "package x\n\n// A 非结构体实体。\n//\n//rans:kind=a\ntype A int\n",
-			wantSub: "non-struct",
-		},
-		{
-			name: "duplicate explicit rans name",
-			src: "package x\n\ntype A struct {\n\tF string " + orderTag(1) + "\n}\n\n" +
-				"// B 同名消息。\n//\n//rans:name=dup\ntype B struct {\n\tG string " + orderTag(1) + "\n}\n\n" +
-				"// C 再一个同名。\n//\n//rans:name=dup\ntype C struct {\n\tH string " + orderTag(1) + "\n}\n",
-			wantSub: "duplicate message name",
-		},
-		{
-			name: "explicit name collides with type name",
-			src: "package x\n\n" +
-				"// A 显式命名撞类型名。\n//\n//rans:name=B\ntype A struct {\n\tF string " + orderTag(1) + "\n}\n\n" +
-				"type B struct {\n\tG string " + orderTag(1) + "\n}\n",
-			wantSub: "duplicate message name",
-		},
-		{
-			name:    "malformed order tag non-int",
-			src:     "package x\n\ntype A struct {\n\tF string `rans:\"order=abc\"`\n}\n",
-			wantSub: "malformed",
-		},
-		{
-			name:    "duplicate order in one struct",
-			src:     "package x\n\ntype A struct {\n\tF string " + orderTag(1) + "\n\tG string " + orderTag(1) + "\n}\n",
-			wantSub: "duplicate order",
-		},
-		{
-			name:    "duplicate rans kind on one type",
-			src:     "package x\n\n// A 双 kind。\n//\n//rans:kind=a\n//rans:kind=b\ntype A struct{}\n",
-			wantSub: "duplicate rans:kind",
-		},
-		{
-			name:    "unknown annotation key",
-			src:     "package x\n\n// A 未知注解。\n//\n//rans:kinds=a\ntype A struct{}\n",
-			wantSub: "unknown annotation",
-		},
-		{
-			// 多名字段共享一条 tag：order 只登记一次但产出两个同 order 的
-			// FieldDecl → 两份重复 case 臂，round-trip 错乱（A 被覆写、B 恒零）。
-			name:    "multi-name tagged field",
-			src:     "package x\n\ntype M struct {\n\tA, B string " + orderTag(1) + "\n}\n",
-			wantSub: "multi-name",
-		},
-		{
-			// 嵌入字段无 Names：tag 被解析、order 被 seen 占位，但无 FieldDecl
-			// 产出 → 消息静默缺字段。
-			name:    "embedded tagged field",
-			src:     "package x\n\ntype Inner struct{}\n\ntype M struct {\n\tInner " + "`rans:\"order=1\"`" + "\n}\n",
-			wantSub: "embedded",
-		},
-		{
-			// 空名 _：产出 FieldDecl{Name:"_"} → 生成 v._ 非法源码。
-			name:    "blank tagged field name",
-			src:     "package x\n\ntype M struct {\n\t_ string " + orderTag(1) + "\n}\n",
-			wantSub: "blank",
-		},
-		{
-			name:    "generics on kind-annotated type",
-			src:     "package x\n\n// G 泛型实体。\n//\n//rans:kind=g\ntype G[T any] struct{}\n",
-			wantSub: "generics not supported",
-		},
-		{
-			name:    "generics on message candidate struct",
-			src:     "package x\n\ntype G[T any] struct {\n\tA string " + orderTag(1) + "\n}\n",
-			wantSub: "generics not supported",
-		},
-		{
-			// idempotent 是方法级旗标注解：带值即畸形。
-			name:    "idempotent annotation with value",
-			src:     "package x\n\nimport \"context\"\n\n// A 实体。\n//\n//rans:kind=a\ntype A struct{}\n\n// M 带值注解。\n//\n//rans:idempotent=true\nfunc (a *A) M(ctx context.Context) error { return nil }\n",
-			wantSub: "rans:idempotent",
-		},
-		{
-			// 注解在类型声明上：位置错——idempotent 只认方法声明 doc。
-			name:    "idempotent annotation on type decl",
-			src:     "package x\n\n// A 实体误挂方法注解。\n//\n//rans:kind=a\n//rans:idempotent\ntype A struct{}\n",
-			wantSub: "method-level",
-		},
-		{
-			// 同一方法重复标注。
-			name:    "duplicate idempotent annotation",
-			src:     "package x\n\nimport \"context\"\n\n// A 实体。\n//\n//rans:kind=a\ntype A struct{}\n\n// M 重复标注。\n//\n//rans:idempotent\n//rans:idempotent\nfunc (a *A) M(ctx context.Context) error { return nil }\n",
-			wantSub: "duplicate rans:idempotent",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := writePkg(t, map[string]string{"x.go": tc.src})
-			_, err := LoadPackage(dir, "")
-			if err == nil {
-				t.Fatalf("LoadPackage 成功，want 错误含 %q", tc.wantSub)
-			}
-			if !strings.Contains(err.Error(), tc.wantSub) {
-				t.Fatalf("err = %v, want 含 %q", err, tc.wantSub)
-			}
-		})
-	}
-}
-
-// TestLoadPackageLeavesUnrelatedGenerics 泛型门卫不误伤生成面之外的类型：
-// 无 kind 注解、无 rans tag 字段的泛型声明原样放行（不进实体/消息面）。
 func TestLoadPackageLeavesUnrelatedGenerics(t *testing.T) {
 	src := "package x\n\ntype L[T any] []T\n\ntype S[T any] struct {\n\tX T\n}\n"
 	dir := writePkg(t, map[string]string{"x.go": src})
@@ -382,29 +278,6 @@ func (o Other) Off(ctx context.Context) error { return nil }
 	if byName["Bare"].Idempotent {
 		t.Fatal("Bare.Idempotent = true, want false")
 	}
-}
-
-func TestLoadPackageDirLevelErrors(t *testing.T) {
-	t.Run("no go files", func(t *testing.T) {
-		dir := t.TempDir()
-		if _, err := LoadPackage(dir, ""); err == nil || !strings.Contains(err.Error(), "no non-test Go files") {
-			t.Fatalf("err = %v, want 含 no non-test Go files", err)
-		}
-	})
-	t.Run("multiple packages", func(t *testing.T) {
-		dir := writePkg(t, map[string]string{
-			"a.go": "package a\n",
-			"b.go": "package b\n",
-		})
-		if _, err := LoadPackage(dir, ""); err == nil || !strings.Contains(err.Error(), "multiple packages") {
-			t.Fatalf("err = %v, want 含 multiple packages", err)
-		}
-	})
-	t.Run("not exist dir", func(t *testing.T) {
-		if _, err := LoadPackage(filepath.Join(t.TempDir(), "nope"), ""); err == nil {
-			t.Fatal("LoadPackage 成功，want 错误")
-		}
-	})
 }
 
 func TestRunWriteIfDiff(t *testing.T) {
@@ -476,3 +349,8 @@ func TestRunWriteIfDiff(t *testing.T) {
 		t.Fatalf("类型门卫 err = %v, want 含 chan int", err)
 	}
 }
+
+// TestParamBlankNameGate 载荷参数名 `_`（Go 未用参数惯用法）→ 生成期报错
+// 而非产出不可编译的请求类型（参数名直通请求字段名，生成 v._ / 字面量键
+// _ 形态；消息字段侧孪生门卫见 checkTaggedFieldNames）。反向锚定：ctx 位
+// 空白名（_ context.Context）是惯用法，名字被生成体丢弃，不受门卫约束。

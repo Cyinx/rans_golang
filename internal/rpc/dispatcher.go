@@ -227,10 +227,11 @@ func (d *Dispatcher) handleCancel(hdr wire.Header, body []byte) {
 
 // handleMigrationPackage 随迁包投递（规格 §13.3 E1 快路径的目标端半边）：
 // 包体 = 原始快照字节（不套外封——快照形状是实体私有契约，
-// Header 常规条件字段承载 TargetUUID 寻址）。系统面单向：不回执；也不激
-// 活——包驻缓存等激活闭包消费（load-first），激活时机归调用方。畸形
-// TargetUUID → warn 丢弃（UUID 寻址失败即无语义可执行，且无地址可回）。
-// 缓存未接线 → warn 丢弃（防御，见 NewDispatcher）。
+// Header 常规条件字段承载 TargetUUID 寻址）；扩展块 ExtFieldSrcIncarnation
+// 携带源纪元（随包缓存，恢复侧与 Store 高水位比较的版本依据）。系统面单向：
+// 不回执；也不激活——包驻缓存等激活闭包消费（load-first），激活时机归调用
+// 方。畸形 TargetUUID → warn 丢弃（UUID 寻址失败即无语义可执行，且无地址
+// 可回）。缓存未接线 → warn 丢弃（防御，见 NewDispatcher）。
 func (d *Dispatcher) handleMigrationPackage(hdr wire.Header, body []byte) {
 	defer func() {
 		if body != nil {
@@ -248,7 +249,18 @@ func (d *Dispatcher) handleMigrationPackage(hdr wire.Header, body []byte) {
 			"message", hdr.MessageID, "err", err)
 		return
 	}
-	d.pkgs.Put(id, body) // copy-in：上方 defer 归还页后缓存内容不受影响
+	// 包头扩展块携带源纪元（缺位 → 零值，按旧端发送方形态处理；畸形
+	// 同落零值但留痕——与上方畸形身份的防御口径一致）。
+	ext, err := wire.DecodeRequestExt(hdr.Ext)
+	if err != nil {
+		log.Warn("rans/rpc: migration package ext decode failed; treating as legacy sender form",
+			"message", hdr.MessageID, "err", err)
+	}
+	var srcInc uint64
+	if ext.HasSrcIncarnation {
+		srcInc = ext.SrcIncarnation
+	}
+	d.pkgs.Put(id, body, srcInc) // copy-in：上方 defer 归还页后缓存内容不受影响
 }
 
 // handleRequest Request/OneWay 分发（规格 §10.3）：

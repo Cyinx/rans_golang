@@ -129,7 +129,7 @@ type Table struct {
 	placement       func(kind string, exclude rans.NodeID) (rans.NodeID, bool)
 	store           checkpoint.Store
 	stateLoader     StateLoader
-	sendPackage     func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte) error
+	sendPackage     func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error
 	migrationBudget time.Duration
 
 	// warnNoStoreOnce Retire 遇「有状态实体 + 未配置 Store」的部署缺口
@@ -192,8 +192,9 @@ type Options struct {
 	// rpc 装配形态经 BindMigrationPackages 接线。
 	StateLoader StateLoader
 	// SendPackage 随迁包直发（规格 §13.3 E1 快路径；nil → 跳过发送）。rpc
-	// 装配形态经 BindMigrationPackages 接线。
-	SendPackage func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte) error
+	// 装配形态经 BindMigrationPackages 接线。srcInc 形参是源端落库围栏
+	// incarnation（随迁包源纪元，收端恢复时与 Store 高水位比较）。
+	SendPackage func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error
 	// MigrationBudget 迁移总预算；零/负值回落 DefaultMigrationBudget。
 	MigrationBudget time.Duration
 

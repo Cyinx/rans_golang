@@ -13,6 +13,12 @@ import (
 // kindPattern：kind 是目录键分隔符成分，字符集受限（移植规格 §3.1）。
 var kindPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
 
+// ValidKindName 报告 kind 名是否落在合法字符集（判据与 NewID 共用同一
+// 正本）。装配期校验（如 node.Config.Kinds）经本函数复用判据，避免
+// 字符集规则多份复制漂移；确需零依赖本地复制的场合（如 ransgen），
+// 注释指回本正本。
+func ValidKindName(s string) bool { return kindPattern.MatchString(s) }
+
 // ID 是实体身份：Kind（实体类型，持久化契约）+ Key（实例 key 规范串）。
 // 值相等：结构体仅含 string，可直接 == 与作 map 键（移植规格 §3.2）。
 type ID struct {

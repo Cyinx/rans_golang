@@ -22,10 +22,13 @@ type options struct {
 	nodePlacements     map[int]node.Placement
 	randomPlacement    bool // WithPlacement：node 缺省随机放置（kind 感知候选）
 	watchdog           *node.WatchdogConfig
-	idleKind           string        // 闲置回收策略 kind（WithIdlePassivation）
-	idleAfter          time.Duration // 闲置阈值
-	idleLoop           time.Duration // 闲置收集循环周期（随 WithIdlePassivation 启用）
-	outboxCapacity     int           // 发件箱容量（WithOutboxCapacity；0 = node 缺省）
+	idleKind           string                // 闲置回收策略 kind（WithIdlePassivation）
+	idleAfter          time.Duration         // 闲置阈值
+	idleLoop           time.Duration         // 闲置收集循环周期（随 WithIdlePassivation 启用）
+	outboxCapacity     int                   // 发件箱容量（WithOutboxCapacity；0 = node 缺省）
+	fakeDeath          bool                  // WithFakeDeath：逐节点成员写门控（FakeDeath 原语）
+	nodeSelfFences     map[int]time.Duration // WithNodeSelfFence：逐节点存活节拍自围栏阈值覆盖
+	epochFailNode      int                   // WithNodeEpochFailure：取号失败布防节点（-1 = 无）
 }
 
 // redisOptions redis 模式参数（WithRedis）。
@@ -43,7 +46,8 @@ func WithCallDefault(d time.Duration) Option {
 }
 
 // WithCallMax 覆盖全部节点的调用预算上限（Calls.Max；缺省 node 缺省
-// 10min）：合成的任何来源超过它即封顶。
+// 10min）：合成的任何来源超过它即封顶。Max < Default 构造期报错（封顶对
+// 缺省预算同样生效）——需要小 Max 的用例搭配 WithCallDefault 调低缺省。
 func WithCallMax(d time.Duration) Option {
 	return func(o *options) { o.callMax = d }
 }
@@ -57,10 +61,12 @@ func WithDirectory(d directory.Directory) Option {
 // WithRedis 切换 redis 模式：共享目录换 *redis.Directory（独立 KeyPrefix，
 // 集群实例间键隔离、-count=N 重跑间也隔离），经 Directory.Injected 注入全部
 // 节点（测试持有——Kill 的「目录不关」语义天然成立，CrashKeepsDir 开关在
-// 注入形态下无效果）。续租/变更轮询/地址解析由 node 内置接线（目录实现
-// LeaseDirectory/BrowseAll/NodeAddrResolver 即自动启用）；leaseTTL/
-// heartbeatInterval ≤0 由各自实现取缺省。redis 不可达时目录命令报错——
-// 测试方自带探活门禁 skip。
+// 注入形态下无效果）。存活节拍/自围栏/地址解析由 node 内置接线（目录实现
+// NodeRegistry 成员面即自动启用；解析走目录的 NodeAddrResolver）。
+// leaseTTL 只喂成员键存活期（HeartbeatTTL = 2×leaseTTL；≤0 → redis 缺省
+// 2min）；heartbeatInterval 喂 Lease.Interval（成员键刷新周期，≤0 →
+// membership 缺省 30s）。redis 不可达时目录命令报错——测试方自带探活
+// 门禁 skip。
 func WithRedis(addr string, leaseTTL, heartbeatInterval time.Duration) Option {
 	return func(o *options) {
 		o.redis = &redisOptions{
@@ -137,4 +143,36 @@ func WithTLS() Option {
 // 编排面——小容量使少数几帧即达满箱，阻塞/丢弃行为在测试窗口内可观测。
 func WithOutboxCapacity(n int) Option {
 	return func(o *options) { o.outboxCapacity = n }
+}
+
+// WithFakeDeath 启用假死注入原语：逐节点装配成员写门控目录（共享目录的
+// 透传包装，Cluster.FakeDeath 布防触发），Cluster 侧经门控句柄布防。redis
+// 模式专用（成员键承载于 Redis；目录无 NodeRegistry 能力即装配失败）。
+// 注入形态见 FakeDeath。与 WithNodeEpochFailure 共用同一门控装配。
+func WithFakeDeath() Option {
+	return func(o *options) { o.fakeDeath = true }
+}
+
+// WithNodeSelfFence 覆盖第 i 个节点（0 基）的存活节拍自围栏阈值
+// （Lease.SelfFence：成员键写/节点代际取号持续失败超此时长 → 本地实体全
+// 表关准入 + 止损销毁）：取号失败注入形态的止损时长控制面（短值把 e2e 止
+// 损断言控进秒级）。未覆盖的节点维持 0 缺省推导
+// （max(MemberTTL−2×Interval, Interval)）。
+func WithNodeSelfFence(i int, d time.Duration) Option {
+	return func(o *options) {
+		if o.nodeSelfFences == nil {
+			o.nodeSelfFences = make(map[int]time.Duration)
+		}
+		o.nodeSelfFences[i] = d
+	}
+}
+
+// WithNodeEpochFailure 对第 i 个节点（0 基）装配期布防取号失败门控
+// （NextNodeEpoch 一律报错）：误判接管形态③的注入原语。布防必须先于节点
+// Start——取号仅发生在存活节拍的未取号期，装配期是唯一确定性时机；布防
+// 后该节点不写成员键、对成员视图不可见，持续失败经 SelfFence 记账推进止
+// 损时钟（止损时长配 WithNodeSelfFence 控秒级）。redis 模式专用（门控依
+// 赖 NodeRegistry 能力面，无该能力的目录装配即失败）。
+func WithNodeEpochFailure(i int) Option {
+	return func(o *options) { o.epochFailNode = i }
 }

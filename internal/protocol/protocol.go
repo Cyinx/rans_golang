@@ -55,7 +55,8 @@ const (
 	FlagHasExtensions MessageFlag = 1 << 7
 )
 
-// IsControlPlane：握手完成前仅允许控制面消息（移植规格 §10.2 pre-auth 门禁）。
+// IsControlPlane 控制面帧分类：控制帧优先通道入选集 + 发端 pre-auth 出站放行集；
+// 非收端 pre-auth 门禁——入站更窄（仅 Handshake/HandshakeAck/Ping/Pong 可过，见 dispatchPreAuth）。
 func IsControlPlane(t MessageType) bool {
 	switch t {
 	case MsgHandshake, MsgHandshakeAck, MsgPing, MsgPong, MsgRetire, MsgOwnershipLost:

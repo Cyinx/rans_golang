@@ -30,8 +30,9 @@ type impl struct {
 
 var _ directory.Directory = (*impl)(nil)
 
-// New 返回进程内目录。无 TTL/租约语义（HeartbeatBatch 的续期在本实现
-// 为 no-op：条目常驻，实例标记匹配即通过），不实现 LeaseDirectory。
+// New 返回进程内目录（单机最小形态，不含节点注册面——注册面见
+// NewNodeRegistry）。条目常驻：无 TTL，注销写墓碑（纪元跨墓碑存续），
+// 条目有效性由调用方按成员代际判定。
 func New() directory.Directory {
 	return &impl{
 		m:   make(map[rans.ID]entry),

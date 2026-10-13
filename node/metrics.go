@@ -22,14 +22,14 @@ type Metric struct {
 //     （rans.transport.reconnects_total）、最近写批量
 //     （rans.transport.batch_size）、握手摘要失配
 //     （rans.handshake.schema_mismatch）、出队过期即弃
-//     （rans.call.expired）、续租丢失
-//     （rans.cluster.heartbeat_lost，租约目录形态才注册）；
+//     （rans.call.expired）、自检止损轮数（rans.lease.self_fenced，
+//     目录实现 NodeRegistry 的成员面形态才注册——逐节点事实随本快照
+//     逐节点观测）；
 //   - 快照是即时读数：Gauge 闭包在调用时刻采样，重复调用读数随运行状态
 //     演进；不阻塞（全部闭包为廉价内存读）；
 //   - 进程级聚合的仪表不在本快照：rans.activation.failed /
-//     rans.checkpoint.final_failed / rans.lease.self_fenced 三项 Counter
-//     按设计跨节点聚合，注册在进程级缺省注册表（metrics.Snapshot() 同源
-//     可见）；
+//     rans.checkpoint.final_failed 两项 Counter 由 internal 包直接注册在
+//     进程级缺省注册表（metrics.Snapshot() 同源可见）；
 //   - 并发安全；可在任意时刻调用（Start 前/后皆可——装配期注册的仪表
 //     在 New 返回后即有读数）。
 func (n *Node) Metrics() []Metric {

@@ -1,12 +1,7 @@
 // 能力接口面：基础 Directory（directory.go，合并端口：注册/注销/查找/换锁）
-// 之上按消费方叠加能力接口——租约面（实例级批量归属校验，续租拆除前的
-// 暂留形态）与聚合视图（Browser）。能力可选：无续租语义的实现（inmem）
-// 不实现 LeaseDirectory。
-//
-// ⚠️ 暂态注记（HR4 票 15→17）：H13 取消逐实体续租后，LeaseDirectory 的
-// 剩余语义只有「批量归属校验」（HeartbeatBatch 返回归属不符集，消费方
-// LeaseKeeper 据此止损销毁）；租约 TTL/续期/过期清理的对象已随主键无 TTL
-// 消亡，本面整体（含 Browser 与索引残骸清理）随票 17 的续租拆除一并退役。
+// 之上叠加节点成员面 NodeRegistry（注册总表 + 判活键 + 聚合视图/代际/
+// 地址解析），以及激活与路由共用的条目有效性判定 OwnerAlive。能力可选：
+// 未注入成员面的目录（inmem 单机形态）仅实现基础 Directory。
 
 package directory
 
@@ -20,7 +15,9 @@ import (
 
 // OwnerAlive 成员代际有效性判定（H13 决策 20：条目有效 ⟺ owner(node,
 // epoch) 在成员视图存活）——目录实现 NodeRegistry 即查（存活且 epoch 一致，
-// epoch>0 的归属同节点号重启换代即死）；无成员面的目录保守返回 true（不可
+// epoch>0 的归属同节点号重启换代即死）；读错误保守返回 true（err 无法确认
+// 成员键状态，判死会让瞬时故障触发 CAS 接管与缓存失效，真死由发送失败/
+// 重试环兜底）；键不在/已过期才判死；无成员面的目录保守返回 true（不可
 // 判死，维持既有转发语义）。激活（接管决策）与路由（陈旧收口）共用判据，
 // 归本包避免两处漂移。
 func OwnerAlive(ctx context.Context, dir Directory, o Owner) bool {
@@ -29,7 +26,10 @@ func OwnerAlive(ctx context.Context, dir Directory, o Owner) bool {
 		return true
 	}
 	ep, alive, err := reg.NodeEpoch(ctx, o.Node)
-	if err != nil || !alive {
+	if err != nil {
+		return true
+	}
+	if !alive {
 		return false
 	}
 	return o.Epoch == 0 || ep == o.Epoch

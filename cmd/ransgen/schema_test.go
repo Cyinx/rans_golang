@@ -25,7 +25,7 @@ var wireDirs = []string{
 func schemaPkg(t *testing.T, src string) *ransSchema {
 	t.Helper()
 	dir := writePkg(t, map[string]string{"x.go": src})
-	s, err := buildSchema([]string{dir})
+	s, err := buildSchema([]string{dir}, "rans_gen.go")
 	if err != nil {
 		t.Fatalf("buildSchema: %v", err)
 	}
@@ -193,14 +193,14 @@ func TestCheckCompatibleSilent(t *testing.T) {
 // 非零退出，与判据失败同一退出码、独立错误文本）。
 func TestRunCheckBaselineUnreadable(t *testing.T) {
 	dir := writePkg(t, map[string]string{"x.go": "package x\ntype M struct {\n\tA int64 `rans:\"order=1\"`\n}\n"})
-	if _, err := runCheck([]string{dir}, filepath.Join(t.TempDir(), "missing.json")); err == nil {
+	if _, err := runCheck([]string{dir}, "rans_gen.go", filepath.Join(t.TempDir(), "missing.json")); err == nil {
 		t.Fatalf("基线缺失未报错")
 	}
 	bad := filepath.Join(t.TempDir(), "bad.json")
 	if err := os.WriteFile(bad, []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runCheck([]string{dir}, bad); err == nil {
+	if _, err := runCheck([]string{dir}, "rans_gen.go", bad); err == nil {
 		t.Fatalf("基线非法未报错")
 	}
 }
@@ -211,8 +211,50 @@ func TestSchemaDuplicateWireNameAcrossDirs(t *testing.T) {
 	src := "package x\ntype Dup struct {\n\tA int64 `rans:\"order=1\"`\n}\n"
 	d1 := writePkg(t, map[string]string{"a.go": src})
 	d2 := writePkg(t, map[string]string{"b.go": src})
-	if _, err := buildSchema([]string{d1, d2}); err == nil {
+	if _, err := buildSchema([]string{d1, d2}, "rans_gen.go"); err == nil {
 		t.Fatalf("跨包重名未报错")
+	}
+}
+
+// TestSchemaSkipRespectsOutFlag -schema/-check 的生成物排除名跟随 -out
+// 旗标而非硬编码 rans_gen.go：排除的必须正是 generate 模式将要写出的那份
+// 文件（生成物回扫会让派生请求的注册名落回类型名，清单即失真）；-out 指向
+// 别处时，历史遗留的 rans_gen.go 不得被误排除。
+func TestSchemaSkipRespectsOutFlag(t *testing.T) {
+	files := map[string]string{
+		"src.go":        "package x\n\n// Real 源消息。\ntype Real struct {\n\tA int64 `rans:\"order=1\"`\n}\n",
+		"rans_gen.go":   "package x\n\n// GenFromDefault 缺省 -out 的生成物形态。\ntype GenFromDefault struct {\n\tA int64 `rans:\"order=1\"`\n}\n",
+		"custom_gen.go": "package x\n\n// GenFromCustom 自定义 -out 的生成物形态。\ntype GenFromCustom struct {\n\tA int64 `rans:\"order=1\"`\n}\n",
+	}
+	dir := writePkg(t, files)
+	s, err := buildSchema([]string{dir}, "custom_gen.go")
+	if err != nil {
+		t.Fatalf("buildSchema: %v", err)
+	}
+	names := map[string]bool{}
+	for _, m := range s.Messages {
+		names[m.Name] = true
+	}
+	if !names["Real"] {
+		t.Fatalf("源消息 Real 未入清单: %v", names)
+	}
+	if !names["GenFromDefault"] {
+		t.Fatalf("rans_gen.go 被硬编码误排除（-out 指向别处时应照常扫描）: %v", names)
+	}
+	if names["GenFromCustom"] {
+		t.Fatalf("-out 指向的生成物未被排除: %v", names)
+	}
+	// -schema 落盘与 -check 同一排除语义。
+	outJSON := filepath.Join(t.TempDir(), "schema.json")
+	if err := runSchema([]string{dir}, "custom_gen.go", outJSON); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+	b, err := os.ReadFile(outJSON)
+	if err != nil {
+		t.Fatalf("读清单: %v", err)
+	}
+	if !strings.Contains(string(b), "GenFromDefault") || strings.Contains(string(b), "GenFromCustom") {
+		t.Fatalf("-schema 落盘未跟随 -out 排除:\n%s", b)
 	}
 }
 
@@ -220,7 +262,7 @@ func TestSchemaDuplicateWireNameAcrossDirs(t *testing.T) {
 // 三线面包的当前清单逐字节一致——线面改动未重产基线即红（Makefile
 // schema-check 的测试级孪生）。
 func TestSchemaBaselineFresh(t *testing.T) {
-	s, err := buildSchema(wireDirs)
+	s, err := buildSchema(wireDirs, "rans_gen.go")
 	if err != nil {
 		t.Fatalf("buildSchema(wireDirs): %v", err)
 	}

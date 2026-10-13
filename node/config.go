@@ -51,7 +51,8 @@ type Config struct {
 	Calls CallConfig
 	// Outbox 出站发件箱参数（H11 决策 11，恒装配无开关）。
 	Outbox OutboxConfig
-	// Lease 续租参数（redis 等租约目录形态生效；inmem 无租约面自动跳过）。
+	// Lease 存活节拍参数（redis 等成员面目录形态生效——目录实现
+	// NodeRegistry 才装配 Liveness；inmem 无成员面自动跳过）。
 	Lease LeaseConfig
 	// Watchdog 看门狗全局阈值与扫描周期；per-kind 覆盖在 KindOptions。
 	Watchdog WatchdogConfig
@@ -104,9 +105,12 @@ type SecurityConfig struct {
 
 // CallConfig 调用面参数（逐请求预算合成的配置半边；合成规则见
 // rans.Timeout——本次预算 = min(调用方 ctx 剩余, Timeout(d) 选项, Max)）。
+// 封顶对全部来源生效：Max < Default 构造期报错（validate）——缺省预算
+// 不允许越过上限，杜绝「无 deadline 调用反而拿超大预算」的静默破口。
 type CallConfig struct {
 	// Default 单次调用的缺省预算：调用方 ctx 无 deadline 且未传
-	// rans.Timeout(d) 选项时取本值；≤0 → DefaultCallTimeout。
+	// rans.Timeout(d) 选项时取本值；≤0 → DefaultCallTimeout。受 Max 封顶
+	//（Max < Default 构造期报错）。
 	Default time.Duration
 	// Max 单次调用预算上限：合成的任何来源超过它即封顶；≤0 →
 	// DefaultMaxCallTimeout。
@@ -125,17 +129,16 @@ type OutboxConfig struct {
 	Shards int
 }
 
-// LeaseConfig 续租参数（租约目录形态生效）。
+// LeaseConfig 存活节拍参数（成员面形态生效——目录实现 NodeRegistry 才
+// 装配 Liveness；逐字段语义见各字段注释）。
 type LeaseConfig struct {
-	// Interval 续租与节点键刷新的共用周期；≤0 → 30s（membership 缺省）。
-	// 亦作目录变更轮询间隔（缩短续租即缩短失效传播延迟）。
+	// Interval 成员键刷新周期（存活节拍——Liveness 每周期无条件续写本
+	// 节点成员键，零实体照写）；≤0 → 30s（membership 缺省）。
 	Interval time.Duration
-	// SelfFence 本节点续租连续失败的自检阈值；0 → 按 LeaseTTL 推导，<0 关闭。
+	// SelfFence 本节点成员键写/代际取号连续失败的自检阈值（超时即本地
+	// 全集关准入 + 止损销毁——接管误判的兜底）；0 → 按 MemberTTL 推导
+	//（max(MemberTTL−2×Interval, Interval)），<0 关闭。
 	SelfFence time.Duration
-	// MaxConcurrentDestroys 失租销毁的并发 worker 上限；≤0 → 8。
-	MaxConcurrentDestroys int
-	// DestroyTimeout 单次失租销毁的 ctx 预算；≤0 → 30s。
-	DestroyTimeout time.Duration
 }
 
 // WatchdogParams 看门狗阈值（per-kind 覆盖粒度）。零值字段回落全局/缺省。
@@ -195,6 +198,8 @@ type IdlePolicy struct {
 	Migrate bool
 }
 
+// kind 键字符集门闸经 rans.ValidKindName 复用正本判据（原本地复制已收口）。
+
 // validate 构造期全量校验（New 单一入口，失败返回错误不留半开组合体）。
 // 就地补默认值（Config 值语义——调用方副本不受影响）。
 func (c *Config) validate() error {
@@ -210,6 +215,9 @@ func (c *Config) validate() error {
 	if c.Calls.Max <= 0 {
 		c.Calls.Max = DefaultMaxCallTimeout
 	}
+	if c.Calls.Max < c.Calls.Default {
+		return fmt.Errorf("rans: new: Calls.Max (%s) must not be below Calls.Default (%s) (Max caps every budget source, the default included)", c.Calls.Max, c.Calls.Default)
+	}
 	if c.Outbox.Capacity <= 0 {
 		c.Outbox.Capacity = DefaultOutboxCapacity
 	}
@@ -218,6 +226,14 @@ func (c *Config) validate() error {
 	}
 	if len(c.Kinds) == 0 {
 		return errors.New("rans: new: Kinds are required (Config.Kinds)")
+	}
+	for name, factory := range c.Kinds {
+		if !rans.ValidKindName(name) {
+			return fmt.Errorf("rans: new: Kinds[%q] is not a valid kind name (charset: ^[A-Za-z_][A-Za-z0-9_-]{0,63}$)", name)
+		}
+		if factory == nil {
+			return fmt.Errorf("rans: new: Kinds[%q] factory is nil", name)
+		}
 	}
 	if c.Directory.Redis != nil && c.Directory.Injected != nil {
 		return errors.New("rans: new: Directory.Redis and Directory.Injected are mutually exclusive")

@@ -117,8 +117,10 @@ var depRules = []depRule{
 	// testkit：node、公开包、internal/testhooks。
 	{members: []string{"testkit"},
 		allowed: concat(ransPublic, []string{"node", "internal/testhooks"})},
-	// examples、testkit/sigtermhelper、cmd/ransgen：公开包（ransgen 不依赖运行时）。
-	{members: []string{"examples/arbitration", "examples/chat", "examples/counter", "examples/reenter", "testkit/sigtermhelper", "cmd/ransgen"},
+	// examples、testkit/sigtermhelper、testkit/genfixture、cmd/ransgen：公开包
+	//（ransgen 不依赖运行时；genfixture 是生成实体冒烟 fixture——生成物入库
+	// 形态与 examples 同款，只 import rans/codec 公开包）。
+	{members: []string{"examples/arbitration", "examples/chat", "examples/counter", "examples/reenter", "testkit/sigtermhelper", "testkit/genfixture", "cmd/ransgen"},
 		allowed: ransPublic},
 	// ---- 扩展行 ----
 	// internal/testhooks：仅 testkit 使用的逐节点注入面；模块内依赖实况 =

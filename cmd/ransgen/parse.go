@@ -14,10 +14,17 @@ import (
 	"strings"
 )
 
-// kindPattern 与 identity 包的 kind 字符集规则同款本地复制（ransgen 只依赖
-// 标准库、不 import identity）；两处规则必须保持一致，正本见
-// identity/uuid.go 的 kindPattern。
+// kindPattern 与 rans.ValidKindName 同规则本地复制（ransgen 只依赖标准库、
+// 不 import 契约包——生成器可独立 go run）；正本 rans/id.go，两处必须
+// 保持一致。
 var kindPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`)
+
+// namePattern wire 注册名（//rans:name 显式名）字符集：首字符字母/下划线，
+// 其余字母数字点横线——点号支撑与派生名 <Kind>.<Method> 同构的命名空间
+// 形态，横线对齐 kind 字符集；上限 128 段。空名不在此匹配（独立报错：
+// 空 wire 名撞无值应答协议哨兵 codec.Encode(nil) 的 ("", nil, nil) 形态，
+// 注册表同名消息会吞掉无值应答的解码，必须在门卫层拦）。
+var namePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,127}$`)
 
 // PackageDecl 是一次包扫描的完整发现结果（已排序，见 normalize）。
 type PackageDecl struct {
@@ -37,12 +44,13 @@ type EntityDecl struct {
 // MethodDecl 方法签名（从 AST 提取）。Args/Returns 保持源码顺序——位置
 // 语义，normalize 不重排。Idempotent 报告方法声明 doc 上的
 // //rans:idempotent 旗注解（规格 §9.2：幂等标注的生成代理默认追加幂等
-// 选项）。
+// 选项）。Pos 为声明处 file:line（派生请求的冲突定位用）。
 type MethodDecl struct {
 	Name       string
 	Args       []FieldDecl
 	Returns    []FieldDecl
 	Idempotent bool
+	Pos        string
 }
 
 // MessageDecl 消息声明：含 rans:"order=N" 字段 tag 的 struct。
@@ -54,6 +62,7 @@ type MessageDecl struct {
 	Name         string      // wire TypeName：//rans:name 显式命名，否则类型名
 	NameExplicit bool        // Name 来自显式 //rans:name（采纳门卫依据）
 	TypeName     string      // Go 类型名
+	Pos          string      // 声明处 file:line（跨包 wire 名冲突定位用）
 	Fields       []FieldDecl // 仅含 order tag 字段，按 Order 升序
 }
 
@@ -207,12 +216,20 @@ func collectTypeDecl(fset *token.FileSet, pd *PackageDecl, gd *ast.GenDecl, ts *
 		//（发现层不为此设门卫）。
 		return nil
 	}
+	// //rans:name 值门卫：空名与非法字符在此拦（struct 上一律校验——不合法
+	// 的注解值不因「暂无 order tag 字段」而放过，补字段时同名即直通注册）。
+	if ann.hasName {
+		if err := checkWireName(ann.name); err != nil {
+			return fmt.Errorf("%s: type %s: %w", declPos(fset, ts.Pos()), ts.Name.Name, err)
+		}
+	}
 	msg, found, err := collectMessage(fset, ts, st)
 	if err != nil {
 		return err
 	}
 	if found {
 		msg.Name = ts.Name.Name
+		msg.Pos = declPos(fset, ts.Pos())
 		if ann.hasName {
 			msg.Name = ann.name
 			msg.NameExplicit = true
@@ -220,6 +237,23 @@ func collectTypeDecl(fset *token.FileSet, pd *PackageDecl, gd *ast.GenDecl, ts *
 		pd.Messages = append(pd.Messages, msg)
 	}
 	return nil
+}
+
+// checkWireName 校验 //rans:name 注解值（空名/字符集违例分报；哨兵碰撞见 namePattern 注释）。
+func checkWireName(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty rans:name")
+	}
+	if !namePattern.MatchString(name) {
+		return fmt.Errorf("invalid rans:name %q (charset: ^[A-Za-z_][A-Za-z0-9_.-]{0,127}$)", name)
+	}
+	return nil
+}
+
+// declPos 声明位置的稳定文本形 file:line（门卫与冲突错误定位用）。
+func declPos(fset *token.FileSet, pos token.Pos) string {
+	p := fset.Position(pos)
+	return fmt.Sprintf("%s:%d", p.Filename, p.Line)
 }
 
 // collectMessage 提取 struct 的 order tag 字段。found=false 表示没有任何
@@ -377,54 +411,6 @@ func parseAnnotations(doc *ast.CommentGroup) (annotations, error) {
 		}
 	}
 	return a, nil
-}
-
-// receiverTypeName 提取方法接收者的基类型名（值/指针接收者均可）。
-func receiverTypeName(fd *ast.FuncDecl) (string, bool) {
-	if len(fd.Recv.List) != 1 {
-		return "", false
-	}
-	t := fd.Recv.List[0].Type
-	if star, ok := t.(*ast.StarExpr); ok {
-		t = star.X
-	}
-	id, ok := t.(*ast.Ident)
-	if !ok {
-		return "", false // 泛型/复杂接收者：v1 不支持，静默跳过
-	}
-	return id.Name, true
-}
-
-// methodDecl 从方法声明提取签名（接收者不计入 Args）与 //rans:idempotent
-// 旗注解（注解带值/重复即解析错误，位置为方法声明处）。
-func methodDecl(fset *token.FileSet, fd *ast.FuncDecl) (MethodDecl, error) {
-	ann, err := parseAnnotations(fd.Doc)
-	if err != nil {
-		return MethodDecl{}, fmt.Errorf("%s: %w", fset.Position(fd.Pos()), err)
-	}
-	return MethodDecl{
-		Name:       fd.Name.Name,
-		Args:       fieldDecls(fset, fd.Type.Params),
-		Returns:    fieldDecls(fset, fd.Type.Results),
-		Idempotent: ann.idempotent,
-	}, nil
-}
-
-func fieldDecls(fset *token.FileSet, fl *ast.FieldList) []FieldDecl {
-	if fl == nil {
-		return nil
-	}
-	var out []FieldDecl
-	for _, field := range fl.List {
-		if len(field.Names) == 0 {
-			out = append(out, FieldDecl{Name: "", Type: exprString(fset, field.Type)})
-			continue
-		}
-		for _, name := range field.Names {
-			out = append(out, FieldDecl{Name: name.Name, Type: exprString(fset, field.Type)})
-		}
-	}
-	return out
 }
 
 func fieldName(field *ast.Field) string {

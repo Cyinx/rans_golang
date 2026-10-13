@@ -1,13 +1,11 @@
 package node
 
-// redis 模式指标可见性验收（指标接线随组装根内置：heartbeat_lost 归
-// wireLease、gateway pending / transport reconnects 归 rpc 装配；读数面
-// internal/metrics 不在 testkit 依赖面内（约定 spec §3.2 testkit 行），
-// node 包测试是合法观察点）。
-// 锁三项指标经组合后的可观测行为：
+// redis 模式指标可见性验收（指标接线随组装根内置：gateway pending /
+// transport reconnects 归 rpc 装配，仪表落节点自有注册表、经 Node.Metrics()
+// 读；读数面 internal/metrics 不在 testkit 依赖面内（约定 spec §3.2
+// testkit 行），node 包测试是合法观察点）。
+// 锁两项指标经组合后的可观测行为：
 //   - gateway pending：在途请求驻留期 ≥1、Kill（Close 急停）快速失败后归零；
-//   - heartbeat_lost：归属被外部窃取 → 续租失败批 +1（Kill 停机本身不产
-//     计数——计数活在「归属变更的存活方」，窃取即 Kill 等价的可观测组合）；
 //   - transport reconnects：关断既有连接（WrapConn 捕获把手——SeverNode
 //     的注入点等价物）→ 再调用按需重拨 → 计数 +1。
 // 时序断言一律有界轮询（pollUntil），无承重 sleep。
@@ -99,13 +97,10 @@ func metricsClusterDialCapture(t *testing.T, dir directory.Directory, kinds map[
 	return a, b
 }
 
-// TestRedisMetricsPendingAndLeaseLost pending 与 heartbeat_lost 两腿：
-//   - pending：n1 对 node2 上的阻塞实体持在途请求 → 读数 ≥1；Kill(node2)
-//     （Close 急停）→ 快速失败 → 归零；
-//   - heartbeat_lost：n1 本地激活实体 → 外部窃取归属 → 下一轮续租失败批 +1。
+// TestRedisMetricsPendingFailFast pending 在途窗腿：n1 对 node2 上的阻塞
+// 实体持在途请求 → 读数 ≥1；Kill(node2)（Close 急停）→ 快速失败 → 归零。
 func TestRedisMetricsPendingFailFast(t *testing.T) {
 	opts := nodeRedisOptions(t)
-	opts.HeartbeatTTL = 1500 * time.Millisecond
 	opts.HeartbeatTTL = 3 * time.Second
 	dir := redis.New(opts)
 	defer dir.Close()

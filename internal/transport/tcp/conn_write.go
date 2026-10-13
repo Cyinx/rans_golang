@@ -216,7 +216,7 @@ func (c *Conn) Send(ctx context.Context, hdr wire.Header, body []byte) error {
 		return nil
 	default:
 	}
-	select { // 慢路径：满队阻塞，ctx/关闭/退役终态任一解除
+	select { // 慢路径：满队阻塞，ctx 到期或连接关闭解除（退役由入队前置检查拦截）
 	case ch <- outFrame{hdr: hdr, body: body}:
 		c.retireMu.Unlock()
 		return nil

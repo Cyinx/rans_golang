@@ -28,8 +28,8 @@ _Avoid_: `host`（旧组装包名，已删除）；`edge`/`edgesrv`/`Config.Edge
 _Avoid_: 本地专用调用入口（EX11 病根，已删除）；`Caller`（旧名）
 
 **Code / Reason（统一错误模型）**（固定，2026-10-08 HR3 裁定）：
-调用错误唯一形态 `*rans.Error{Code, Reason, Message, Node, AppCode, AppData}`——`Code` 是重试类别（线上数值同旧 `contracts.StatusCode`，附录 B），`Reason` 是具体原因（`Busy/Overloaded/NotLocal/UnknownKind/StaleLocation/...`）。本地与远端同构（EX12）；实体 Handle 错误在投递边界折叠为 `CodeError`+`Reason=Handler`，调用方不可 Unwrap 到实体原始错误。判错用 `rans.CodeOf/ReasonOf` 与 `errors.Is` 哨兵（`ErrTimeout/ErrUnavailable/ErrNotFound`）。
-_Avoid_: `manager.ErrTimeout`/`*routing.TimeoutError` 等旧错误形态（已删除）；对调用返回值做 Unwrap 依赖
+调用错误的约定形态 `*rans.Error{Code, Reason, Message, Node, AppCode, AppData}`——`Code` 是重试类别（线上数值同旧 `contracts.StatusCode`，附录 B），`Reason` 是具体原因（`Busy/Overloaded/NotLocal/UnknownKind/StaleLocation/...`）。本地与远端同构（EX12）；实体 Handle 错误在投递边界折叠为 `CodeError`+`Reason=Handler`，调用方不可 Unwrap 到实体原始错误。判错用 `rans.CodeOf/ReasonOf` 与 `errors.Is` 哨兵（`ErrTimeout/ErrUnavailable/ErrNotFound`）。已知例外（如实收窄，勿做宽断言）：本地基础设施故障面（请求编码/应答解码）现以包装的普通 error 逃逸，`ErrSerialization`/`ErrDecode` 哨兵当前零生产者——「返回值必为 `*rans.Error`」不成立。
+_Avoid_: `manager.ErrTimeout`/`*routing.TimeoutError` 等旧错误形态（已删除）；对调用返回值做 Unwrap 依赖；对错误形态做「必为 *rans.Error」的类型宽断言
 
 **Table（本地激活表）**（固定，2026-10-08 HR3 裁定）：
 本地激活表面 `internal/activation.Table`（原 `manager.Manager` 核心：激活仲裁 register-first + 输家转发 + 销毁）。管理操作公开面是 `Node.Destroy(ctx, id)`/`Node.Migrate(ctx, id)`——只作用于本地实例，非本地 `NotFound`+`Reason=NotLocal`。
@@ -52,16 +52,16 @@ _Avoid_: 绝对时刻过线（时钟偏差）；网关 pending 的全局固定�
 _Avoid_: ctx 全透传（本地远端行为分叉，违反位置透明）；未登记键过线
 
 **发件箱（Outbox）**（2026-10-11 HR4 裁定，随 v0.23.0 落地）：
-节点级出站缓冲——单向发送入箱即返回，worker 按目标节点哈希分片保同目标 FIFO，负责路由与发送。满策略按生产者分野：显式 `Tell` 阻塞至 ctx 到期；事件扇出/错误回包/仲裁输家转发满即丢 + 计数（保 INV5：实体 loop 与读循环永不因下游慢而卡）。控制帧（Ping/Pong/Retire）走独立优先通道。
-_Avoid_: 实体 loop 或读循环上的同步出站 IO（H11 要消除的形态）
+节点级出站缓冲——单向发送入箱即返回，worker 按目标节点哈希分片保同目标 FIFO，负责路由与发送。满策略按生产者分野：显式 `Tell` 阻塞至 ctx 到期；事件扇出/错误回包/仲裁输家转发/接管通知满即丢 + 计数（保 INV5：实体 loop 与读循环永不因下游慢而卡）。控制帧（Ping/Pong/Retire/接管通知 `MsgOwnershipLost`）走独立优先通道；重定向提示走数据通道（可丢加速面，正 TTL 兜底）。
+_Avoid_: 实体 loop 或读循环上的同步出站 IO（H11 要消除的形态）；把重定向提示当优先通道帧（实走数据通道）
 
 **节点代际（Node epoch）**（2026-10-11 HR5 裁定，随 v0.23.0 落地）：
-节点启动时 `{reg}` 内全局计数器 HINCRBY 取得的单调值，节点键值携带；目录条目记录 `{node, nodeEpoch, inc}`。**条目有效 ⟺ owner(node, epoch) 在本端成员视图存活**（调用方内存判定，Redis 单键 Lua 不跨 slot 查成员键）。同节点号重启 → epoch 变大 → 旧条目自然失效。
-_Avoid_: 用 TTL/续租判条目有效性（H13 前旧形态）
+节点启动时 `{reg}` 内全局计数器 HINCRBY 取得的单调值，节点键值携带；目录条目记录 `{node, nodeEpoch, inc}`。**条目有效 ⟺ owner(node, epoch) 在本端成员视图存活**——判定经 `directory.OwnerAlive` 单点查节点注册表（`NodeRegistry.NodeEpoch` 单键 GET；激活接管闸门与路由正缓存命中每跳判定，非调用方内存判定）；读错误保守判活（瞬时故障不触发接管/缓存失效），键不在/已过期或代际不符判死。同节点号重启 → epoch 变大 → 旧条目自然失效。
+_Avoid_: 用 TTL/续租判条目有效性（H13 前旧形态）；把判活当调用方内存判定（每跳一次注册表读是现实现的真实代价）
 
-**接管（Takeover）**（2026-10-11 HR5 裁定，随 v0.23.0 落地）：
-死 owner 目录条目的重占——Register 携带 `expectedOwner` 做 CAS（逐实体键单 slot Lua 原子读-比-写），赢则 inc+1 覆写。接管方节点**直发控制消息**给旧 owner 节点令其对该 id 立即关准入；SelfFence 兜底误判（成员键过期 ⟹ 该节点 liveness 同败 ⟹ 自动关准入），inc 围栏保 INV3（旧纪元持久写被 Store 拒）。
-_Avoid_: 无条件覆写条目（双实例无仲裁）
+**接管（Takeover）**（2026-10-11 HR5 裁定，随 v0.23.0 落地；接管通知发送半边随 2026-10-13 修复批真实接线）：
+死 owner 目录条目的重占——Register 携带 `expectedOwner` 做 CAS（逐实体键单 slot Lua 原子读-比-写），赢则 inc+1 覆写；接管闸门的判活（`directory.OwnerAlive`）对注册表读错误保守判活（瞬时故障不触发接管）。接管赢方**经发件箱以 `MsgOwnershipLost`（=16）控制帧直发**旧 owner 节点（控制面优先通道；best-effort——满箱即丢、不重试，丢失由 SelfFence 兜底），旧 owner 对归属全等的实例立即关准入 + 有界销毁；SelfFence 兜底误判（成员键过期 ⟹ 该节点 liveness 同败 ⟹ 自动关准入），inc 围栏保 INV3（旧纪元持久写被 Store 拒）。
+_Avoid_: 无条件覆写条目（双实例无仲裁）；把接管通知当可靠投递（best-effort，SelfFence 是兜底不是冗余）
 
 **重定向提示（Redirect hint）**（2026-10-11 HR5 裁定，随 v0.23.0 落地）：
 非 owner 节点转发请求后，在回包/错误帧携带正确 owner，调用方立即改写本地位置缓存（不等正 TTL 30s 到期）——取代目录全量轮询（DirectoryWatcher 删除）的被动失效面；正 TTL 30s 作为提示丢失时的收敛上界。SPUBLISH 主动失效留扩展点不做。
