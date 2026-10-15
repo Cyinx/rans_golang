@@ -21,9 +21,9 @@
 //	  调用经重试环按目录归属改道赢家执行（落败实例终局逐出）。
 //	Phase C 再平衡：node1 本地实体数超阈 → 自动卸载闲置候选（闲置超阈值、
 //	最冷优先）迁给放置远端。
-//	Phase B 接管：杀赢家（Close——不排空不注销，模拟崩溃）→ 有界轮询等租
-//	约过期（Lookup miss）且存活视图淘汰死者 → 幸存者再 Call → miss 本地重
-//	激活 → 目录归属翻转。
+//	Phase B 接管：杀赢家（Close——不排空不注销，模拟崩溃）→ 有界轮询等死
+//	者心跳键过期（存活视图淘汰死者；目录条目常驻——死 owner 墓碑不过期）
+//	→ 幸存者再 Call → 激活 Register 的 CAS 收养翻转归属。
 package main
 
 import (
@@ -147,7 +147,7 @@ func main() {
 				HeartbeatTTL: heartbeatKeyTTL,
 				KeyPrefix:    prefix,
 			}},
-			Lease:     node.LeaseConfig{Interval: heartbeatInterval},
+			Liveness:  node.LivenessConfig{Interval: heartbeatInterval},
 			Calls:     node.CallConfig{Default: callTimeout},
 			Placement: placement,
 		}
@@ -332,9 +332,9 @@ func phaseA(ctx context.Context, dir *redis.Directory, nodes []*arbNode, target 
 	fmt.Printf("[A] entity report via node%d: %s\n", loser.id, report)
 }
 
-// phaseB 杀赢家 → 租约过期 → 幸存者重激活接管。
+// phaseB 杀赢家 → 心跳键过期（成员淘汰）→ 幸存者重激活接管。
 func phaseB(ctx context.Context, dir *redis.Directory, nodes []*arbNode, target rans.ID) {
-	fmt.Println("--- Phase B: crash the winner, wait lease expiry, takeover by survivor ---")
+	fmt.Println("--- Phase B: crash the winner, wait membership eviction, takeover by survivor ---")
 
 	loc, found, err := dir.Lookup(ctx, target)
 	if err != nil || !found {
@@ -351,14 +351,10 @@ func phaseB(ctx context.Context, dir *redis.Directory, nodes []*arbNode, target 
 	winner.kill()
 	fmt.Printf("[B] node%d killed (transport + heartbeat stopped)\n", winner.id)
 
-	// 有界等待两件事同时成立：目录租约过期（Lookup miss）+ 死节点心跳键
-	// 过期（存活视图淘汰——放置候选里不能再有死者，否则 miss 路径会把
-	// 重激活请求远发给死节点）。
+	// 有界等待死节点心跳键过期（存活视图淘汰——放置候选里不能再有死者，
+	// 否则接管路径会把重激活请求远发给死节点）。目录条目不消失：死 owner
+	// 墓碑常驻，归属翻转由激活 Register 的 CAS 收养完成。
 	if !pollUntil(15*time.Second, func() bool {
-		_, found, err := dir.Lookup(ctx, target)
-		if err != nil || found {
-			return false
-		}
 		for _, n := range aliveView(ctx, dir) {
 			if n == winner.id {
 				return false
@@ -366,14 +362,22 @@ func phaseB(ctx context.Context, dir *redis.Directory, nodes []*arbNode, target 
 		}
 		return true
 	}) {
-		fail("lease expiry / membership eviction did not converge within 15s")
+		fail("membership eviction did not converge within 15s")
 	}
-	fmt.Printf("[B] lease expired after %s (directory miss, node%d evicted from membership view: %v)\n",
-		time.Since(killed).Round(time.Millisecond), winner.id, aliveView(ctx, dir))
+	fmt.Printf("[B] node%d evicted from membership view after %s (view: %v)\n",
+		winner.id, time.Since(killed).Round(time.Millisecond), aliveView(ctx, dir))
 
-	// 幸存者重激活：目录 miss、放置选自身（唯一存活节点）→ 本地激活。本
-	// 演示不接 checkpoint Store（钝化/迁移恢复面见 testkit 验收），计数从
-	// 1 重新开始。
+	// 墓碑演示点：死 owner 条目常驻目录（Lookup 仍命中，owner 指死者）。
+	locDead, stillFound, err2 := dir.Lookup(ctx, target)
+	if err2 != nil || !stillFound {
+		fail("phase B tombstone lookup: found=%v err=%v", stillFound, err2)
+	}
+	fmt.Printf("[B] directory entry persists with dead owner (tombstone): owner=node%d\n", locDead.Node)
+
+	// 幸存者重激活：放置选自身（唯一存活节点）→ 激活 Register 的 CAS 收养
+	// 死 owner 条目完成归属翻转（路由见死 owner 条目按陈旧归属收口到本地
+	// 激活）。本演示不接 checkpoint Store（钝化/迁移恢复面见 testkit 验收），
+	// 计数从 1 重新开始。
 	v, err := survivor.n.Client().Call(ctx, target, int(survivor.id))
 	if err != nil {
 		fail("phase B reactivation call: %v", err)

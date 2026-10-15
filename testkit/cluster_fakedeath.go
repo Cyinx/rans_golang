@@ -65,6 +65,15 @@ func (g *membershipGate) RegisterNode(ctx context.Context, node rans.NodeID, inf
 	return g.NodeRegistry.RegisterNode(ctx, node, info)
 }
 
+// RenewNode 门控点：布防后吞写报 Renewed（比对续期不得破坏假死——续期
+// 探测会把键缺席暴露成 Absent，触发复活处置）。
+func (g *membershipGate) RenewNode(ctx context.Context, node rans.NodeID, info directory.NodeInfo) (directory.RenewResult, error) {
+	if g.armed.Load() {
+		return directory.RenewRenewed, nil
+	}
+	return g.NodeRegistry.RenewNode(ctx, node, info)
+}
+
 // NextNodeEpoch 门控点：布防后报错（存活节拍的取号失败形态——registerSelf
 // 取号失败即返回、成员键停写，节点对成员视图不可见；失败经 SelfFence 记
 // 账推进止损时钟，与写失败同一防线、同一阈值）。

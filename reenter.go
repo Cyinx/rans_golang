@@ -12,7 +12,7 @@ import (
 type ReenterArm interface {
 	// Reenter 让出登记：派生 wctx（继承规则见 ReenterAfter）、在实体 loop
 	// 外执行 work，then 作为续体任务回实体 loop 串行执行。非阻塞。
-	Reenter(work func(ctx context.Context) (any, error), then func(v any, err error))
+	Reenter(work func(ctx context.Context) (any, error), then func(ctx context.Context, v any, err error))
 }
 
 // ReenterAfter 在 Handle 内让出实体 loop（H12 决策 16/17 的让出重入原语）：
@@ -34,6 +34,14 @@ type ReenterArm interface {
 //     正常完成；work 调回仍在同步等待的上游时上游哈希已在路径中，照样立即
 //     判环（Cycle）。需在 work 中知晓自身身份时在让出点前自行捕获。
 //
+// tctx（传给 then 的续体 ctx）派生规则：
+//   - 以 Handle ctx 的值链为底（Self/Incarnation/Client/因果路径/传播键
+//     可用），脱钩其收尾 cancel 并重挂原请求 deadline——续体不随投递返回
+//     收场，跑不到 deadline 之外的取消面；
+//   - 无延迟应答登记点（无类型遮蔽）：then 内 rans.Defer 必 panic，不得
+//     武装原请求的迟到应答；
+//   - 让出面保持（then 内可嵌套 ReenterAfter）；then 返回后收尾 cancel。
+//
 // 典型两件套（契约正本）：
 //
 //	r := rans.Defer(ctx)                  // 本请求改延迟应答，拿 Responder
@@ -50,7 +58,7 @@ type ReenterArm interface {
 // work 在飞 → cancel wctx、已 Deferred 未 Reply → 标记取消（后续 Reply 丢
 // 弃）；终局未完成的 Responder 以调用方 Timeout 收场（模糊结果）。执行看门
 // 狗只统计 loop 同步执行段：work 期间不计入，then 回 loop 后重新计入。
-func ReenterAfter(ctx context.Context, work func(ctx context.Context) (any, error), then func(v any, err error)) {
+func ReenterAfter(ctx context.Context, work func(ctx context.Context) (any, error), then func(ctx context.Context, v any, err error)) {
 	p, ok := ctxkey.ReenterPointFrom(ctx)
 	if !ok {
 		panic("rans: ReenterAfter called outside a runtime Handle ctx (only deliveries injected by the runtime carry the reenter point; rebuilt or plain ctx do not)")

@@ -12,6 +12,7 @@ import (
 	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/metrics"
 )
 
 // BindStateLoader / BindPackageSender 随迁包两端的装配期接线：前者接目标端
@@ -70,8 +71,8 @@ func (m *Table) SelfNode() rans.NodeID { return m.self }
 // InstanceOwner 本地实例的目录归属（无实例/未落位 → false）：所有权丢失
 // 通知的收端匹配面。
 func (m *Table) InstanceOwner(id rans.ID) (directory.Owner, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.readMu.RLock()
+	defer m.readMu.RUnlock()
 	inst := m.local[id]
 	if inst == nil {
 		return directory.Owner{}, false
@@ -92,8 +93,11 @@ func (m *Table) BindTakeoverNotifier(fn func(target rans.NodeID, id rans.ID, pre
 // notifyTakeover 通知旧 owner（未绑定 no-op）：调用点在激活闭包上，发送
 // 面自带异步与预算，本调用即刻返回。
 func (m *Table) notifyTakeover(prev directory.Owner, id rans.ID) {
-	if m.takeoverNotify != nil && prev.Node != 0 {
+	// prev.Node == self：换代后接管自己旧代际条目——不再发回环帧。
+	if m.takeoverNotify != nil && prev.Node != 0 && prev.Node != m.self {
 		m.takeoverNotify(prev.Node, id, prev)
+		m.metricsReg().Counter(metrics.NameOwnershipLostSent,
+			"ownership-lost notifications sent to previous owners").Add(1)
 	}
 }
 

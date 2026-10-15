@@ -1,10 +1,14 @@
 package wire
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+	"sync/atomic"
+	"time"
+
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/codec"
 	"github.com/cyinx/rans_golang/internal/protocol"
-	"sync/atomic"
 )
 
 // Header 消息头（规格 §7.2）：位置编码，Flags 驱动条件字段，不用 field-tag——
@@ -149,7 +153,7 @@ func DecodeHeader(b []byte) (Header, error) {
 
 // IDGen 进程内消息 ID 发生器（陷阱 7）：MessageID 是请求/响应关联键，
 // 必须单调不复用——回绕前复用会让 pending 表错配到旧请求。零值可用，
-// 从 1 起（0 保留为"无 ID"哨兵）。
+// 从 1 起（0 保留为"无 ID"哨兵）；生产装配一律用 NewIDGen 取随机起点。
 type IDGen struct {
 	last atomic.Uint64
 }
@@ -157,4 +161,17 @@ type IDGen struct {
 // Next 返回下一个 ID；atomic 单调递增，多 goroutine 安全。
 func (g *IDGen) Next() uint64 {
 	return g.last.Add(1)
+}
+
+// NewIDGen 随机起点构造：跨同号进程重启不复用 ID 空间（网关只按
+// MessageID 关联应答，旧化身的迟到应答不得命中新化身的 pending 项）。
+func NewIDGen() *IDGen {
+	var b [8]byte
+	origin := uint64(time.Now().UnixNano())
+	if _, err := rand.Read(b[:]); err == nil {
+		origin = binary.BigEndian.Uint64(b[:])
+	}
+	g := &IDGen{}
+	g.last.Store((origin>>2 | 1<<32) - 1)
+	return g
 }

@@ -22,7 +22,8 @@ type options struct {
 	nodePlacements     map[int]node.Placement
 	randomPlacement    bool // WithPlacement：node 缺省随机放置（kind 感知候选）
 	watchdog           *node.WatchdogConfig
-	idleKind           string                // 闲置回收策略 kind（WithIdlePassivation）
+	idleKind           string                // 闲置回收策略 kind（WithIdlePassivation/WithIdleMigration）
+	idleMigrate        bool                  // 闲置策略迁移档（Migrate: true）
 	idleAfter          time.Duration         // 闲置阈值
 	idleLoop           time.Duration         // 闲置收集循环周期（随 WithIdlePassivation 启用）
 	outboxCapacity     int                   // 发件箱容量（WithOutboxCapacity；0 = node 缺省）
@@ -64,7 +65,7 @@ func WithDirectory(d directory.Directory) Option {
 // 注入形态下无效果）。存活节拍/自围栏/地址解析由 node 内置接线（目录实现
 // NodeRegistry 成员面即自动启用；解析走目录的 NodeAddrResolver）。
 // leaseTTL 只喂成员键存活期（HeartbeatTTL = 2×leaseTTL；≤0 → redis 缺省
-// 2min）；heartbeatInterval 喂 Lease.Interval（成员键刷新周期，≤0 →
+// 2min）；heartbeatInterval 喂 Liveness.Interval（成员键刷新周期，≤0 →
 // membership 缺省 30s）。redis 不可达时目录命令报错——测试方自带探活
 // 门禁 skip。
 func WithRedis(addr string, leaseTTL, heartbeatInterval time.Duration) Option {
@@ -129,6 +130,15 @@ func WithIdlePassivation(kind string, after time.Duration) Option {
 	}
 }
 
+// WithIdleMigration 给全部节点登记指定 kind 的闲置迁移策略（闲置阈值
+// after、Migrate: true——闲置实体经放置迁给远端；搭配 WithCheckpointStore
+// 与多节点集群）并把闲置收集循环调到测试节奏（20ms/轮）。
+func WithIdleMigration(kind string, after time.Duration) Option {
+	return func(o *options) {
+		o.idleKind, o.idleAfter, o.idleMigrate, o.idleLoop = kind, after, true, 20*time.Millisecond
+	}
+}
+
 // WithTLS 切换 TLS 模式：NewCluster 时自签一把集群 CA、逐节点签发服务器
 // 证书（SAN 127.0.0.1/::1/localhost——节点监听/拨号都在回环）并装配双角色
 // tls.Config（监听侧持本节点证书、拨号侧信任集群 CA）。TLS 握手先于帧循环
@@ -154,7 +164,7 @@ func WithFakeDeath() Option {
 }
 
 // WithNodeSelfFence 覆盖第 i 个节点（0 基）的存活节拍自围栏阈值
-// （Lease.SelfFence：成员键写/节点代际取号持续失败超此时长 → 本地实体全
+// （Liveness.SelfFence：成员键写/节点代际取号持续失败超此时长 → 本地实体全
 // 表关准入 + 止损销毁）：取号失败注入形态的止损时长控制面（短值把 e2e 止
 // 损断言控进秒级）。未覆盖的节点维持 0 缺省推导
 // （max(MemberTTL−2×Interval, Interval)）。

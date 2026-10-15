@@ -205,7 +205,7 @@ func RunNodeMembershipSuite(t *testing.T, newReg func(t *testing.T, hbTTL time.D
 		if err := d.RegisterNode(ctx, 9, directory.NodeInfo{Addr: "10.0.0.9:9"}); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.UnregisterNode(ctx, 9); err != nil {
+		if err := d.UnregisterNode(ctx, 9, 0); err != nil {
 			t.Fatal(err)
 		}
 		if nodes, err := d.NodeIDs(ctx); err != nil {
@@ -256,6 +256,8 @@ func RunNodeMembershipSuite(t *testing.T, newReg func(t *testing.T, hbTTL time.D
 			t.Fatalf("NodeIDs after un-drain = %v, want [31 32]", nodes)
 		}
 	})
+
+	runRenewSuite(t, ctx, newReg)
 }
 
 // equalNodeSet 校验节点集与节点→地址映射的键集一致。
@@ -348,7 +350,7 @@ func RunNodeEpochMonotonicSuite(t *testing.T, newReg func(t *testing.T, hbTTL ti
 		if err := d.RegisterNode(ctx, 62, directory.NodeInfo{Addr: "10.0.0.62:1", Epoch: e1}); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.UnregisterNode(ctx, 62); err != nil {
+		if err := d.UnregisterNode(ctx, 62, 0); err != nil {
 			t.Fatal(err)
 		}
 		if _, ok, err := d.NodeEpoch(ctx, 62); err != nil || ok {
@@ -434,12 +436,13 @@ func RunNodeEpochQuerySuite(t *testing.T, newReg func(t *testing.T, hbTTL time.D
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+
 }
 
 // nodeDown 节点即时退出成员视图（成员注销面——优雅停机路径）。
 func nodeDown(ctx context.Context, t *testing.T, d directory.NodeRegistry, node rans.NodeID, _ time.Duration) {
 	t.Helper()
-	if err := d.UnregisterNode(ctx, node); err != nil {
+	if err := d.UnregisterNode(ctx, node, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := d.NodeEpoch(ctx, node); err != nil || ok {

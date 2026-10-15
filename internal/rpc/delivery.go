@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,17 +148,15 @@ func (r *remoteDelivery) Deliver(p *pawnite.Pawnite) {
 	}
 	// ctx 携带执行实例的 incarnation 纪元（fencing 面，与本地
 	// callDelivery.Deliver 同款）；基 ctx 携带节点调用面。入站因果路径注入
-	//（H12 决策 14 v2：扩展块 causal 解码产物；Tell 不携带，恒 nil）。传播
-	// 键值项解码注入（H10 决策 8）：扩展块 ctx 项按登记名查表解码回填，与
-	// 本地同语义重建共守「可见值 = decode 产物」形态（INV6）；未登记名/
-	// 解码失败项跳过留痕。Handle ctx 的 deadline 按请求预算派生（H10 决策
-	// 6）：dl 已在 newDelivery 按「收到时刻 + budget」锚定；出队检查已挡掉
-	// 耗尽者，竞态极小窗内得到已到期 ctx 按取消语义收场。调用方 ctx 不跨
-	// 节点：远端折叠传 nil ctxErr。延迟应答登记点仅请求形态注入（H12 决策
-	// 16 前半：单向无应答面，Handle 内 rans.Defer 经它登记）。
-	ctx := r.d.baseCtx()
+	//	（H12 决策 14 v2：扩展块 causal 解码产物；Tell 不携带，恒 nil）。传播
+	//	键值项解码注入（H10 决策 8）：扩展块 ctx 项按登记名查表解码回填，与
+	//	本地同语义重建共守「可见值 = decode 产物」形态（INV6）；未登记名/
+	//	解码失败项跳过留痕。deadline/取消面/登记点/让出面统一经唯一信封
+	//	构造（票 08）：dl 已在 newDelivery 按「收到时刻 + budget」锚定，出队
+	//	检查已挡掉耗尽者；调用方 ctx 不跨节点（远端折叠传 nil ctxErr）。
+	base := r.d.baseCtx()
 	if cp := r.ext.Causal; cp != nil {
-		ctx = ctxkey.WithCausal(ctx, cp)
+		base = ctxkey.WithCausal(base, cp)
 	}
 	if n := len(r.ext.Ctx); n > 0 {
 		items := make([]ctxkey.PropItem, 0, n)
@@ -165,26 +164,27 @@ func (r *remoteDelivery) Deliver(p *pawnite.Pawnite) {
 			items = append(items, ctxkey.PropItem{Name: it.Name, Value: it.Value})
 		}
 		var skipped int
-		ctx, skipped = ctxkey.InjectPropagation(ctx, items)
+		base, skipped = ctxkey.InjectPropagation(base, items)
 		if skipped > 0 {
 			log.Warn("rans/rpc: inbound propagation items skipped",
 				"count", skipped, "message", r.hdr.MessageID)
 		}
 	}
-	ctx = ctxkey.WithSelf(ctxkey.WithIncarnation(ctx, p.Incarnation()), r.id.Kind, r.id.Key)
-	if r.hdr.Type == protocol.MsgRequest {
-		ctx = ctxkey.WithDeferPoint(ctx, r)
+	oneWay := r.hdr.Type == protocol.MsgOneWay
+	var deferArm rans.DeferredArm // 单向无应答面：nil = 无类型遮蔽
+	if !oneWay {
+		deferArm = r
 	}
-	ctx, cancel := context.WithDeadline(ctx, r.dl)
-	defer cancel()
-	// 让出面注入（H12 决策 16 后半）：远端腿 detached——Handle ctx 随投递
-	// 返回的 defer cancel 收场，wctx 脱钩派生（见 pawnite.ReenterArm）；
-	// 执行面随投递留存供 MsgCancel 取消在飞 work（markCanceled）。
-	arm := p.NewReenterArm(ctx, true)
+	form := pawnite.EnvelopeCall
+	if oneWay {
+		form = pawnite.EnvelopeOneWay
+	}
+	ctx, cancel, arm := p.HandleCtx(base, r.id, form, r.dl, deferArm, true)
+	// 执行面随投递留存供 MsgCancel 取消 Handle ctx 与在飞 work
+	//（markCanceled）；取消面登记 + 竞态复查（H10 决策 9）：先登记取消面
+	// 再复查标记，兜住 markCanceled 读到 nil 面的窗口（配对次序见
+	// markCanceled 注释）。
 	r.reenter.Store(arm)
-	ctx = ctxkey.WithReenterPoint(ctx, arm)
-	// 取消面登记 + 竞态复查（H10 决策 9）：先登记取消面再复查标记，兜住
-	// markCanceled 读到 nil 面的窗口（配对次序见 markCanceled 注释）。
 	r.execCancel.Store(&cancel)
 	if r.canceled.Load() {
 		p.NoteCanceled()
@@ -193,15 +193,37 @@ func (r *remoteDelivery) Deliver(p *pawnite.Pawnite) {
 	}
 	out, err := ent.Handle(ctx, v)
 	if err != nil {
-		// Handle 错误边界（远端半边）：与本地投递边界共用
-		// activation.FoldHandlerError 唯一定义——折叠为 CodeError+ReasonHandler，
-		// AppError/AppDataError 的业务维（AppCode/AppData）随结构化 Error
-		// 帧过线，调用方得到与本地同构的 *rans.Error。ctxErr=nil
-		// 时折叠无透传出口，类型断言必中（defensive 分支仅兜契约破坏）。
+		// Handle ctx 到期/取消且错误原样传播（文档化惯例，slowEntity 形
+		// 态）：按请求预算耗尽/取消收场而非折叠成 Handler 错误——调用方
+		// 分类得 Timeout/Canceled（远端腿与本地腿 ctxOutcome 同口径；重
+		// 打预算后收发两端 deadline 对齐，该形态从竞态窗变常态，票 05 实
+		// 证收口）。
+		if cerr := ctx.Err(); cerr != nil && errors.Is(err, cerr) {
+			if errors.Is(cerr, context.DeadlineExceeded) {
+				r.replyError(rans.NewError(rans.CodeTimeout, rans.ReasonExpired,
+					"request budget exhausted during handler"))
+				return
+			}
+			r.replyError(rans.NewError(rans.CodeCanceled, rans.ReasonNone,
+				"request canceled during handler"))
+			return
+		}
+		// 单向消息与本地 Tell 同构：错误 Warn 含错误留痕（无应答面，规格
+		// §8.2「一切失败记日志」）。请求形态走 Handle 错误边界（远端半边）：
+		// 与本地投递边界共用 activation.FoldHandlerError 唯一定义——折叠为
+		// CodeError+ReasonHandler，AppError/AppDataError 的业务维
+		//（AppCode/AppData）随结构化 Error 帧过线，调用方得到与本地同构的
+		// *rans.Error。ctxErr=nil 时折叠无透传出口（defensive 分支仅兜契约
+		// 破坏）。
+		if oneWay {
+			log.Warn("rans/rpc: remote one-way handler error",
+				"uuid", r.id.String(), "err", err)
+			return
+		}
 		r.replyError(foldHandlerErr(err))
 		return
 	}
-	if r.hdr.Type == protocol.MsgOneWay {
+	if oneWay {
 		return // 单向消息：执行即可，不应答
 	}
 	// 延迟应答判读与本地 callDelivery.Deliver 同一矩阵（契约正本见 rans.Defer）。
@@ -244,6 +266,14 @@ func (r *remoteDelivery) DeliverDeferred(v any, err error) {
 // DeferredDeadline 本请求的执行 deadline（newDelivery 锚定的「收到时刻 +
 // budget」权威，Responder 到期丢弃判据）。
 func (r *remoteDelivery) DeferredDeadline() time.Time { return r.dl }
+
+// SettleDeferred 实例终局收场（票 11，pawnite.DeferredSettler）：未 Reply
+// 的延迟应答以 Timeout+Deactivated 立即回结对端——不折叠（终局是运行时
+// 状态，非 Handle 错误）；摘除取消定位同 DeliverDeferred。
+func (r *remoteDelivery) SettleDeferred(e *rans.Error) {
+	r.d.unregisterCancel(r)
+	r.replyError(e)
+}
 
 // foldHandlerErr Handle 错误折叠为线格式 *rans.Error（两收场共用；
 // FoldHandlerError 唯一定义的远端半边适配，defensive 分支仅兜契约破坏）。
@@ -301,6 +331,15 @@ func (r *remoteDelivery) Reject(status rans.Code, reason rans.Reason) {
 // 仅头部位运算与发件箱非阻塞入箱（满即丢，错误只留痕，不上抛）。
 func (r *remoteDelivery) Forward(winner rans.NodeID) {
 	defer r.release()
+	// 在箱已标记取消的投递不再转发（票 12）：取消定位先于仲裁落败到达
+	// ——转发会在赢家侧执行一个调用方已放弃的请求。按取消收场回结源端
+	// 并计数 rans.call.canceled。
+	if r.canceled.Load() {
+		r.d.noteCanceledFrame()
+		r.replyError(rans.NewError(rans.CodeCanceled, rans.ReasonNone,
+			"rans: canceled before forward (not delivered)"))
+		return
+	}
 	if r.hdr.Flags&protocol.FlagForwarded != 0 {
 		// NotFound+StaleLocation（结构化 reason）：该帧必然从未被执行
 		// ——分类唯一表归 RetryNotFound，调用方重解析位置后重试。
@@ -313,8 +352,29 @@ func (r *remoteDelivery) Forward(winner rans.NodeID) {
 			"forward loser with anonymous source: no reply address"))
 		return
 	}
+	// 重定向提示（票 12：本方法是同步输家分支与 pawnite 排空转发的共同
+	// 漏斗——两路都在此向源端发提示，pending 改道赢家，取消/判停跟随；
+	// epoch 置 0——提示条目语义，缓存真值由正 TTL 收敛）。
+	if src := rans.NodeID(r.hdr.SourceNodeID); src != 0 && src != r.d.self {
+		hh := wire.Header{
+			Type:         protocol.MsgRedirectHint,
+			Flags:        protocol.FlagHasSourceNodeID | protocol.FlagHasTargetUUID,
+			MessageID:    r.hdr.MessageID,
+			SourceNodeID: uint16(r.d.self),
+			TargetKind:   r.hdr.TargetKind,
+			TargetInst:   r.hdr.TargetInst,
+		}
+		hb := wire.EncodeRedirectHint(wire.RedirectHint{Node: uint16(winner)})
+		if err := r.d.outbox.TryPut(src, hh, hb); err != nil {
+			log.Debug("rans/rpc: redirect hint dropped",
+				"source", src, "message", r.hdr.MessageID, "err", err)
+		}
+	}
 	fh := r.hdr
 	fh.Flags |= protocol.FlagForwarded
+	// 转发按本投递剩余重写预算（票 05）：赢家不按原调用方的完整预算重
+	// 新锚定——排队与本投递已耗掉的时长扣除，迟到链不放大预算。
+	restampBudget(&fh, r.dl)
 	// 非阻塞入箱（H11 决策 12/13）：转发帧交节点发件箱——满即丢计数，
 	// 发送（地址解析+懒拨号+端点韧性）归分片 worker 异步完成。调用点
 	// （读循环输家分支与 pawnite 终局/迁移整箱排空）零阻塞 IO。

@@ -14,13 +14,20 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/pawnite"
 )
+
+// staleDestroyBudget 陈旧实例止损销毁的单实体预算（实体已围栏，超时无害
+// ——与 rpc 侧 ownership-lost 销毁预算同源量级）。
+const staleDestroyBudget = 30 * time.Second
 
 // 缺省参数同源（规格附录 A）：checkpoint 间隔 1min、单轮上限 1000。
 const (
@@ -161,13 +168,36 @@ func captureCheckpoint(ctx context.Context, tbl *activation.Table, p *pawnite.Pa
 			tbl.EndCheckpoint(p, out.Epoch) // 该纪元无内容可写：视为已 checkpoint
 			return
 		}
-		// 围栏：Put 携带本 incarnation 纪元——收尾 goroutine
-		// 与实例生命周期解耦（ckptInFlight 是实例内的门，跨 incarnation 不
-		// 设防），强弃换代后本写入晚落时由 Store 侧 CAS 拒绝
-		//（ErrStaleIncarnation，按失败留痕、不记纪元——但换代后旧实例的
-		// 纪元簿记已随逐出作废，重试也不再发生）。
-		if err := tbl.SnapshotStore().Put(ctx, id, p.Incarnation(), out.Snapshot); err != nil {
-			tbl.AbortCheckpoint(p)
+		// 落库 ctx 脱离扫描轮取消（Scan 返回即 cancel，早于本收尾 Put），
+		// 重挂本轮 deadline：到点未完即弃。
+		pctx := context.WithoutCancel(ctx)
+		if dl, ok := ctx.Deadline(); ok {
+			var cancel context.CancelFunc
+			pctx, cancel = context.WithDeadline(pctx, dl)
+			defer cancel()
+		}
+		// 围栏：Put 携带本 incarnation 纪元——收尾 goroutine 与实例生命周期
+		// 解耦（ckptInFlight 是实例内的门，跨 incarnation 不设防）。stale
+		// 拒写=更新的化身已落库（本实例确定失主）：围栏该实例并按实例身份
+		// 异步销毁（stop 形态不落终快照），其余失败留痕下轮重扫。
+		if err := tbl.SnapshotStore().Put(pctx, id, p.Incarnation(), out.Snapshot); err != nil {
+			tbl.AbortCheckpoint(p) // 先归还在飞门：retireCore 的 AwaitCheckpointSettled 不空转
+			if errors.Is(err, checkpoint.ErrStaleIncarnation) {
+				p.Fence()
+				tbl.MetricsRegistry().Counter(metrics.NameOwnershipStaleFenced,
+					"stale-incarnation writes that fenced or dropped the writing instance").Add(1)
+				log.Info("rans/activation: checkpoint rejected as stale; instance fenced for identity-guarded destroy",
+					"uuid", id.String(), "incarnation", p.Incarnation())
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), staleDestroyBudget)
+					defer cancel()
+					if err := DestroyPawn(ctx, tbl, id, p); err != nil {
+						log.Warn("rans/activation: stale-instance destroy failed (entity stays fenced)",
+							"uuid", id.String(), "err", err)
+					}
+				}()
+				return
+			}
 			log.Warn("rans/activation: checkpoint put failed (retry next sweep)",
 				"uuid", id.String(), "err", err)
 			return

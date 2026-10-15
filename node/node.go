@@ -32,6 +32,7 @@ type Node struct {
 	closeDir bool // node 自建目录（redis 形态）Shutdown 才关；注入目录归调用方
 	mgr      *mgr.Table
 	lv       *membership.Liveness   // 节点存活信号（目录实现 NodeRegistry 才有；inmem nil）
+	view     *membership.LocalView  // 节点本地成员视图（票 01；nil = 无注册表形态）
 	cache    *routing.LocationCache // 位置缓存（恒装配）
 	rem      *rpc.Remote
 	client   rans.Client // 唯一调用入口（统一路由：本地快路径/远程一形态）

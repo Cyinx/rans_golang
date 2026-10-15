@@ -31,6 +31,14 @@ func (g *Gateway) canceledOutcome(ctx context.Context, target rans.NodeID, reqHd
 	return ctxOutcome(ctx)
 }
 
+// SetCancelQueue 取消通知的发件箱接线（票 12：MsgCancel 经请求同一目标
+// 队列——排在请求之后不超车；目标熔断时取消随 TryPut 丢弃，请求必然也
+// 未送出）。装配期注入（remote：网关构造后再建发件箱，随后接线）；nil
+// 或未接线时退回直发（独立测试构造形态）。
+func (g *Gateway) SetCancelQueue(o *Outbox) {
+	g.cancelQueue = o
+}
+
 // sendCancelOnCanceled 调用方 ctx 以「主动取消」（非预算到期）收场时，向
 // pending 目标节点异步发 MsgCancel（H10 决策 9）：头部携原请求 MessageID/
 // SourceNodeID/TargetUUID——对端按（源节点，MessageID）定位在途/在箱请求。
@@ -47,6 +55,15 @@ func (g *Gateway) sendCancelOnCanceled(ctx context.Context, target rans.NodeID, 
 		SourceNodeID: reqHdr.SourceNodeID,
 		TargetKind:   reqHdr.TargetKind,
 		TargetInst:   reqHdr.TargetInst,
+	}
+	if g.cancelQueue != nil {
+		// 同目标队列入队（票 12）：满即丢/熔断丢弃与取消的尽力语义一致
+		//（请求本体在同一队列，二者同命运）。
+		if err := g.cancelQueue.TryPut(target, hdr, nil); err != nil {
+			log.Debug("rans/rpc: cancel notification dropped at outbox",
+				"target", target, "message", hdr.MessageID, "err", err)
+		}
+		return
 	}
 	go func() {
 		cctx, cancel := context.WithTimeout(context.Background(), cancelSendBudget) // 例外②：取消通知尽力预算（cancelSendBudget 集中定义——调用方 ctx 已收场，不能再作发送面）

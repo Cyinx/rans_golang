@@ -2,6 +2,7 @@ package activation
 
 import (
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/pawnite"
 )
 
@@ -32,6 +33,10 @@ func (m *Table) Locals() []PawnRef {
 	m.readMu.RUnlock()
 	return refs
 }
+
+// MetricsRegistry 观测注册表协作面（lifecycle/rpc 侧 B9 计数器落点；
+// 注入优先、Default 兜底——语义同 carrier.go 的 metricsReg）。
+func (m *Table) MetricsRegistry() *metrics.Registry { return m.metricsReg() }
 
 // InstanceIncarnation 返回在册实例的注册纪元（协作面）：ok=false 表示注册
 // 从未完成（owner 未落位——输家/注册失败/未起步，本实例无目录主张）。

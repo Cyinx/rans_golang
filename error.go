@@ -1,6 +1,7 @@
 package rans
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -29,6 +30,7 @@ const (
 	ReasonHandler
 	ReasonExpired
 	ReasonCycle
+	ReasonDeactivated
 )
 
 // String 返回 reason 的诊断名（snake_case，供日志与测试可读性）；线格式
@@ -73,6 +75,8 @@ func (r Reason) String() string {
 		return "expired"
 	case ReasonCycle:
 		return "cycle"
+	case ReasonDeactivated:
+		return "deactivated"
 	default:
 		return fmt.Sprintf("reason(%d)", uint16(r))
 	}
@@ -111,8 +115,13 @@ func (e *Error) Error() string {
 }
 
 // Is 按维度匹配：target 为 *Error 时比 Code；target.Reason 非 0 时同时比
-// Reason；target.AppCode 非 0 时同时比 AppCode。
+// Reason；target.AppCode 非 0 时同时比 AppCode。target 为标准库
+// context.DeadlineExceeded 时超时类（Code==Timeout）匹配（票 13：标准 Go
+// 判错写法对超时/取消两半都成立——取消经包装链携带 ctx.Err() 本就可达）。
 func (e *Error) Is(target error) bool {
+	if target == context.DeadlineExceeded {
+		return e.Code == CodeTimeout
+	}
 	t, ok := target.(*Error)
 	if !ok {
 		return false

@@ -233,7 +233,7 @@ func FuzzHandshakeDecode(f *testing.F) {
 		return w.Bytes()
 	}
 	// 合法最小握手（无 MAC）。
-	f.Add(seed(3, 3, func(w *codec.Writer) {
+	f.Add(seed(4, 4, func(w *codec.Writer) {
 		w.BeginObject(3)
 		w.WriteTag(1, codec.WireFixed16)
 		w.WriteFixed16(5)
@@ -241,7 +241,7 @@ func FuzzHandshakeDecode(f *testing.F) {
 		w.WriteFieldFixed64(3, 0xABCD)
 	}))
 	// 未知字段号 9 + 极大字段号 + 未定义线型。
-	f.Add(seed(3, 5, func(w *codec.Writer) {
+	f.Add(seed(4, 6, func(w *codec.Writer) {
 		w.BeginObject(4)
 		w.WriteTag(1, codec.WireFixed16)
 		w.WriteFixed16(5)
@@ -254,8 +254,8 @@ func FuzzHandshakeDecode(f *testing.F) {
 	}))
 	// 不相交版本区间与区间倒置。
 	f.Add(seed(2, 2, func(w *codec.Writer) { w.BeginObject(0) }))
-	f.Add(seed(4, 9, func(w *codec.Writer) { w.BeginObject(0) }))
-	f.Add(seed(5, 3, func(w *codec.Writer) { w.BeginObject(0) }))
+	f.Add(seed(5, 9, func(w *codec.Writer) { w.BeginObject(0) }))
+	f.Add(seed(6, 4, func(w *codec.Writer) { w.BeginObject(0) }))
 	// 带 MAC 的完整握手 + 截断体。
 	hs := Handshake{NodeID: 1, ClusterName: "t", SchemaDigest: 9}
 	f.Add(hs.Encode([]byte("k")))

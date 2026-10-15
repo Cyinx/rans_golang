@@ -203,6 +203,7 @@ func (p *Pawnite) finishRetiredInOrder(ctx context.Context) {
 	p.setTerminalLocked(TerminalRetired, 0)
 	p.mu.Unlock()
 	p.disposeLate(late)
+	p.settleDeferred()
 }
 
 // settleFollowersNow 取走在册跟随者并按 settleErr 结算（nil=已完成）。

@@ -206,13 +206,13 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 			cfg.Placement = fixedLocalPlacement{}
 		}
 		if o.redis != nil {
-			// 存活节拍周期（node 内置接线：Lease.Interval 驱动成员键刷新；
+			// 存活节拍周期（node 内置接线：Liveness.Interval 驱动成员键刷新；
 			// ≤0 → membership 缺省 30s——测试注入短值即缩短失效传播延迟）。
-			cfg.Lease.Interval = o.redis.heartbeatInterval
+			cfg.Liveness.Interval = o.redis.heartbeatInterval
 			// 存活节拍自围栏阈值逐节点覆盖（WithNodeSelfFence）：取号失败
 			// 形态的止损时长控制面。
 			if d, ok := o.nodeSelfFences[idx]; ok {
-				cfg.Lease.SelfFence = d
+				cfg.Liveness.SelfFence = d
 			}
 		}
 		if o.watchdog != nil {
@@ -221,21 +221,33 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 		}
 		if o.idleKind != "" {
 			cfg.KindOptions = map[string]node.KindOptions{
-				o.idleKind: {Idle: &node.IdlePolicy{After: o.idleAfter, Migrate: false}},
+				o.idleKind: {Idle: &node.IdlePolicy{After: o.idleAfter, Migrate: o.idleMigrate}},
 			}
 			cfg.Rebalance.Period = o.idleLoop
+			if o.idleMigrate {
+				cfg.Rebalance.Threshold = 1 // 迁移档由 Rebalance 驱动（本地 >阈值 才卸载）
+			}
 		}
 		nod, err := node.New(cfg)
 		if err != nil {
 			t.Fatalf("testkit: new node %d: %v", id, err)
 		}
+		startFailed := false
 		if err := nod.Start(t.Context()); err != nil { // 测试基建装配入口：Start ctx 只辖监听建立（t.Context 随测试生命期收口）
-			t.Fatalf("testkit: start node %d: %v", id, err)
+			// 取号失败注入节点（票 14 语义）：Start 同步取号失败即终态报
+			// 错——期望形态，不 Fatal；节点仍登记（Node(i) 索引不空档）
+			// 但不注册地址表（无监听无成员键，对集群不可见）。
+			if idx != o.epochFailNode {
+				t.Fatalf("testkit: start node %d: %v", id, err)
+			}
+			startFailed = true
 		}
-		addrs[id] = nod.Addr()
-		c.mu.Lock()
-		c.byAddr[nod.Addr()] = id
-		c.mu.Unlock()
+		if !startFailed {
+			addrs[id] = nod.Addr()
+			c.mu.Lock()
+			c.byAddr[nod.Addr()] = id
+			c.mu.Unlock()
+		}
 		cn.node = Node{ID: id, Node: nod}
 		c.nodes = append(c.nodes, cn)
 	}

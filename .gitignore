@@ -11,12 +11,5 @@ bin/
 *.key
 redis.local.env
 
-# 内部过程文档：本地保留、不入公开仓库（2026-10-13 开源剥离）
-.scratch/
-docs/superpowers/
-docs/porting/
-docs/decisions/
-docs/ROADMAP.md
-docs/agents/
-docs/ISSUES.md
-AGENTS.md
+# 内部过程文档已回 main 跟踪（票 22）；公开线剥离由
+# tools/sync-oss-snapshot.sh 的临时 index 流程承担（不靠 .gitignore）。

@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,13 @@ type Dispatcher struct {
 	pool     *wire.PagePool
 	pkgs     *PackageCache // MigrationPackage 落点；nil → 包丢弃留痕（防御）
 	draining atomic.Bool   // 排空门闸（规格 §14.1 ①；BeginDraining 置位）
+	// viewInvalidate 重定向提示触发的视图失效钩子（票 01）。
+	viewInvalidate func()
+
+	// canceledFrames 转发前取消收场计数（票 12；BindCanceledCounter 装
+	// 配期接线，nil = 不计——独立测试构造形态）。
+	canceledFrames *metrics.Counter
+
 	// outbox 节点发件箱（NewDispatcher 装配期注入，恒非 nil）：回包/转发
 	// 出站的非阻塞入箱面（H11 决策 12/13——满即丢计数，发送归分片 worker
 	// 异步完成，读循环与实体 loop 零阻塞 IO）。
@@ -73,6 +81,21 @@ type Dispatcher struct {
 
 // setBaseClient 注入投递基 ctx 的调用面（NewClient 装配期调用，Start 前）。
 func (d *Dispatcher) setBaseClient(c rans.Client) { d.baseClient = c }
+
+// BindCanceledCounter 转发前取消收场的计数接线（票 12；remote 装配期把
+// rans.call.canceled 计数器传入，与 activation 出队取消同面聚合）。
+func (d *Dispatcher) BindCanceledCounter(c *metrics.Counter) { d.canceledFrames = c }
+
+// BindViewInvalidate 视图失效钩子接线（票 01：重定向提示=拓扑信号——
+// 对端换代/接管，候选与地址跟上；nil 静默）。
+func (d *Dispatcher) BindViewInvalidate(fn func()) { d.viewInvalidate = fn }
+
+// noteCanceledFrame 转发前取消收场计数（nil 安全）。
+func (d *Dispatcher) noteCanceledFrame() {
+	if d.canceledFrames != nil {
+		d.canceledFrames.Add(1)
+	}
+}
 
 // baseCtx 投递基 ctx：携带调用面（nil 未接线时退回 Background——行为零
 // 变化）。入站请求的 GetOrActivate 与 Handle ctx 一律由本基 ctx 派生。
@@ -159,6 +182,11 @@ func (d *Dispatcher) BeginDraining() { d.draining.Store(true) }
 // 继续服务到排空收编为止），miss 在激活路径之前被拦下；既有投递（已在
 // 收件箱/在途执行）不受门闸影响，由阶段②的统一销毁路径收编。
 func (d *Dispatcher) HandleMessage(hdr wire.Header, body []byte) {
+	// 入站即可达（票 04）：收到某节点帧即闭合该目标的发件箱熔断——分区
+	// 恢复后首个入站帧立刻解除快速失败，不等冷却探针（无开断时零成本）。
+	if src := rans.NodeID(hdr.SourceNodeID); src != 0 && src != d.self {
+		d.outbox.NotifyNodeAlive(src)
+	}
 	switch hdr.Type {
 	case protocol.MsgResponse, protocol.MsgError:
 		d.gw.HandleResponse(hdr, body)
@@ -277,8 +305,8 @@ func (d *Dispatcher) handleMigrationPackage(hdr wire.Header, body []byte) {
 //     Error(NotFound+UnknownKind)（kind 不在注册表的远端面与本地
 //     激活面同构，NotFound 促源端重解析重试）；ErrActivationFailed
 //     瞬态失败 → 重试（注册后的失败属执行前确定性失败——回执面一律
-//     Unavailable+ActivationFailed；分类唯一表归
-//     RetryUnconditional，源端环内无条件重试）；其余错误 → Error(CodeError)；
+//     Unavailable+ActivationFailed；分类唯一表归 RetryUnconditional，源端
+//     环内无条件重试）；其余错误 → Error(CodeError；CodeError 形态透传 Reason)；
 //   - 仲裁落败（错误链携带 *activation.ArbitrationLostError）：GetOrActivate
 //     入表后复检命中终态时错误同步返回——此刻消息尚未入任何收件箱，
 //     pawnite 的整箱转发扑空，由本层直接按输家语义转发原始字节给赢家
@@ -317,24 +345,7 @@ func (d *Dispatcher) handleRequest(hdr wire.Header, body []byte) {
 		}
 		var lost *activation.ArbitrationLostError
 		if errors.As(err, &lost) {
-			// 重定向提示（H13 决策 24）：转发的同时向源端直发缓存加速帧
-			//（不裁决 pending——请求本体已转发，正常应答从赢家到达；提示
-			// 丢失由正 TTL 兜底收敛）。匿名源无地址可发，跳过。
-			if src := rans.NodeID(hdr.SourceNodeID); src != 0 && src != d.self {
-				hh := wire.Header{
-					Type:         protocol.MsgRedirectHint,
-					Flags:        protocol.FlagHasSourceNodeID | protocol.FlagHasTargetUUID,
-					MessageID:    hdr.MessageID,
-					SourceNodeID: uint16(d.self),
-					TargetKind:   hdr.TargetKind,
-					TargetInst:   hdr.TargetInst,
-				}
-				hb := wire.EncodeRedirectHint(wire.RedirectHint{
-					Node: uint16(lost.Winner.Node), Epoch: lost.Winner.Epoch})
-				if err := d.outbox.TryPut(src, hh, hb); err != nil {
-					d.pool.Put(hb)
-				}
-			}
+			// 输家转发（提示发送随 Forward 漏斗统一收口，见 delivery.go）。
 			d.newDelivery(hdr, body, id).Forward(lost.WinnerNode())
 			return
 		}
@@ -354,8 +365,12 @@ func (d *Dispatcher) handleRequest(hdr wire.Header, body []byte) {
 			if body != nil {
 				d.pool.Put(body)
 			}
-			d.replyError(hdr, rans.NewError(rans.CodeError, rans.ReasonNone,
-				"activation error: "+err.Error()))
+			e := rans.NewError(rans.CodeError, rans.ReasonNone, "activation error: "+err.Error())
+			var re *rans.Error
+			if errors.As(err, &re) && re.Code == rans.CodeError {
+				e.Reason = re.Reason // 不可重试形态（如工厂 panic）的 Reason 原样过线
+			}
+			d.replyError(hdr, e)
 			return
 		}
 		// ErrActivationFailed：瞬态失败，重试（页仍在本层手中）

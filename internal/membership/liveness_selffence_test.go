@@ -1,39 +1,25 @@
 package membership
 
-// Liveness 自围栏（H13：自 LeaseKeeper 迁入）单元验收：成员键写持续失败
-// 超过 SelfFence → 对 LocalIDs 全集逐实体 Fence（同步关准入）+ OnSelfFenceLost
-// 止损销毁（独立 goroutine，不阻塞存活循环——阻塞不冻结面由 EX5 族
+// Liveness 自围栏单元验收：存活节拍持续失败超过 SelfFence → Fence(0)
+// 围栏全部本地实例（钩子自带异步止损销毁——阻塞不冻结面由
 // TestLiveness_NodeKeyNotFrozenByBlockingDestroy 锚定）；写恢复即复位
 //（下一失败幕可再次触发）；<0 关闭。
 
 import (
-	"context"
 	"errors"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/cyinx/rans_golang"
 )
 
 func TestSelfFence_TriggersOnProlongedFailure(t *testing.T) {
 	reg := newFakeNodeRegistry(nil)
-	a, b := mustID(t, "k", "sf-a"), mustID(t, "k", "sf-b")
 
-	var mu sync.Mutex
-	fenced := make(map[rans.ID]int)
-	lost := make(map[rans.ID]int)
+	var rounds atomic.Int32
 	lv, err := NewLiveness(LivenessConfig{
 		Reg: reg, Self: 1, Interval: 20 * time.Millisecond,
 		SelfFence: 60 * time.Millisecond,
-		Fence:     func(id rans.ID) { mu.Lock(); fenced[id]++; mu.Unlock() },
-		LocalIDs:  func() []rans.ID { return []rans.ID{a, b} },
-		OnSelfFenceLost: func(_ context.Context, lostID rans.ID) error {
-			mu.Lock()
-			lost[lostID]++
-			mu.Unlock()
-			return nil
-		},
+		Fence:     func(uint64) int { rounds.Add(1); return 2 },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -44,18 +30,10 @@ func TestSelfFence_TriggersOnProlongedFailure(t *testing.T) {
 	reg.waitCalled(t) // 首写成功
 	reg.failWrites(errors.New("partition"))
 	deadline := time.After(2 * time.Second)
-	for {
-		mu.Lock()
-		done := len(fenced) == 2 && len(lost) == 2
-		mu.Unlock()
-		if done {
-			break
-		}
+	for rounds.Load() == 0 {
 		select {
 		case <-deadline:
-			mu.Lock()
-			t.Fatalf("self-fence did not cover all locals: fenced=%v lost=%v", fenced, lost)
-			mu.Unlock()
+			t.Fatalf("self-fence did not fire: rounds=%d", rounds.Load())
 		default:
 			time.Sleep(time.Millisecond)
 		}
@@ -63,13 +41,11 @@ func TestSelfFence_TriggersOnProlongedFailure(t *testing.T) {
 
 	// 写恢复即复位：失败幕恰触发一次（恢复后无新失败不再围栏）。
 	reg.healWrites()
-	reg.waitCalled(t)
+	reg.waitRenew(t)
 	time.Sleep(120 * time.Millisecond)
-	mu.Lock()
-	if fenced[a] != 1 || fenced[b] != 1 {
-		t.Fatalf("fence must fire exactly once per failure episode: %v", fenced)
+	if n := rounds.Load(); n != 1 {
+		t.Fatalf("fence must fire exactly once per failure episode: rounds=%d", n)
 	}
-	mu.Unlock()
 }
 
 func TestSelfFence_DisabledByNegative(t *testing.T) {
@@ -78,8 +54,7 @@ func TestSelfFence_DisabledByNegative(t *testing.T) {
 	var fenced int
 	lv, err := NewLiveness(LivenessConfig{
 		Reg: reg, Self: 1, Interval: 20 * time.Millisecond, SelfFence: -1,
-		Fence:    func(rans.ID) { fenced++ },
-		LocalIDs: func() []rans.ID { return nil },
+		Fence: func(uint64) int { fenced++; return 0 },
 	})
 	if err != nil {
 		t.Fatal(err)

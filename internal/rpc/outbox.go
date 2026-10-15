@@ -1,25 +1,24 @@
 package rpc
 
-// 节点发件箱（H11 决策 11）：单向发送入箱即返回，worker 按目标节点哈希
-// 分片异步负责路由与发送。分片内单 worker 串行承同目标 FIFO，分片间并
-// 行（同分片异目标互相排队是哈希分片的固有代价）。容量为全箱共享计数
-// （跨分片合计），满箱语义按生产者分野（决策 12）：显式 Tell 阻塞至调
-// 用方 ctx 到期，非阻塞生产者（事件扇出/回包/转发——票 09）满即丢计数。
+// 节点发件箱（票 04 重构：按目标分队列）：每个目标节点一条 FIFO 队列 +
+// 按需起停的专属 worker——跨目标互不阻塞（哈希分片的同分片队头阻塞随分
+// 片模型消亡），同目标 FIFO 保持（C1「先 Tell 后 Call」承诺载体）。容量
+// 两级：全箱共享（Outbox.Capacity）+ 每目标上限（防单目标独占全箱）；控
+// 制面帧（MsgOwnershipLost/MsgRedirectHint 经 TryPut）走独立预留容量，数
+// 据帧占满时仍可入箱。死目标熔断：发送重试耗尽或端点判停 → 该目标熔断
+// ——箱内帧立即按「确定未送出」收场（调用帧回投 Unavailable+SendFailed、
+// 单向帧丢弃计数），熔断期间新入箱快速失败；冷却期满放行一帧探测、成功
+// 即闭合，成员视图换代/复活事件（票 01 接线 NotifyNodeAlive）即时闭合。
 //
-// 请求-响应调用帧同箱入队（PutCall）：与单向帧同分片同 FIFO——同目标
-// 「先 Tell 后 Call」的跨节点写出次序由单 worker 串行承载。调用帧携带
-// 调用方 ctx 与失败回投面，worker 以 SendCall 发送：预算随帧入箱，排队
-// 过期的帧在发送段自我中止（确定未送出，不产生迟到执行）。
+// 发送面由组装根注入（Send/SendCall 接网关端点；重试窗口在端点内部——
+// 发件箱看到的是重试耗尽后的最终错误，即熔断触发判据）。body 所有权随
+// 入箱移交发件箱、随发送成功移交端点或随弃置/熔断清扫释放——与
+// SendOneWay 同口径，不得复用已归还缓冲。
 //
-// 发送面由组装根注入（Remote 接网关 SendOneWay——路由与发送韧性在端点
-// 内部），worker 逐帧调用，失败即弃置计数（at-most-once：重试窗口在端
-// 点内，分片头阻塞由箱容量吸收）。body 所有权随入箱移交发件箱、随发送
-// 成功移交端点或随弃置释放引用——与 SendOneWay 同口径，不得复用已归还
-// 缓冲。
-//
-// 生命周期：构造即启动全部分片 worker（同网关扫描器的构造期常驻面），
-// Close 幂等收口——在途发送经内部 ctx 取消、在箱帧弃置计数（dropped）。
-// 优雅停机须先经停序③ flush 等箱空再 Close（Remote.Shutdown 装配）。
+// 生命周期：worker 按需起（首帧入队）停（队列排空），Close 幂等收口
+// ——在箱帧计数丢弃（dropped）、在途发送经 runCtx 取消（sendCall 的发送
+// ctx 同时受调用方预算与关箱取消约束）。优雅停机先经停序③ flush 等箱空
+// 再 Close（Remote.Shutdown 装配）。
 
 import (
 	"context"
@@ -30,42 +29,54 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
-	"github.com/cyinx/rans_golang/internal/log"
 	"github.com/cyinx/rans_golang/internal/metrics"
+	"github.com/cyinx/rans_golang/internal/protocol"
 	"github.com/cyinx/rans_golang/internal/wire"
 )
 
-// 发件箱缺省参数（H11 决策 11；node.Config.Outbox 零值回落同值——
-// node.DefaultOutboxCapacity/DefaultOutboxShards）与 worker 发送预算。
+// 发件箱缺省参数与 worker 发送预算。
 const (
 	// defaultOutboxCapacity 全箱共享容量缺省（条）。
 	defaultOutboxCapacity = 65536
-	// defaultOutboxShards 按目标节点哈希的分片数缺省。
-	defaultOutboxShards = 16
-	// outboxSendBudget 单帧发送的防御预算（异步发送无调用方预算可继承
-	// ——满箱等待消耗的是入箱调用方的预算，出箱发送的预算归发件箱自
-	// 有）：分片的单帧头阻塞上界，覆盖端点韧性面的整轮重试窗口。
+	// outboxPerTargetDiv/Floor 每目标上限 = max(容量/Div, Floor)——防单
+	// 目标独占全箱（死目标熔断前的排队上界）。
+	outboxPerTargetDiv   = 8
+	outboxPerTargetFloor = 64
+	// outboxControlReserve 控制面帧的独立预留容量（全箱容量之上的余量
+	// 段位，仅控制帧可占；控制帧同时豁免每目标上限）。
+	outboxControlReserve = 256
+	// outboxOpenThreshold 连续发送失败开断阈值：单次失败可能是瞬态抖动
+	//（连接更替/注入丢包），连续两次才判目标死亡。端点判停通知
+	//（NotifyTargetDown）本身是重试耗尽的强信号，不受阈值约束。
+	outboxOpenThreshold = 2
+	// outboxBreakerCooldown 熔断冷却：期满后下一次入箱即半开探测（该帧
+	// 经真实发送面，成败决定闭合/复开）。取短值（100ms）：分区恢复/目标
+	// 重启后的首个调用即探针——快速恢复可达性；死目标高频流量下每冷却
+	// 期只放行一帧进端点重试，代价有界。成员视图事件（票 01 接线
+	// NotifyNodeAlive）是即时闭合的正解，冷却是无线索时的兜底。
+	outboxBreakerCooldown = 100 * time.Millisecond
+	// outboxSendBudget 单帧发送的防御预算（端点韧性重试窗口的上界；
+	// 调用帧另受调用方预算封顶，取较早者）。
 	outboxSendBudget = 30 * time.Second
 )
 
 // errOutboxClosed 关箱后的入箱拒绝（停机窗口竞态）：plain 错误——分类
-// 唯一表 NoRetry（停机终态不重试），与满箱预算收场（Timeout/Canceled）
-// 分列。
+// 唯一表 NoRetry（停机终态不重试）。
 var errOutboxClosed = errors.New("rans: outbox: closed (node shutting down)")
 
-// errOutboxFull 非阻塞入箱（TryPut）的满箱丢弃哨兵：plain 错误——满即
-// 丢是决策 12 的固定策略而非故障，消费方（事件扇出/回包/转发）据此留痕
-// 继续即可，计数落 rans.outbox.dropped。
+// errOutboxFull 非阻塞入箱（TryPut）的满箱丢弃哨兵：满即丢是决策 12 的
+// 固定策略而非故障，消费方据此留痕继续，计数落 rans.outbox.dropped。
 var errOutboxFull = errors.New("rans: outbox: full (non-blocking producer drop)")
+
+// errOutboxBreaker 目标熔断的入箱拒绝：该目标判停（发送重试耗尽/端点判
+// 停），帧确定未入箱——快速失败而非排队干等。
+var errOutboxBreaker = errors.New("rans: outbox: target circuit breaker open")
 
 // OutboxConfig 发件箱构造参数（内部装配面——组装收敛于 Remote.New）。
 type OutboxConfig struct {
-	// Capacity 全箱共享容量（在箱条目上限，跨分片合计）；≤0 →
-	// defaultOutboxCapacity。
+	// Capacity 全箱共享容量（在箱条目上限，跨目标合计）；≤0 →
+	// defaultOutboxCapacity。每目标上限由此派生（见 outboxPerTargetDiv）。
 	Capacity int
-	// Shards 按目标节点哈希的分片数（每分片单 worker 串行）；≤0 →
-	// defaultOutboxShards。
-	Shards int
 	// Send 发送面（必填）：一帧一次端点发送（路由+发送的韧性在实现内
 	// 部）；Remote 装配网关的 SendOneWay，测试注入替身。
 	Send func(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte) error
@@ -73,52 +84,76 @@ type OutboxConfig struct {
 	// 韧性，携带请求 deadline——过期即中止（确定未送出），失败经帧内
 	// fail 回投等待方。PutCall 使用时必填（nil → 入箱拒绝）。
 	SendCall func(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte, deadline time.Time) error
-	// Metrics 指标注册表；nil → metrics.Default()。深度 gauge 与丢弃/
-	// 发送失败计数器在此注册（构造点集中注入）。
+	// Metrics 指标注册表；nil → metrics.Default()。
 	Metrics *metrics.Registry
 }
 
 // outboxItem 在箱帧：body 所有权已移交发件箱（见包注释契约）。ctx/fail
 // 仅调用帧（PutCall）非零：ctx 携调用方取消与预算（worker 发送腿的上
-// 界），fail 回投发送失败（响应不走此面，仍归网关 pending）。
+// 界），fail 回投发送失败/熔断收场（响应不走此面，仍归网关 pending）。
 type outboxItem struct {
 	target rans.NodeID
 	hdr    wire.Header
 	body   []byte
 	ctx    context.Context
 	fail   func(error)
+	// dl 帧预算 deadline（票 05）：写出时刻的过期判据与 budget_ms 重写锚
+	//（排队耗时扣除——收端以「到达+剩余」锚定，不放大调用方预算）；
+	// 零值 = 无预算（TryPut 生产者与无 deadline ctx）。
+	dl time.Time
 }
 
-// outboxShard 分片：单 worker 串行消费的 FIFO 队列（mutex + cond；
-// 切片尾部入头部出、按峰值增长——无预分配大缓冲）。
-type outboxShard struct {
+// targetQueue 单目标的 FIFO 队列 + 按需 worker 运行态 + 熔断状态机。
+type targetQueue struct {
 	mu    sync.Mutex
-	cond  *sync.Cond // worker 在空队列上等待；入箱 Signal、关箱 Broadcast
+	cond  *sync.Cond // worker 的空队等待（入队 Signal、关箱 Broadcast）
 	queue []outboxItem
-	// stopped 关箱标志（与 sweep 同临界区置位——此后入箱必被拒，杜绝
-	// worker 退出后的孤儿帧）。
+	// worker worker 在跑（空队退出清零；首帧入队时按需起）。
+	worker bool
+	// stopped 关箱标志（Close 与清扫同临界区置位——此后入箱必被拒）。
 	stopped bool
+	// 熔断状态（mu 保护）：open=熔断中（新入箱快速失败、箱内帧被清
+	// 扫）；probing=半开（冷却期满已放行一帧探测，成败决闭合/复开）；
+	// openAt 复开计时锚。
+	open    bool
+	probing bool
+	openAt  time.Time
+	// fails 连续发送失败计数（mu 保护；成功清零）：达 outboxOpenThreshold
+	// 才开断——单次瞬态失败（连接抖动/包丢失注入）不毒化后续流量。
+	fails int
+	// spaceCh 每目标上限的满等待者唤醒通道（关旧建新广播——与全箱
+	// spaceCh 同机制的目标级副本；worker 出箱即触发）。
+	spaceCh chan struct{}
 }
 
 // Outbox 节点级有界发件箱。Put 入箱即返回（满箱阻塞段见方法注释）；
 // TryPut 非阻塞生产者面（满即丢计数）；Depth 为排空等待面；Close 幂等
 // 收口。并发安全。
 type Outbox struct {
-	cfg    OutboxConfig
-	cap    int64
-	shards []*outboxShard
+	cfg       OutboxConfig
+	cap       int
+	perTarget int
 
-	// inBox 全箱共享计数（容量唯一闸门——跨分片合计）：入箱 CAS +1、
-	// 出箱/弃置 -1；深度 gauge 与停序 flush 读同一原子。
+	tmu     sync.Mutex
+	targets map[rans.NodeID]*targetQueue
+	closed  bool // tmu：关箱后 queueFor 不再新建（Close 清扫与入箱的竞态收口）
+
+	// inBox 全箱共享计数（容量唯一闸门——跨目标合计）：入箱 CAS +1、
+	// 出箱/弃置/熔断清扫 -1；深度 gauge 与停序 flush 读同一原子。
 	inBox atomic.Int64
 
-	// 空间广播面（满箱等待者的唤醒通道）：任一帧出箱即关旧建新（广播
-	// 唤醒全部等待者，胜者 CAS 占位、余者在新通道上重等）。
+	// openCount 当前开断目标数（入站可达性通知的零成本快速路径：无熔断
+	// 即直接返回——逐帧通知不进锁）。
+	openCount atomic.Int64
+
+	// 空间广播面（满箱等待者的唤醒通道）：任一帧出箱即关旧建新。
 	spaceMu sync.Mutex
 	spaceCh chan struct{}
 
-	sendFailed *metrics.Counter
-	dropped    *metrics.Counter
+	sendFailed    *metrics.Counter
+	dropped       *metrics.Counter
+	breakerOpened *metrics.Counter
+	expired       *metrics.Counter
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
@@ -127,18 +162,14 @@ type Outbox struct {
 	wg        sync.WaitGroup
 }
 
-// NewOutbox 构造发件箱并启动全部分片 worker（构造期常驻面，Close 收口
-// ——同网关扫描器形态）。Send 必填（nil 拒绝构造——无发送面的发件箱是
-// 配置事故）。
+// NewOutbox 构造发件箱（worker 按需起停，无常驻集）。Send 必填（nil 拒
+// 绝构造——无发送面的发件箱是配置事故）。
 func NewOutbox(cfg OutboxConfig) (*Outbox, error) {
 	if cfg.Send == nil {
 		return nil, errors.New("rans: outbox: Send is required")
 	}
 	if cfg.Capacity <= 0 {
 		cfg.Capacity = defaultOutboxCapacity
-	}
-	if cfg.Shards <= 0 {
-		cfg.Shards = defaultOutboxShards
 	}
 	reg := cfg.Metrics
 	if reg == nil {
@@ -147,7 +178,9 @@ func NewOutbox(cfg OutboxConfig) (*Outbox, error) {
 	runCtx, runCancel := context.WithCancel(context.Background())
 	o := &Outbox{
 		cfg:       cfg,
-		cap:       int64(cfg.Capacity),
+		cap:       cfg.Capacity,
+		perTarget: max(cfg.Capacity/outboxPerTargetDiv, outboxPerTargetFloor),
+		targets:   map[rans.NodeID]*targetQueue{},
 		spaceCh:   make(chan struct{}),
 		runCtx:    runCtx,
 		runCancel: runCancel,
@@ -156,58 +189,50 @@ func NewOutbox(cfg OutboxConfig) (*Outbox, error) {
 	o.sendFailed = reg.Counter(metrics.NameOutboxSendFailed,
 		"outbox worker send attempts failed (retry window exhausted or close-canceled)")
 	o.dropped = reg.Counter(metrics.NameOutboxDropped,
-		"frames dropped after enqueue without sending (close abandonment; capacity-policy drops land here too)")
-	reg.Gauge(metrics.NameOutboxDepth, "outbox entries waiting to be sent (all shards)",
+		"frames dropped after enqueue without sending (close abandonment; capacity/breaker drops land here too)")
+	o.breakerOpened = reg.Counter(metrics.NameOutboxBreakerOpened,
+		"per-target circuit breaker openings (send retries exhausted or endpoint terminated)")
+	o.expired = reg.Counter(metrics.NameCallExpired,
+		"frames dropped before execution on budget expiry (pawnite dequeue + outbox write-out)")
+	reg.Gauge(metrics.NameOutboxDepth, "outbox entries waiting to be sent (all targets)",
 		func() float64 { return float64(o.inBox.Load()) })
-	for i := 0; i < cfg.Shards; i++ {
-		s := &outboxShard{}
-		s.cond = sync.NewCond(&s.mu)
-		o.shards = append(o.shards, s)
-		o.wg.Add(1)
-		go o.run(s)
-	}
 	return o, nil
 }
 
-// Put 入箱一帧：箱有位即返回（入箱即返回语义）；满箱阻塞至腾位、关箱
-// 或 ctx 结束（显式 Tell 的满箱段——阻塞至调用方预算到期，错误形态与调
-// 用面统一映射一致：预算到期 → Timeout、主动取消 → Canceled）。body 所
-// 有权随本调用移交（见包注释）。
+// queueFor 目标队列 registry（无则建；队列随目标集常驻——节点号空间有
+// 界，空队仅占微小结构）。关箱后不再新建（返回 false）：Close 的清扫快
+// 照与入箱的建队竞态由此收口——关箱后入箱一律 errOutboxClosed，杜绝「清
+// 扫后才建的队列漏清/漏计」与 wg.Add 与 Wait 的并发误用。
+func (o *Outbox) queueFor(target rans.NodeID) (*targetQueue, bool) {
+	o.tmu.Lock()
+	defer o.tmu.Unlock()
+	if o.closed {
+		return nil, false
+	}
+	q := o.targets[target]
+	if q == nil {
+		q = &targetQueue{spaceCh: make(chan struct{})}
+		q.cond = sync.NewCond(&q.mu)
+		o.targets[target] = q
+	}
+	return q, true
+}
+
+// isControlFrame 控制面帧判定（预留容量的适用面）：归属通知与重定向提
+// 示——正确性承载帧，满箱不可丢；数据帧（请求/应答/单向/迁移包）不在列。
+func isControlFrame(hdr wire.Header) bool {
+	return hdr.Type == protocol.MsgOwnershipLost || hdr.Type == protocol.MsgRedirectHint
+}
+
+// Put 入箱一帧：箱有位即返回（入箱即返回语义）；满箱（全箱或本目标上
+// 限）阻塞至腾位、关箱或 ctx 结束；目标熔断即快速失败（确定未投递）。
+// body 所有权随本调用移交（见包注释）。
 func (o *Outbox) Put(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte) error {
 	return o.putBlocking(ctx, outboxItem{target: target, hdr: hdr, body: body})
 }
 
-// putBlocking 阻塞生产者（Put/PutCall）的满箱等待共核：占位失败（满箱）
-// 即等空间/关箱/ctx 三路收口后重试。
-func (o *Outbox) putBlocking(ctx context.Context, it outboxItem) error {
-	select {
-	case <-o.stopCh:
-		return errOutboxClosed
-	default:
-	}
-	for {
-		full, err := o.enqueueItem(it)
-		if err != nil || !full {
-			return err
-		}
-		// 满箱：等空间/关箱/预算（广播通道 + 关箱闸 + ctx 三路收口）。
-		o.spaceMu.Lock()
-		ch := o.spaceCh
-		o.spaceMu.Unlock()
-		select {
-		case <-ch:
-		case <-o.stopCh:
-			return errOutboxClosed
-		case <-ctx.Done():
-			return o.putOutcome(it.target, ctx)
-		}
-	}
-}
-
-// PutCall 入箱一帧请求-响应调用帧：与 Put 同一满箱阻塞语义，差异仅在
-// item 携调用方 ctx 与失败回投面（worker 发送腿见 sendCall）。调用帧与
-// 单向帧同分片同 FIFO——同目标「先 Tell 后 Call」的写出次序由此承载；
-// 排队期间预算照常流逝（过期帧由发送段中止，见包注释）。
+// PutCall 入箱一帧请求-响应调用帧：与 Put 同一满箱/熔断语义，差异仅在
+// item 携调用方 ctx 与失败回投面（worker 发送腿见 sendCall）。
 func (o *Outbox) PutCall(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte, fail func(error)) error {
 	if o.cfg.SendCall == nil {
 		return errors.New("rans: outbox: SendCall is required for call frames")
@@ -218,69 +243,172 @@ func (o *Outbox) PutCall(ctx context.Context, target rans.NodeID, hdr wire.Heade
 	return o.putBlocking(ctx, outboxItem{target: target, hdr: hdr, body: body, ctx: ctx, fail: fail})
 }
 
-// TryPut 非阻塞入箱一帧（H11 决策 12 的非阻塞生产者面——事件扇出/错误
-// 回包/仲裁输家转发/正常应答帧）：箱有位即入（与 Put 同一占位与分片队
-// 序，同目标 FIFO 语义不变）；满箱满即丢——计 rans.outbox.dropped 后返
-// 回 errOutboxFull，绝不等待；关箱拒绝（errOutboxClosed，与 Put 的停机
-// 窗口语义同型）。满箱丢弃时 body 所有权不移交（调用方继续持有并自行
-// 收场——池页归池、临时缓冲归 GC）。CAS 竞争失败内部自旋重试（无等待
-// 段，非阻塞面不因竞争升级为阻塞）。
+// putBlocking 阻塞生产者（Put/PutCall）的满箱等待共核。
+func (o *Outbox) putBlocking(ctx context.Context, it outboxItem) error {
+	select {
+	case <-o.stopCh:
+		return errOutboxClosed
+	default:
+	}
+	it.dl, _ = ctx.Deadline() // 票 05：写出时刻的过期/重写锚（无则零值）
+	for {
+		q, state, err := o.enqueueItem(it, false)
+		if state == enqueued {
+			return nil
+		}
+		if state == breakerOpen {
+			// 阻塞生产者不吃快速失败（票 04 收口）：等冷却余量后重试——本
+			// 帧成为半开探针（分区恢复的自愈面；TryPut 的非阻塞生产者仍
+			// 即刻拒绝）。等待受关箱与调用方 ctx 收口。
+			q.mu.Lock()
+			wait := outboxBreakerCooldown - time.Since(q.openAt)
+			q.mu.Unlock()
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-timer.C:
+				case <-o.stopCh:
+					timer.Stop()
+					return errOutboxClosed
+				case <-ctx.Done():
+					timer.Stop()
+					return o.putOutcome(it.target, ctx)
+				}
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if state == rejected {
+			return errOutboxClosed
+		}
+		var space chan struct{}
+		if state == globalFull {
+			o.spaceMu.Lock()
+			space = o.spaceCh
+			o.spaceMu.Unlock()
+		} else { // targetFull：本目标上限的腾位等待
+			q.mu.Lock()
+			space = q.spaceCh
+			q.mu.Unlock()
+		}
+		select {
+		case <-space:
+		case <-o.stopCh:
+			return errOutboxClosed
+		case <-ctx.Done():
+			return o.putOutcome(it.target, ctx)
+		}
+	}
+}
+
+// TryPut 非阻塞入箱一帧（事件扇出/错误回包/仲裁输家转发/正常应答帧）：
+// 箱有位即入；满即丢——计 rans.outbox.dropped 后返回 errOutboxFull，绝不
+// 等待；控制面帧走预留容量段位（数据帧占满仍可入）；关箱拒绝；目标熔
+// 断拒绝（控制帧同拒——死目标不会处理它）。满箱/熔断丢弃时 body 所有
+// 权不移交。
 func (o *Outbox) TryPut(target rans.NodeID, hdr wire.Header, body []byte) error {
 	select {
 	case <-o.stopCh:
 		return errOutboxClosed
 	default:
 	}
-	for {
-		full, err := o.enqueue(target, hdr, body)
-		if err != nil {
-			return err
+	_, state, err := o.enqueueItem(outboxItem{target: target, hdr: hdr, body: body}, true)
+	if err != nil {
+		if state == breakerOpen {
+			o.dropped.Add(1)
 		}
-		if !full {
-			return nil
-		}
-		o.dropped.Add(1)
-		return errOutboxFull
+		return err
 	}
+	if state == enqueued {
+		return nil
+	}
+	o.dropped.Add(1)
+	return errOutboxFull
 }
 
-// enqueue 占位入队（TryPut 的临界区单点，构造最小 item）：语义见
-// enqueueItem。
-func (o *Outbox) enqueue(target rans.NodeID, hdr wire.Header, body []byte) (bool, error) {
-	return o.enqueueItem(outboxItem{target: target, hdr: hdr, body: body})
+// enqueueState 入箱临界区的结论。
+type enqueueState int
+
+const (
+	enqueued enqueueState = iota
+	globalFull
+	targetFull
+	breakerOpen
+	rejected
+)
+
+// enqueueItem 占位入队共核（全部生产者的临界区单点）。熔断目标快速失败
+// （冷却期满转半开放行一帧探测——errOutboxBreaker 包装 errSendFailed，
+// 调用方得到「确定未投递」分类）；容量两级（全箱 CAS 占位、每目标上限
+// 在队列锁内复查）；关箱竞态回退占位。
+func (o *Outbox) enqueueItem(it outboxItem, try bool) (*targetQueue, enqueueState, error) {
+	q, ok := o.queueFor(it.target)
+	if !ok {
+		return nil, rejected, errOutboxClosed
+	}
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return q, rejected, errOutboxClosed
+	}
+	if q.open && !q.probing {
+		if time.Since(q.openAt) >= outboxBreakerCooldown {
+			q.probing = true // 半开：本帧即探测帧
+		} else {
+			q.mu.Unlock()
+			return q, breakerOpen, fmt.Errorf("rans: outbox: node %d: %w: %w",
+				it.target, errSendFailed, errOutboxBreaker)
+		}
+	}
+	control := isControlFrame(it.hdr)
+	limit := int64(o.cap)
+	if control {
+		limit += outboxControlReserve
+	}
+	if !o.claimInBox(limit) {
+		q.mu.Unlock()
+		return q, globalFull, nil
+	}
+	if !control && len(q.queue) >= o.perTarget {
+		o.inBox.Add(-1)
+		q.mu.Unlock()
+		return q, targetFull, nil
+	}
+	q.queue = append(q.queue, it)
+	startWorker := !q.worker
+	if startWorker {
+		q.worker = true
+		// wg.Add 在 q.mu 内与 Close 的清扫/Wait 定序：本队列的 worker 计
+		// 数先于（或被回绝于）Close 对本队列的临界区——杜绝 Add 与 Wait
+		// 的并发误用窗口。
+		o.wg.Add(1)
+	}
+	q.mu.Unlock()
+	if startWorker {
+		go o.run(q)
+	} else {
+		q.cond.Signal()
+	}
+	return q, enqueued, nil
 }
 
-// enqueueItem 占位入队共核（全部生产者的临界区单点）：占位成功并入队完
-// 成返回 (false, nil)；满箱返回 (true, nil)（占位未发生，等待/丢弃语义
-// 归调用方分野）；关箱（停机闸窗口竞态）回退占位返回 errOutboxClosed。
-func (o *Outbox) enqueueItem(it outboxItem) (bool, error) {
+// claimInBox 全箱占位（limit 段位内的 CAS 自旋）。
+func (o *Outbox) claimInBox(limit int64) bool {
 	for {
 		cur := o.inBox.Load()
-		if cur >= o.cap {
-			return true, nil
+		if cur >= limit {
+			return false
 		}
-		if !o.inBox.CompareAndSwap(cur, cur+1) {
-			continue // 竞争失败重占位
+		if o.inBox.CompareAndSwap(cur, cur+1) {
+			return true
 		}
-		s := o.shards[o.shardOf(it.target)]
-		s.mu.Lock()
-		if s.stopped { // 关箱竞态：与 sweep 同临界区判定，回退占位
-			s.mu.Unlock()
-			o.inBox.Add(-1)
-			return false, errOutboxClosed
-		}
-		s.queue = append(s.queue, it)
-		empty := len(s.queue) == 1
-		s.mu.Unlock()
-		if empty {
-			s.cond.Signal() // 单 worker：空队→忙等待切换只需 Signal
-		}
-		return false, nil
 	}
 }
 
-// putOutcome 满箱等待段的调用方收场（与网关 ctxOutcome 同映射）：预算
-// 到期 → Timeout（消息确定未入箱），主动取消 → Canceled。
+// putOutcome 满箱等待段的调用方收场：预算到期 → Timeout（消息确定未入
+// 箱），主动取消 → Canceled。
 func (o *Outbox) putOutcome(target rans.NodeID, ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("rans: outbox: tell to node %d blocked at capacity until caller budget: %w",
@@ -289,109 +417,53 @@ func (o *Outbox) putOutcome(target rans.NodeID, ctx context.Context) error {
 	return fmt.Errorf("%w: %w", rans.ErrCanceled, ctx.Err())
 }
 
-// Depth 返回在箱条目数（全箱共享计数；停序③ flush 的等待面——归零即
-// 出站单向队列排空；在途发送不计数，其收场由端点韧性面与关箱取消承担）。
+// Depth 返回在箱条目数（全箱共享计数；停序③ flush 的等待面）。
 func (o *Outbox) Depth() int { return int(o.inBox.Load()) }
 
-// shardOf 目标节点 → 分片（FNV-1a 32 过 2 字节节点号，确定性散布）。
-func (o *Outbox) shardOf(n rans.NodeID) int {
-	h := uint32(2166136261)
-	h ^= uint32(n) & 0xff
-	h *= 16777619
-	h ^= (uint32(n) >> 8) & 0xff
-	h *= 16777619
-	return int(h % uint32(len(o.shards)))
-}
-
-// run 分片 worker 主循环：单 worker 串行消费队头（同目标 FIFO 的承载
-// 点）——出箱即释放全箱占位并广播空间，再同步走发送面（韧性在端点内
-// 部）。关箱即退（队列已由 Close 清扫，无余帧可弃）。
-func (o *Outbox) run(s *outboxShard) {
+// run 目标 worker 主循环：串行消费队头（同目标 FIFO 的承载点）——出箱
+// 即释放两级占位并广播空间，再同步走发送面；熔断中的遗留帧不空发（出
+// 箱即按熔断收场）。空队退出（worker 清零，下一帧入队时按需重启）。
+func (o *Outbox) run(q *targetQueue) {
 	defer o.wg.Done()
 	for {
-		s.mu.Lock()
-		for len(s.queue) == 0 && !s.stopped {
-			s.cond.Wait()
+		q.mu.Lock()
+		for len(q.queue) == 0 && !q.stopped {
+			q.cond.Wait()
 		}
-		if len(s.queue) == 0 {
-			s.mu.Unlock()
+		if len(q.queue) == 0 {
+			q.worker = false
+			q.mu.Unlock()
 			return
 		}
-		it := s.queue[0]
-		s.queue[0] = outboxItem{}
-		s.queue = s.queue[1:]
-		s.mu.Unlock()
+		it := q.queue[0]
+		q.queue[0] = outboxItem{}
+		q.queue = q.queue[1:]
+		blocked := q.open && !q.probing
+		q.mu.Unlock()
 
 		o.inBox.Add(-1)
 		o.signalSpace()
+		o.signalTargetSpace(q)
+		if blocked {
+			o.failFrame(it, errOutboxBreaker)
+			continue
+		}
+		// 写出时刻过期检查（票 05）：排队过预算的帧不送出——调用帧回投
+		//「确定未送出」、单向帧丢弃计 rans.call.expired（与 pawnite 出队
+		// 过期同一指标面）。
+		if !it.dl.IsZero() && !time.Now().Before(it.dl) {
+			if it.fail != nil {
+				it.fail(fmt.Errorf("%w: node %d expired in outbox queue",
+					errSendFailed, it.target))
+			} else {
+				o.expired.Add(1)
+			}
+			continue
+		}
 		if it.fail != nil {
-			o.sendCall(it)
+			o.sendCall(q, it)
 		} else {
-			o.sendOne(it)
+			o.sendOne(q, it)
 		}
 	}
-}
-
-// sendOne 单向帧发送：预算 ctx（关箱取消贯穿）调注入面；失败计数留痕后
-// 弃置（at-most-once——重试窗口在端点韧性面内）。
-func (o *Outbox) sendOne(it outboxItem) {
-	ctx, cancel := context.WithTimeout(o.runCtx, outboxSendBudget)
-	defer cancel()
-	if err := o.cfg.Send(ctx, it.target, it.hdr, it.body); err != nil {
-		o.sendFailed.Add(1)
-		log.Warn("rans/rpc: outbox send failed",
-			"node", it.target, "type", uint8(it.hdr.Type), "err", err)
-	}
-}
-
-// sendCall 调用帧发送腿：ctx 双亲封顶（帧内调用方 ctx 承载取消与请求
-// 预算，runCtx+防御预算封顶关窗等待上界），deadline 取派生后的 ctx（即
-// 两者的较早者）。排队过期的帧在此中止——确定未送出；失败计数留痕并
-// 回投等待方（回投错误即确定未投递形态，等待方据此分类重试）。
-func (o *Outbox) sendCall(it outboxItem) {
-	ctx, cancel := context.WithTimeout(it.ctx, outboxSendBudget)
-	defer cancel()
-	deadline, _ := ctx.Deadline()
-	if err := o.cfg.SendCall(ctx, it.target, it.hdr, it.body, deadline); err != nil {
-		o.sendFailed.Add(1)
-		log.Warn("rans/rpc: outbox call-frame send failed",
-			"node", it.target, "type", uint8(it.hdr.Type), "err", err)
-		it.fail(err)
-	}
-}
-
-// signalSpace 空间广播：关旧通道唤醒全部满箱等待者、建新通道承接下一
-// 轮等待（胜者 CAS 占位、余者重等——容量闸门在 CAS，广播只负责唤醒）。
-func (o *Outbox) signalSpace() {
-	o.spaceMu.Lock()
-	close(o.spaceCh)
-	o.spaceCh = make(chan struct{})
-	o.spaceMu.Unlock()
-}
-
-// Close 幂等收口：落关箱闸、逐分片清扫在箱帧（计数丢弃——与置位同
-// 临界区，杜绝 worker 退出后的孤儿帧）、取消在途发送、等 worker 全退。
-// 优雅停机先经停序③ flush 等箱空（Remote.Shutdown 装配）再调用。
-func (o *Outbox) Close() {
-	o.stopOnce.Do(func() {
-		close(o.stopCh)
-		dropped := 0
-		for _, s := range o.shards {
-			s.mu.Lock()
-			s.stopped = true
-			dropped += len(s.queue)
-			s.queue = nil
-			s.mu.Unlock()
-			s.cond.Broadcast()
-		}
-		if dropped > 0 {
-			o.inBox.Add(-int64(dropped)) // 深度随弃置回落（计数与队列同源）
-		}
-		o.runCancel()
-		o.wg.Wait()
-		if dropped > 0 {
-			o.dropped.Add(float64(dropped))
-			log.Warn("rans/rpc: outbox closed with pending items", "dropped", dropped)
-		}
-	})
 }

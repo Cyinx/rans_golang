@@ -104,6 +104,13 @@ func (c *callDelivery) DeferredDeadline() time.Time {
 	return dl
 }
 
+// SettleDeferred 实例终局收场（票 11，pawnite.DeferredSettler）：未 Reply
+// 的延迟应答以 Timeout+Deactivated 立即送达调用方——不折叠（终局是运行
+// 时状态，非 Handle 错误）；非阻塞应答通道与 DeliverDeferred 同纪律。
+func (c *callDelivery) SettleDeferred(e *rans.Error) {
+	c.replyResult(nil, e)
+}
+
 // DeferredCanceled 调用方收场让渡读数（rans.Responder 的可选丢弃判据，本地
 // 腿）：调用方 ctx 已取消/到期 = 收场权威已让渡——迟到延迟应答丢弃（与远端
 // 腿的 MsgCancel 标记收口同一 Responder 丢弃路径）。
@@ -129,11 +136,19 @@ func (c *callDelivery) DeliveryCausalPath() []uint64 {
 // 调用方合成 ctx 的 deadline（票 03 callBudget 产物），出队据此复查过期。
 func (c *callDelivery) DeliveryDeadline() (time.Time, bool) { return c.ctx.Deadline() }
 
-// Deliver 在 Pawnite loop goroutine 上执行（串行语义的落点）。Handle ctx
-// 携带执行实例的 incarnation 纪元（fencing 面——zombie 迟回的
-// Handle 续体直写消费方存储时可凭 ctx 令牌被拒；值取自实际执行投递的
-// pawnite，而非投递构造时刻的实例引用）与延迟应答登记点（本地请求投递
-// 恒携带）。
+// DeliveryCanceled 在箱取消标记读数（pawnite.CancelAware，本地请求投递）：
+// 调用方在出队前主动取消 → 出队即弃并计 rans.call.canceled——与远端 MsgCancel
+// 同构。deadline 到期不在此列（出队过期检查先行，Timeout+Expired 收场）。
+func (c *callDelivery) DeliveryCanceled() bool {
+	return errors.Is(c.ctx.Err(), context.Canceled)
+}
+
+// Deliver 在 Pawnite loop goroutine 上执行（串行语义的落点）。Handle ctx 经
+// 唯一信封构造（票 08）：请求形态调用方取消穿透、携带执行实例的 incarnation
+// 纪元（fencing 面——zombie 迟回的 Handle 续体直写消费方存储时可凭 ctx 令牌
+// 被拒；值取自实际执行投递的 pawnite）与延迟应答登记点（本地请求投递恒携
+// 带）；让出面挂链——调用方取消/请求 deadline 穿透到 work，而发送腿不提前
+// 释放预算 ctx（rpc callOnce 本地腿），work 存活到请求 deadline。
 //
 // Handle 错误边界折叠：本方法是本地投递的 Handle 错误唯一
 // 产生点，返回的错误一律经 FoldHandlerError 折叠为 CodeError+ReasonHandler
@@ -141,12 +156,9 @@ func (c *callDelivery) DeliveryDeadline() (time.Time, bool) { return c.ctx.Deadl
 // 的形态对分类唯一表必判 NoRetry，嵌套运行时形态不再诱发重复执行。
 // 延迟应答判读与 remoteDelivery 同一矩阵（契约正本见 rans.Defer）。
 func (c *callDelivery) Deliver(p *pawnite.Pawnite) {
-	hctx := ctxkey.WithSelf(ctxkey.WithIncarnation(c.ctx, p.Incarnation()), c.id.Kind, c.id.Key)
-	hctx = ctxkey.WithDeferPoint(hctx, c)
-	// 让出面注入（H12 决策 16 后半）：本地腿 wctx 直挂 Handle ctx 链——调用
-	// 方取消/请求 deadline 自然穿透到 work（见 pawnite.ReenterArm）。
-	arm := p.NewReenterArm(hctx, false)
-	hctx = ctxkey.WithReenterPoint(hctx, arm)
+	dl, _ := c.ctx.Deadline()
+	hctx, cancel, _ := p.HandleCtx(c.ctx, c.id, pawnite.EnvelopeCall, dl, c, false)
+	defer cancel()
 	val, err := c.handler(hctx, c.req)
 	if err != nil {
 		c.replyResult(nil, FoldHandlerError(err, c.ctx.Err()))

@@ -50,6 +50,46 @@ func newPendingTable(maxPending int) *pendingTable {
 	return pt
 }
 
+// retarget 改写 pending 条目的目标节点（票 12：重定向提示收端——后续
+// MsgCancel 与 FailPendingForNode 跟随到赢家）。from 守卫：条目当前目标
+// 不符（提示过期/已改道）即不动。返回是否改写。
+func (pt *pendingTable) retarget(id uint64, from, to rans.NodeID) bool {
+	s := pt.shardOf(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.pending[id]
+	if !ok || e.target != from {
+		return false
+	}
+	e.target = to
+	if set := s.byNode[from]; set != nil {
+		delete(set, id)
+		if len(set) == 0 {
+			delete(s.byNode, from)
+		}
+	}
+	set := s.byNode[to]
+	if set == nil {
+		set = make(map[uint64]struct{})
+		s.byNode[to] = set
+	}
+	set[id] = struct{}{}
+	return true
+}
+
+// currentTarget 读 pending 条目的当前目标（票 12：重定向提示改道后，取
+// 消通知跟随赢家——等待段取消时不再用发送时捕获的 target）。条目不在
+// （已收场）回落 fallback。
+func (pt *pendingTable) currentTarget(id uint64, fallback rans.NodeID) rans.NodeID {
+	s := pt.shardOf(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.pending[id]; ok {
+		return e.target
+	}
+	return fallback
+}
+
 func (pt *pendingTable) shardOf(id uint64) *pendingShard {
 	return &pt.shards[id%pendingShards]
 }

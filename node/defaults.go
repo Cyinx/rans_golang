@@ -29,7 +29,4 @@ const (
 	// DefaultOutboxCapacity 节点发件箱全箱共享容量缺省（Outbox.Capacity
 	// ≤0 时的回落值，条）。
 	DefaultOutboxCapacity = 65536
-	// DefaultOutboxShards 节点发件箱按目标节点哈希的分片数缺省
-	//（Outbox.Shards ≤0 时的回落值）。
-	DefaultOutboxShards = 16
 )

@@ -12,7 +12,7 @@ import (
 
 // RunRegisterSuite 对目录实现（directory.Directory 合并端口）跑全部契约
 // 断言（键值 v3 语义）：Register 单键四分支（无值/墓碑收养、同 node+epoch
-// 重注册、CAS 接管、输返回现归属）、epoch-0 未接代际条目的收养自愈、同节
+// 重注册、CAS 接管、输返回现归属）、遗留 epoch-0 条目的 CAS 接管自愈（票 15）、同节
 // 点换代 CAS 重占、注销写墓碑且纪元单调跨墓碑存续、条件注销三元全等无通
 // 配、Transfer 三态（匹配赢/不符 ErrNotOwner/缺失 nil）与目标 epoch 写入。
 // 并发用例钉死取号原子性（异节点竞争恰一赢、同节点收养纪元无重复）与输
@@ -120,31 +120,41 @@ func RunRegisterSuite(t *testing.T, newDir func(t *testing.T) directory.Director
 		}
 	})
 
-	t.Run("分支 2 epoch-0 收养：升写调用方纪元，返回值与落库一致且可注销", func(t *testing.T) {
+	t.Run("遗留 epoch-0 条目：非收养、CAS 接管自愈（票 15）", func(t *testing.T) {
 		d := newDir(t)
 		id := mkID("adoptzero")
-		// epoch-0 是受支持形态（节点未接代际窗口内的激活注册面）
-		if won, _, err := d.Register(ctx, id, self(1, 0), nil); err != nil || !won {
+		// epoch-0 条目是遗留形态（票 14 起不再产生）——同节点/异节点以
+		// 真实代际重注册不再经分支 2 收养：
+		if won, cur, err := d.Register(ctx, id, self(1, 0), nil); err != nil || !won {
 			t.Fatalf("epoch-0 register: won=%v err=%v", won, err)
+		} else {
+			_ = cur
 		}
-		// 同节点携非零纪元收养：条目升写调用方纪元（自愈），current 是含新
-		// 纪元的自归属——返回值必须与 Lookup 落库值全等（按返回值簿记与
-		// 条件注销的前提）
-		won, owner, err := d.Register(ctx, id, self(1, 5), nil)
+		legacy, found, err := d.Lookup(ctx, id)
+		if err != nil || !found {
+			t.Fatalf("legacy lookup: found=%v err=%v", found, err)
+		}
+		won, _, err := d.Register(ctx, id, self(1, 5), nil)
+		if err != nil || won {
+			t.Fatalf("non-epoch re-register must lose (no adoption): won=%v err=%v", won, err)
+		}
+		won, _, err = d.Register(ctx, id, self(2, 5), nil)
+		if err != nil || won {
+			t.Fatalf("cross-node re-register must lose (no adoption): won=%v err=%v", won, err)
+		}
+		// CAS 接管（分支 3，expected=遗留值）自愈：升写接管方真实代际，
+		// 返回值与落库一致、可按返回值注销。
+		won, owner, err := d.Register(ctx, id, self(2, 5), &legacy)
 		if err != nil || !won {
-			t.Fatalf("epoch-0 adoption: won=%v err=%v", won, err)
+			t.Fatalf("CAS takeover of legacy epoch-0: won=%v err=%v", won, err)
 		}
-		if owner.Node != 1 || owner.Epoch != 5 {
-			t.Fatalf("adopted owner = %v, want {1,5,inc} (caller epoch)", owner)
+		if owner.Node != 2 || owner.Epoch != 5 {
+			t.Fatalf("taken owner = %v, want {2,5,inc}", owner)
 		}
 		got, found, err := d.Lookup(ctx, id)
-		if err != nil || !found {
-			t.Fatalf("lookup: found=%v err=%v", found, err)
+		if err != nil || !found || got != owner {
+			t.Fatalf("lookup after takeover = (%v,%v), want %v", got, found, owner)
 		}
-		if got != owner {
-			t.Fatalf("returned owner %v must equal stored owner %v (return = stored)", owner, got)
-		}
-		// 按返回值注销必须命中（返回值≠落库值时此处恒 false，成幽灵条目）
 		if ok, err := d.UnregisterIfOwner(ctx, id, owner); err != nil || !ok {
 			t.Fatalf("unregister by returned owner: ok=%v err=%v", ok, err)
 		}
@@ -438,4 +448,6 @@ func RunRegisterSuite(t *testing.T, newDir func(t *testing.T) directory.Director
 			t.Fatalf("distinct incarnations = %d, want %d", len(seen), workers*per)
 		}
 	})
+
+	runFloorSuite(t, ctx, newDir)
 }

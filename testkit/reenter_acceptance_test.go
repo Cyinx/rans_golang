@@ -47,7 +47,7 @@ func (e *reenterEntity) Handle(ctx context.Context, req any) (any, error) {
 			case <-wctx.Done():
 				return nil, wctx.Err()
 			}
-		}, func(v any, err error) {
+		}, func(_ context.Context, v any, err error) {
 			if e.gate != nil {
 				// 串行判据进入锚：then 开跑即扣住（正确实现下扣住的是实体
 				// loop——他消息无法插队；突变①下 work goroutine 被扣、loop
@@ -67,7 +67,7 @@ func (e *reenterEntity) Handle(ctx context.Context, req any) (any, error) {
 		e.signalStarted()
 		rans.ReenterAfter(ctx, func(wctx context.Context) (any, error) {
 			return rans.ClientFrom(wctx).Call(wctx, e.target, "ping")
-		}, func(v any, err error) {
+		}, func(_ context.Context, v any, err error) {
 			r.Reply(v, err)
 		})
 		return rans.Deferred, nil
@@ -81,7 +81,7 @@ func (e *reenterEntity) Handle(ctx context.Context, req any) (any, error) {
 			default:
 			}
 			return nil, err
-		}, func(v any, err error) {
+		}, func(_ context.Context, v any, err error) {
 			r.Reply(v, err)
 		})
 		return rans.Deferred, nil
@@ -100,7 +100,7 @@ func (e *reenterEntity) Handle(ctx context.Context, req any) (any, error) {
 			case <-timer.C:
 				return "ok", nil
 			}
-		}, func(v any, err error) {
+		}, func(_ context.Context, v any, err error) {
 			if err != nil {
 				e.thenErrText = err.Error()
 			}
@@ -333,7 +333,7 @@ func (e *tellArmEntity) Handle(ctx context.Context, req any) (any, error) {
 				}
 			}
 			return nil, nil
-		}, func(any, error) { e.flag = true })
+		}, func(context.Context, any, error) { e.flag = true })
 		return nil, nil
 	case "get":
 		return e.flag, nil

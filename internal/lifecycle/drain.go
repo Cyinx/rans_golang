@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/log"
 	"github.com/cyinx/rans_golang/internal/metrics"
@@ -271,6 +272,28 @@ func DestroyInstance(ctx context.Context, tbl *activation.Table, id rans.ID, inc
 	return DestroyLocal(ctx, tbl, id)
 }
 
+// DestroyPawn 实例身份守卫销毁（stop 形态）：仅当在册实例仍是 p 时销毁，
+// 不落终快照（陈旧实例的状态本就不可落库——stale 即失主）。换代/已逐出
+// no-op 返回 nil。围栏后销毁的止损面共用（sweeper/迁移 stale、所有权
+// 丢失通知收端）。
+func DestroyPawn(ctx context.Context, tbl *activation.Table, id rans.ID, p *pawnite.Pawnite) error {
+	if cur, ok := tbl.PeekLocal(id); !ok || cur != p {
+		return nil
+	}
+	return p.Destroy(ctx)
+}
+
+// RetirePawn 实例身份守卫销毁（Retire 形态）：仅当在册实例仍是 p 时销毁
+// 并等终态，终快照照落——成员面换代围栏的止损面（键丢失但无人接管时本
+// 实例仍是合法 owner，终快照有效；已被接管时 Store 围栏拒写，尽力而为
+// 照常终局）。换代/已逐出 no-op 返回 nil。
+func RetirePawn(ctx context.Context, tbl *activation.Table, id rans.ID, p *pawnite.Pawnite) error {
+	if cur, ok := tbl.PeekLocal(id); !ok || cur != p {
+		return nil
+	}
+	return destroyRetire(ctx, tbl, id, p)
+}
+
 // Shutdown 本地注册表整体收尾：快照 local
 // 全部条目 → 并行逐实体 Retire 形态销毁（destroyRetire——终快照生效）
 // → errors.Join 汇总 → 空表校验。
@@ -419,8 +442,16 @@ func retireCore(ctx context.Context, tbl *activation.Table, id rans.ID, ent rans
 		if len(snap) == 0 {
 			return pawnite.HandoffOutcome{} // 空快照：无内容可落，直接终局
 		}
-		// 围栏：Put 携带本 incarnation 纪元。
+		// 围栏：Put 携带本 incarnation 纪元；stale 拒写=更新的化身已落库，
+		// 终快照注定不可落——立即停止重试（R11），照常终局。
 		if err := store.Put(ctx, id, p.Incarnation(), snap); err != nil {
+			if errors.Is(err, checkpoint.ErrStaleIncarnation) {
+				log.Info("rans/activation: retire final snapshot rejected as stale; terminal proceeds without retry",
+					"uuid", id.String())
+				tbl.MetricsRegistry().Counter(metrics.NameOwnershipStaleFenced,
+					"stale-incarnation writes that fenced or dropped the writing instance").Add(1)
+				return pawnite.HandoffOutcome{}
+			}
 			lastErr = fmt.Errorf("rans: retire: snapshot put failed: %w", err)
 			continue
 		}

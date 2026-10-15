@@ -184,6 +184,16 @@ func (e *dispEnv) feed(hdr wire.Header, body []byte) []byte {
 // mustSent 从替身 channel 确定性收一帧（channel 断言，不 sleep）。
 func mustSent(t *testing.T, f *fakeConnManager) fakeSent {
 	t.Helper()
+	for {
+		fr := mustSentAny(t, f)
+		if fr.hdr.Type == protocol.MsgRedirectHint {
+			continue // 票 12：Forward 漏斗随转发发重定向提示——非本断言面
+		}
+		return fr
+	}
+}
+func mustSentAny(t *testing.T, f *fakeConnManager) fakeSent {
+	t.Helper()
 	select {
 	case s := <-f.sent:
 		return s

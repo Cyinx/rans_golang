@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -13,13 +14,14 @@ import (
 	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/directory/redis"
+	"github.com/cyinx/rans_golang/internal/membership"
 	"github.com/cyinx/rans_golang/internal/testhooks"
 )
 
 // Config 节点装配的全部输入（普通结构体，便于从 env/YAML 映射）。构造时
 // 完成全部校验（New），运行中不可变；测试注入走 TestHooks。
 //
-// 字段语义与内部装配的对应：Directory/Security/Calls/Lease/Watchdog/
+// 字段语义与内部装配的对应：Directory/Security/Calls/Liveness/Watchdog/
 // Rebalance/Placement/Tuning 逐项见各子配置类型注释；逐字段映射表见
 // 约定 spec §4.2。
 type Config struct {
@@ -37,8 +39,8 @@ type Config struct {
 	ListenAddr string
 	// Kinds 业务 kind 工厂表（生成物 Kinds 可直接填入；必填）。
 	Kinds map[string]rans.Factory
-	// KindOptions per-kind 设置收拢面（约定 spec §5.4 第 3 条）：Watchdog
-	// 参数覆盖与闲置回收策略。未登记的 kind 用全局缺省、永不闲置。
+	// KindOptions per-kind 闲置回收策略（未登记的 kind 永不闲置）；
+	// per-kind 看门狗覆盖在 Watchdog.KindOverrides。
 	KindOptions map[string]KindOptions
 	// Directory 目录来源三分支：Redis 自建（node 持有并负责关闭）＞
 	// Injected 注入（调用方持有）＞ 都为零 → inmem（单节点形态）。
@@ -51,10 +53,10 @@ type Config struct {
 	Calls CallConfig
 	// Outbox 出站发件箱参数（H11 决策 11，恒装配无开关）。
 	Outbox OutboxConfig
-	// Lease 存活节拍参数（redis 等成员面目录形态生效——目录实现
+	// Liveness 存活节拍参数（redis 等成员面目录形态生效——目录实现
 	// NodeRegistry 才装配 Liveness；inmem 无成员面自动跳过）。
-	Lease LeaseConfig
-	// Watchdog 看门狗全局阈值与扫描周期；per-kind 覆盖在 KindOptions。
+	Liveness LivenessConfig
+	// Watchdog 看门狗全局阈值与扫描周期；per-kind 覆盖在 KindOverrides。
 	Watchdog WatchdogConfig
 	// Rebalance 自动再平衡参数（Threshold 0 = 关闭）；依赖 KindOptions 的
 	// Migrate 闲置策略提供候选。
@@ -66,6 +68,11 @@ type Config struct {
 	// ShutdownBudget Run 的停机预算（Shutdown 的 ctx 窗口上限）；≤0 取
 	// DefaultShutdownBudget。直接调 Shutdown 时预算由调用方 ctx 承载。
 	ShutdownBudget time.Duration
+	// FencingFloor 宿主纪元下限钩子（A2 运行时围栏）：返回该 id 已被
+	// 宿主自持存储接受的最大纪元（0 = 无）；每次激活前调用一次，阻塞受
+	// 激活预算约束；报错 → 激活失败（可重试）。nil = 无钩子。目录键丢失
+	// 后激活取号仍高于持久层高水位，复活实例的写不被 Store 围栏静默拒绝。
+	FencingFloor func(ctx context.Context, id rans.ID) (uint64, error)
 	// TestHooks 测试注入点（testkit 与进程内多节点测试专用；类型在
 	// internal/testhooks——模块外无法构造。字段语义见其文档；node.New
 	// 构造期一次性接线，运行中不可变）。
@@ -115,6 +122,12 @@ type CallConfig struct {
 	// Max 单次调用预算上限：合成的任何来源超过它即封顶；≤0 →
 	// DefaultMaxCallTimeout。
 	Max time.Duration
+	// StrictLocalCodec 本地严格编解码模式（票 10，缺省 false）：开启后本地
+	// Call/Tell 对请求与应答（含延迟应答）各做一次 codec 编解码往返——
+	// 未注册类型本地即失败（与远端同构错误）、引用别名被切断，部署拓扑
+	// 变化（本地→远端）不再暴露行为差异。推荐测试/预发开启。成本：每跳
+	// 两次编解码 + 一次内存拷贝。
+	StrictLocalCodec bool
 }
 
 // OutboxConfig 出站发件箱参数（H11 决策 11）：单向发送入箱即返回、
@@ -124,14 +137,12 @@ type OutboxConfig struct {
 	// DefaultOutboxCapacity。满箱语义按生产者分野（决策 12）：显式 Tell
 	// 阻塞至调用方 ctx 到期；事件扇出/回包/转发等非阻塞生产者满即丢计数。
 	Capacity int
-	// Shards 按目标节点哈希的分片数（每分片单 worker 串行——同目标
-	// FIFO 的承载面，同分片异目标互相排队）；≤0 → DefaultOutboxShards。
-	Shards int
 }
 
-// LeaseConfig 存活节拍参数（成员面形态生效——目录实现 NodeRegistry 才
-// 装配 Liveness；逐字段语义见各字段注释）。
-type LeaseConfig struct {
+// LivenessConfig 存活节拍参数（成员面形态生效——目录实现 NodeRegistry
+// 才装配 Liveness；逐字段语义见各字段注释）。票 23 更名自 LeaseConfig
+// （逐实体租约 v0.23 已删——「租约」是化石名）。
+type LivenessConfig struct {
 	// Interval 成员键刷新周期（存活节拍——Liveness 每周期无条件续写本
 	// 节点成员键，零实体照写）；≤0 → 30s（membership 缺省）。
 	Interval time.Duration
@@ -177,12 +188,15 @@ type TuningConfig struct {
 	CheckpointInterval time.Duration
 	// PackageTTL 随迁包缓存存活窗；≤0 → 5min。
 	PackageTTL time.Duration
+	// MembershipRefresh 本地成员视图周期刷新间隔（票 01）；≤0 → 1s；
+	// 下限 100ms（小于该值构造期报错——低于此等于没有视图，退回每跳读
+	// 注册表还多一层间接）。
+	MembershipRefresh time.Duration
 }
 
-// KindOptions per-kind 设置（约定 spec §5.4 第 3 条）。
+// KindOptions per-kind 设置（约定 spec §5.4 第 3 条）。per-kind 看门狗阈值
+// 覆盖在 Watchdog.KindOverrides（本结构只承载闲置回收）。
 type KindOptions struct {
-	// Watchdog per-kind 看门狗阈值覆盖；nil = 用全局。
-	Watchdog *WatchdogParams
 	// Idle 闲置回收策略；nil = 永不闲置。配置后自动执行（Passivate 周期
 	// 钝化 / Migrate 随 Rebalance 卸载），无手动入口。
 	Idle *IdlePolicy
@@ -221,8 +235,20 @@ func (c *Config) validate() error {
 	if c.Outbox.Capacity <= 0 {
 		c.Outbox.Capacity = DefaultOutboxCapacity
 	}
-	if c.Outbox.Shards <= 0 {
-		c.Outbox.Shards = DefaultOutboxShards
+	if c.Directory.Redis != nil && c.Directory.Redis.TombstoneTTL > 0 {
+		// 墓碑 TTL 的纪元下限前提（票 17）：墓碑过期后重激活的纪元必须
+		// 由下限来源兜住（Store 高水位或宿主钩子），否则回退到 A2 修复
+		// 前的纪元回退面。
+		hasHW := false
+		if c.Store != nil {
+			_, hasHW = c.Store.(checkpoint.HighWaterReader)
+		}
+		if !hasHW && c.FencingFloor == nil {
+			return fmt.Errorf("rans: new: Directory.Redis.TombstoneTTL requires an epoch-floor source (Store implementing checkpoint.HighWaterReader, or FencingFloor) — without one, tombstone expiry regresses incarnation monotonicity")
+		}
+	}
+	if c.Tuning.MembershipRefresh > 0 && c.Tuning.MembershipRefresh < membership.MinRefreshInterval {
+		return fmt.Errorf("rans: new: Tuning.MembershipRefresh (%s) below the %s floor (a shorter interval is no view at all — every hop would still read the registry)", c.Tuning.MembershipRefresh, membership.MinRefreshInterval)
 	}
 	if len(c.Kinds) == 0 {
 		return errors.New("rans: new: Kinds are required (Config.Kinds)")
@@ -237,6 +263,16 @@ func (c *Config) validate() error {
 	}
 	if c.Directory.Redis != nil && c.Directory.Injected != nil {
 		return errors.New("rans: new: Directory.Redis and Directory.Injected are mutually exclusive")
+	}
+	for kind := range c.KindOptions {
+		if _, ok := c.Kinds[kind]; !ok {
+			return fmt.Errorf("rans: new: KindOptions[%q] is not a registered kind (Config.Kinds)", kind)
+		}
+	}
+	for kind := range c.Watchdog.KindOverrides {
+		if _, ok := c.Kinds[kind]; !ok {
+			return fmt.Errorf("rans: new: Watchdog.KindOverrides[%q] is not a registered kind (Config.Kinds)", kind)
+		}
 	}
 	if c.Standalone {
 		if c.ListenAddr != "" {

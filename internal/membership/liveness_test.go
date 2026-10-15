@@ -28,9 +28,9 @@ func TestLivenessConfigValidation(t *testing.T) {
 	}
 }
 
-// TestLivenessWritesNodeKeyOnStartAndEveryBeat 启动即写 + 每周期无条件写：
-// PublishSelf 后 Run，不等首个 tick 就有一次 RegisterNode(self, addr)；
-// 多周期后调用数持续增长（零实体照写——续租面缺席不影响成员键节奏）。
+// TestLivenessWritesNodeKeyOnStartAndEveryBeat 启动即写 + 每周期比对续期：
+// PublishSelf 后 Start，不等首个 tick 就有一次 RegisterNode(self, addr)；
+// 多周期后续期调用持续增长（零实体照写；比对续期自第二轮起）。
 func TestLivenessWritesNodeKeyOnStartAndEveryBeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,10 +60,10 @@ func TestLivenessWritesNodeKeyOnStartAndEveryBeat(t *testing.T) {
 		}
 	}
 
-	// 多周期持续重注册（每周期一次 + 启动一次）
+	// 多周期持续续期（首写 RegisterNode + 每周期 RenewNode）
 	time.Sleep(120 * time.Millisecond)
-	if n := len(reg.registrations()); n < 3 {
-		t.Fatalf("RegisterNode called %d times in ~6 ticks; want unconditional per-beat writes (>=3)", n)
+	if n := len(reg.renewals()); n < 3 {
+		t.Fatalf("RenewNode called %d times in ~6 ticks; want per-beat renewals (>=3)", n)
 	}
 }
 
@@ -202,11 +202,10 @@ func TestLivenessBeginDrainingPublishesAndKicksImmediateRefresh(t *testing.T) {
 	}
 
 	lv.BeginDraining()
-	// kick 即时刷新：BeginDraining 返回后的下一次 RegisterNode 携带 Draining=true
+	// kick 即时刷新：BeginDraining 返回后的下一次续期/注册携带 Draining=true
 	deadline := time.After(2 * time.Second)
 	for {
-		calls := reg.registrations()
-		if n := len(calls); n >= 2 && calls[n-1].info.Draining {
+		if renews := reg.renewals(); len(renews) > 0 && renews[len(renews)-1].info.Draining {
 			break
 		}
 		select {
@@ -218,9 +217,9 @@ func TestLivenessBeginDrainingPublishesAndKicksImmediateRefresh(t *testing.T) {
 	}
 
 	// draining 期间存活刷新照常（不被 BeginDraining 停掉）
-	batches := reg.callCount()
+	batches := len(reg.renewals())
 	time.Sleep(60 * time.Millisecond)
-	if reg.callCount() <= batches {
+	if len(reg.renewals()) <= batches {
 		t.Fatal("membership refresh must continue while draining")
 	}
 }
@@ -232,18 +231,18 @@ func TestLivenessBeginDrainingPublishesAndKicksImmediateRefresh(t *testing.T) {
 // 恢复写入，阻塞窗内的成功写序列即新鲜度证据。
 func TestLiveness_NodeKeyNotFrozenByBlockingDestroy(t *testing.T) {
 	reg := newFakeNodeRegistry(nil)
-	X := mustID(t, "k", "1")
 	const blockedTurn = 2 * time.Second
 	destroyEntered := make(chan struct{}, 16)
 	lv, err := NewLiveness(LivenessConfig{
 		Reg: reg, Self: 1, Interval: 100 * time.Millisecond,
 		SelfFence: 150 * time.Millisecond, // 2 轮失败即触发（显式短阈值）
-		Fence:     func(rans.ID) {},
-		LocalIDs:  func() []rans.ID { return []rans.ID{X} },
-		OnSelfFenceLost: func(context.Context, rans.ID) error {
-			destroyEntered <- struct{}{}
-			time.Sleep(blockedTurn)
-			return nil
+		Fence: func(uint64) int {
+			// 钩子实现纪律：围栏即返回，止损销毁异步（阻塞面在销毁侧）。
+			go func() {
+				destroyEntered <- struct{}{}
+				time.Sleep(blockedTurn)
+			}()
+			return 1
 		},
 	})
 	if err != nil {

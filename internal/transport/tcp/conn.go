@@ -103,6 +103,11 @@ type Conn struct {
 // 接口静态断言：*Conn 即传输端口。
 var _ transport.Conn = (*Conn)(nil)
 
+// Drained 返回退役排空信号（writeLoop 退出即关闭——已入队帧已全部写出
+// 或处置完毕；票 06 连接收敛的发送侧保序等待面）。未退役的连接随其终态
+// 关闭。
+func (c *Conn) Drained() <-chan struct{} { return c.retireDrained }
+
 // NewConn 构造连接。Start 前不启动任何 goroutine；dialer=true 时
 // Start 先发 Handshake 并等待 HandshakeAck，false 时等待对端 Handshake
 // 后回 HandshakeAck。pool 为 nil 时内部自建（防御：nil 池会让读路径

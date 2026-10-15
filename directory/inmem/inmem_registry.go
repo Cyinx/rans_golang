@@ -54,19 +54,28 @@ func NewNodeRegistry(hbTTL time.Duration) directory.NodeRegistry {
 	}
 }
 
-// NextNodeEpoch 取节点代际（directory.NodeRegistry 契约）：进程内计数器
-// 单调递增，首个为 1。取号语义与 redis 形态一致——同节点号跨记录死亡
-// （过期/注销）再注册必得严格更大的代际；优雅停机不触碰计数器。
+// MemberTTL 节点记录过期阈值（RegisterNode/RenewNode 续期）。
 func (r *registry) MemberTTL() time.Duration { return r.hbTTL }
 
 // UnregisterNode 成员注销：删除节点记录（即时退出视图）。
-func (r *registry) UnregisterNode(_ context.Context, node rans.NodeID) error {
+// UnregisterNode 成员注销（directory.NodeRegistry 契约）：epoch≠0 时仅当
+// 记录代际 == epoch 才删（守卫；不匹配 no-op）；0 = 无条件。即时退出视图。
+func (r *registry) UnregisterNode(_ context.Context, node rans.NodeID, epoch uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if epoch != 0 {
+		rec, ok := r.liveLocked(node)
+		if !ok || rec.info.Epoch != epoch {
+			return nil
+		}
+	}
 	delete(r.nodes, node)
 	return nil
 }
 
+// NextNodeEpoch 取节点代际（directory.NodeRegistry 契约）：进程内计数器
+// 单调递增，首个为 1。取号语义与 redis 形态一致——同节点号跨记录死亡
+// （过期/注销）再注册必得严格更大的代际；优雅停机不触碰计数器。
 func (r *registry) NextNodeEpoch(_ context.Context) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -81,6 +90,23 @@ func (r *registry) RegisterNode(_ context.Context, node rans.NodeID, info direct
 	defer r.mu.Unlock()
 	r.nodes[node] = nodeRecord{info: info, expiresAt: time.Now().Add(r.hbTTL)}
 	return nil
+}
+
+// RenewNode 比对续期（directory.NodeRegistry 契约）：记录缺席（含惰性
+// 过期）→ RenewAbsent 且不重建；记录代际更大 → RenewSuperseded 值不动；
+// 否则覆写并续期 → RenewRenewed。
+func (r *registry) RenewNode(_ context.Context, node rans.NodeID, info directory.NodeInfo) (directory.RenewResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.liveLocked(node)
+	if !ok {
+		return directory.RenewAbsent, nil
+	}
+	if rec.info.Epoch > info.Epoch {
+		return directory.RenewSuperseded, nil
+	}
+	r.nodes[node] = nodeRecord{info: info, expiresAt: time.Now().Add(r.hbTTL)}
+	return directory.RenewRenewed, nil
 }
 
 // NodeEpoch 读 node 的当前代际（directory.NodeRegistry 契约；不过滤
@@ -107,6 +133,21 @@ func (r *registry) NodeAddr(_ context.Context, node rans.NodeID) (string, bool, 
 		return "", false, nil
 	}
 	return rec.info.Addr, true, nil
+}
+
+// Nodes 存活节点全量信息（directory.NodeRegistry 契约；含 draining）：
+// 惰性过期收敛后的完整视图。
+func (r *registry) Nodes(_ context.Context) (map[rans.NodeID]directory.NodeInfo, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[rans.NodeID]directory.NodeInfo, len(r.nodes))
+	for n, rec := range r.nodes {
+		if r.expiredLocked(n, rec) {
+			continue
+		}
+		out[n] = rec.info
+	}
+	return out, nil
 }
 
 // NodeIDs 返回成员视图当前节点集（升序去重，directory.NodeRegistry 契约）：

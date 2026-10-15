@@ -161,12 +161,22 @@ func TestAcceptance_ExternalStealReRoutes(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("steal unregister: ok=%v err=%v", ok, err)
 	}
-	if won, _, err := dir.Register(ctx, id, directory.Owner{Node: 3}, nil); err != nil || !won {
+	// 票 15：外部窃取以真实代际抢注（epoch-0 条目是遗留形态——路由真值
+	// 面判死，会立即 miss 收口而非路由到 node3）。
+	reg3, ok := dir.(directory.NodeRegistry)
+	if !ok {
+		t.Fatal("redis directory must implement NodeRegistry")
+	}
+	ep3, alive3, err := reg3.NodeEpoch(ctx, 3)
+	if err != nil || !alive3 || ep3 == 0 {
+		t.Fatalf("node3 epoch: ep=%v alive=%v err=%v", ep3, alive3, err)
+	}
+	if won, _, err := dir.Register(ctx, id, directory.Owner{Node: 3, Epoch: ep3}, nil); err != nil || !won {
 		t.Fatalf("steal register to node3: won=%v err=%v", won, err)
 	}
 
 	// 重路由：node2 Call → 目录/有效性判定命中新 owner → node3 首次真实
-	// 激活（epoch-0 注入形态收养）计数从 1 开始。
+	// 激活计数从 1 开始。
 	v, err = n2.Call(ctx, id, 0)
 	if err != nil || v != 1 {
 		t.Fatalf("re-routed call to new owner: v=%v err=%v", v, err)

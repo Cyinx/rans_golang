@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"github.com/cyinx/rans_golang"
@@ -75,17 +76,22 @@ func (m *Table) restoreState(ctx context.Context, id rans.ID, ent rans.Entity) (
 					"uuid", id.String(), "bytes", len(b))
 				return restoreNone, nil, nil // 弃包落到 Store 梯级
 			}
-			if err := carrier.Restore(b); err != nil {
+			// 先判旧再应用（票 19）：包旧/已删时不触碰实体——「先应用再
+			// 判旧」会让实体带着旧包状态走 Store 二次 Restore（合并态污
+			// 染）或在 Store 未命中时整包保留已删除状态（首轮周期
+			// checkpoint 以新纪元写回=复活）。
+			if m.packageStale(ctx, id, srcInc, b) {
+				// 包旧于 Store / 同纪元内容已删（判输迁移的过期包、宿主
+				// Delete 留高水位）：弃包落 Store 梯级——接管恢复必须读
+				// 最新已确认状态，过期包不得以新纪元写回。
+				log.Warn("rans/activation: stale migration package dropped in favor of checkpoint store",
+					"uuid", id.String(), "src_incarnation", srcInc)
+			} else if err := carrier.Restore(b); err != nil {
 				// 随迁包是加速面而非正确性依赖：弃包落到 Store 梯级。
 				log.Warn("rans/activation: activation state restore failed; falling back to checkpoint store",
 					"uuid", id.String(), "err", err)
-			} else if !m.packageStale(ctx, id, srcInc, b) {
-				return restorePackage, b, nil // 包命中且判新：不读 Store 内容（包可能比 Store 新）
 			} else {
-				// 包旧于 Store（判输迁移的过期包）：弃包落 Store 梯级——
-				// 接管恢复必须读最新已确认状态，过期包不得以新纪元写回。
-				log.Warn("rans/activation: stale migration package dropped in favor of checkpoint store",
-					"uuid", id.String(), "src_incarnation", srcInc)
+				return restorePackage, b, nil // 包命中且判新：不读 Store 内容（包可能比 Store 新）
 			}
 		}
 	}
@@ -110,6 +116,34 @@ func (m *Table) restoreState(ctx context.Context, id rans.ID, ent rans.Entity) (
 // 视图，可选能力经类型断言发现）：未实现者恢复侧退回「包优先」历史行为。
 type highWaterStore interface {
 	HighWater(ctx context.Context, id rans.ID) (uint64, bool, error)
+}
+
+// fencingFloor 激活取号的纪元下限合成：max(Store 高水位, 宿主钩子)。
+// 高水位仅当实体可快照且 Store 实现高水位面时可读（能力缺席跳过）；钩子
+// nil 跳过。任一读取出错返回错误——激活失败（可重试，根因保留）。
+func (m *Table) fencingFloor(ctx context.Context, id rans.ID, ent rans.Entity) (uint64, error) {
+	var floor uint64
+	if _, ok := ent.(rans.Snapshotter); ok && m.store != nil {
+		if hwr, can := m.store.(highWaterStore); can {
+			hw, _, err := hwr.HighWater(ctx, id)
+			if err != nil {
+				return 0, fmt.Errorf("rans: activate: store high-water read failed: %w", err)
+			}
+			if hw > floor {
+				floor = hw
+			}
+		}
+	}
+	if m.fencingFloorHook != nil {
+		hf, err := m.fencingFloorHook(ctx, id)
+		if err != nil {
+			return 0, fmt.Errorf("rans: activate: host fencing floor failed: %w", err)
+		}
+		if hf > floor {
+			floor = hf
+		}
+	}
+	return floor, nil
 }
 
 // packageStale 随迁包陈旧判定（restoreState 包命中时调用，与 Store per-id
@@ -139,8 +173,13 @@ func (m *Table) packageStale(ctx context.Context, id rans.ID, srcInc uint64, pkg
 		return true
 	}
 	cur, hit, err := m.store.Get(ctx, id)
-	if err != nil || !hit {
+	if err != nil {
 		return false
+	}
+	if !hit {
+		// 同纪元且内容不在（票 19）：高水位存在即宿主 Delete 撤内容留水
+		// 位的形态——已删除实体不得经随迁包复活，判旧弃包（裸激活）。
+		return true
 	}
 	return !bytes.Equal(cur, pkg)
 }
@@ -153,12 +192,30 @@ var activationFailedCounter = sync.OnceValue(func() *metrics.Counter {
 		"entity activations that ended in failure (entity never reached Active)")
 })
 
-// activationFailReasonRestore / activationFailReasonRegister 是激活失败
-// 计数器 reason 属性的取值（恢复失败 / 注册失败）。reason 暂用字符串维度。
+// metricsReg 观测注册表（构造期注入；未注入回落进程级 Default——直接
+// 构造表的测试与 rpc 形态同 Default）。
+func (m *Table) metricsReg() *metrics.Registry {
+	if m.metrics != nil {
+		return m.metrics
+	}
+	return metrics.Default()
+}
+
+// activationFailReason* 是激活失败计数器 reason 属性的取值（恢复失败 /
+// 注册失败 / 工厂 panic）。reason 暂用字符串维度。
 const (
 	activationFailReasonRestore  = "restore"
 	activationFailReasonRegister = "register"
+	activationFailReasonFactory  = "factory"
 )
+
+// observeFactoryPanic 记录工厂 panic 导致的激活失败：Error 日志（panic 值 +
+// 栈）+ rans.activation.failed{reason=factory} 计数器。
+func (m *Table) observeFactoryPanic(id rans.ID, r any) {
+	log.Error("rans/activation: entity factory panicked; activation rejected",
+		"uuid", id.String(), "panic", r, "stack", string(debug.Stack()))
+	activationFailedCounter().Add(1, attribute.String("reason", activationFailReasonFactory))
+}
 
 // observeRestoreFailure 记录恢复失败导致的激活失败：Error 日志 +
 // rans.activation.failed{reason=restore} 计数器。

@@ -11,8 +11,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/cyinx/rans_golang"
 )
 
 // TestSelfFence_EpochFailureNotEarly 触发基准是首败真实时刻 + SelfFence，
@@ -22,13 +20,11 @@ func TestSelfFence_EpochFailureNotEarly(t *testing.T) {
 	reg := newFakeNodeRegistry(nil)
 	reg.failEpoch(errors.New("directory partition"))
 
-	ent := mustID(t, "k", "ef-ent")
 	var fenced atomic.Int32
 	lv, err := NewLiveness(LivenessConfig{
 		Reg: reg, Self: 1, Interval: 10 * time.Millisecond,
 		SelfFence: 500 * time.Millisecond,
-		Fence:     func(rans.ID) { fenced.Add(1) },
-		LocalIDs:  func() []rans.ID { return []rans.ID{ent} },
+		Fence:     func(uint64) int { fenced.Add(1); return 0 },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -74,13 +70,11 @@ func TestSelfFence_EpochFailureNotEarly(t *testing.T) {
 func TestSelfFence_ZeroTimeFailureStillAccounted(t *testing.T) {
 	reg := newFakeNodeRegistry(nil)
 
-	ent := mustID(t, "k", "zf-ent")
 	var fenced atomic.Int32
 	lv, err := NewLiveness(LivenessConfig{
 		Reg: reg, Self: 1, Interval: time.Hour,
 		SelfFence: 60 * time.Millisecond,
-		Fence:     func(rans.ID) { fenced.Add(1) },
-		LocalIDs:  func() []rans.ID { return []rans.ID{ent} },
+		Fence:     func(uint64) int { fenced.Add(1); return 0 },
 	})
 	if err != nil {
 		t.Fatal(err)

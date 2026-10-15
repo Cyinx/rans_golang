@@ -147,6 +147,16 @@ func TestDispatcher_LoserForwardOffReadLoop(t *testing.T) {
 // gatedSentOf 从挂闸替身确定性收一帧（channel 断言，不 sleep）。
 func gatedSentOf(t *testing.T, s *gatedSender) gatedSent {
 	t.Helper()
+	for {
+		fr := gatedSentOfAny(t, s)
+		if fr.hdr.Type == protocol.MsgRedirectHint {
+			continue // 票 12：Forward 漏斗随转发发重定向提示——非本断言面
+		}
+		return fr
+	}
+}
+func gatedSentOfAny(t *testing.T, s *gatedSender) gatedSent {
+	t.Helper()
 	select {
 	case fr := <-s.sent:
 		return fr

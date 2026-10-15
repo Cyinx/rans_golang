@@ -33,16 +33,27 @@ type fakeNodeRegistry struct {
 		node rans.NodeID
 		info directory.NodeInfo
 	}
-	errReg     error
-	errEpoch   error
-	nextEpoch  uint64
+	errReg        error
+	errEpoch      error
+	nextEpoch     uint64
+	nodes         map[rans.NodeID]uint64 // 成员键代际（fake 判活面）
+	dropped       map[rans.NodeID]bool   // 判活键删除注入
+	sawSuperseded bool                   // RenewNode 出现过 Superseded
+	renewCalls    []struct {
+		node rans.NodeID
+		info directory.NodeInfo
+	} // RenewNode 调用序列
 	epochFails uint64
 	okTimes    []time.Time
 	waitSeen   int
 }
 
 func newFakeNodeRegistry(entries map[rans.ID]directory.Owner) *fakeNodeRegistry {
-	return &fakeNodeRegistry{fakeDirectory: newFakeDirectory(entries)}
+	return &fakeNodeRegistry{
+		fakeDirectory: newFakeDirectory(entries),
+		nodes:         make(map[rans.NodeID]uint64),
+		dropped:       make(map[rans.NodeID]bool),
+	}
 }
 
 // fakeDirectory 最小目录面（v3 语义从简：entries 即真相，无墓簿区分——
@@ -104,7 +115,92 @@ func (f *fakeDirectory) Transfer(_ context.Context, id rans.ID, expected, target
 
 func (f *fakeNodeRegistry) MemberTTL() time.Duration { return 0 }
 
-func (f *fakeNodeRegistry) UnregisterNode(_ context.Context, _ rans.NodeID) error { return nil }
+func (f *fakeNodeRegistry) UnregisterNode(_ context.Context, _ rans.NodeID, _ uint64) error {
+	return nil
+}
+
+// RenewNode 比对续期（directory.NodeRegistry 契约的最小 fake）：记录在
+// 且代际不大于调用方 → Renewed 并记录；记录在且更大 → Superseded；
+// 记录缺席（含 dropKey 注入）→ Absent。
+func (f *fakeNodeRegistry) RenewNode(_ context.Context, node rans.NodeID, info directory.NodeInfo) (directory.RenewResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewCalls = append(f.renewCalls, struct {
+		node rans.NodeID
+		info directory.NodeInfo
+	}{node, info})
+	if err := f.errReg; err != nil {
+		return 0, err
+	}
+	if f.dropped[node] {
+		return directory.RenewAbsent, nil
+	}
+	if cur, ok := f.nodes[node]; ok && cur > info.Epoch {
+		f.sawSuperseded = true
+		return directory.RenewSuperseded, nil
+	}
+	f.nodes[node] = info.Epoch
+	f.okTimes = append(f.okTimes, time.Now())
+	return directory.RenewRenewed, nil
+}
+
+// waitRenew 等待下一次续期调用（有界）。
+func (f *fakeNodeRegistry) waitRenew(t *testing.T) {
+	t.Helper()
+	base := len(f.renewals())
+	deadline := time.After(2 * time.Second)
+	for len(f.renewals()) <= base {
+		select {
+		case <-deadline:
+			t.Fatal("liveness loop never renewed within 2s")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// Nodes fake 成员视图（判活面即 nodes 记录）。
+func (f *fakeNodeRegistry) Nodes(_ context.Context) (map[rans.NodeID]directory.NodeInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[rans.NodeID]directory.NodeInfo, len(f.nodes))
+	for n, ep := range f.nodes {
+		if f.dropped[n] {
+			continue
+		}
+		out[n] = directory.NodeInfo{Addr: "10.0.0.1:1", Epoch: ep}
+	}
+	return out, nil
+}
+
+// renewals 续期调用序列快照。
+func (f *fakeNodeRegistry) renewals() []struct {
+	node rans.NodeID
+	info directory.NodeInfo
+} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]struct {
+		node rans.NodeID
+		info directory.NodeInfo
+	}(nil), f.renewCalls...)
+}
+
+// dropKey 注入「成员键被删」（票 11 复活形态的确定性注入面）。
+func (f *fakeNodeRegistry) dropKey(node rans.NodeID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropped[node] = true
+	delete(f.nodes, node)
+}
+
+// supersedeKey 注入「成员键被更大代际占据」（票 11 让位形态）。
+func (f *fakeNodeRegistry) supersedeKey(node rans.NodeID, epoch uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropped[node] = false
+	f.nodes[node] = epoch
+}
 
 func (f *fakeNodeRegistry) NextNodeEpoch(_ context.Context) (uint64, error) {
 	f.mu.Lock()
@@ -139,6 +235,8 @@ func (f *fakeNodeRegistry) RegisterNode(_ context.Context, node rans.NodeID, inf
 	err := f.errReg
 	if err == nil {
 		f.okTimes = append(f.okTimes, time.Now())
+		f.nodes[node] = info.Epoch
+		f.dropped[node] = false
 	}
 	f.mu.Unlock()
 	return err

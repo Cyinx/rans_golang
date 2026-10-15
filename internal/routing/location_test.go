@@ -232,15 +232,17 @@ func TestLocationCacheConcurrentAccess(t *testing.T) {
 
 // sameShardIDs 生成 n 个落位同一分片的身份（分片预算语义下 FIFO 断言的
 // 确定性编排——按 id.Hash()%locationShards 分桶挑选）。
-func sameShardIDs(t *testing.T, prefix string, n int) []rans.ID {
+func sameShardIDs(t *testing.T, c *LocationCache, prefix string, n int) []rans.ID {
 	t.Helper()
-	buckets := make(map[uint64][]rans.ID)
+	// 票 07：分片哈希改为 Kind/Key 直扫 FNV（不再同源于 id.Hash）——按
+	// 实际分片指针分桶。
+	buckets := make(map[*shard][]rans.ID)
 	for i := 0; ; i++ {
 		id, err := rans.NewID("k", prefix+"-"+strconv.Itoa(i))
 		if err != nil {
 			t.Fatal(err)
 		}
-		b := id.Hash() % locationShards
+		b := c.shardOf(id)
 		buckets[b] = append(buckets[b], id)
 		if len(buckets[b]) == n {
 			return buckets[b]
@@ -252,7 +254,7 @@ func sameShardIDs(t *testing.T, prefix string, n int) []rans.ID {
 // 逐出插入序最旧者（FIFO），最新条目留存。
 func TestLocationCacheMaxEntriesFIFOEviction(t *testing.T) {
 	c := shortCache() // 正 400ms——测试窗口内不过期
-	ids := sameShardIDs(t, "cap", 4)
+	ids := sameShardIDs(t, c, "cap", 4)
 	c.shardOf(ids[0]).mu.Lock()
 	c.shardOf(ids[0]).max = 2 // 分片预算直设（总量/64 均摊的确定性等价面）
 	c.shardOf(ids[0]).mu.Unlock()
@@ -313,7 +315,7 @@ func TestLocationCacheExpiryPreferredOverEviction(t *testing.T) {
 // FIFO 墓碑不占逐出名额——逐出目标是最旧的**存活**条目。
 func TestLocationCacheEvictionSkipsInvalidatedTombstones(t *testing.T) {
 	c := shortCache()
-	ids := sameShardIDs(t, "tomb", 5)
+	ids := sameShardIDs(t, c, "tomb", 5)
 	c.shardOf(ids[0]).mu.Lock()
 	c.shardOf(ids[0]).max = 3 // 分片预算直设（墓碑语义的分片内确定性面）
 	c.shardOf(ids[0]).mu.Unlock()
@@ -361,10 +363,10 @@ func TestLocationCacheDefaultMaxEntries(t *testing.T) {
 	_ = first
 }
 
-// TestLocationCacheOrderDedupOnHotIdChurn：热 id 的
-// 「回填→失效→再回填」churn（钩子④发送失败逐次失效的常态）给 order 追加
-// 同名条目；重新驻留期间它们全是存活态，纯墓碑过滤无法收缩——压缩必须
-// 按 id 去重保最旧 FIFO 位，order 簿记不得随 churn 无界增长。
+// TestLocationCacheOrderDedupOnHotIdChurn（票 07 语义迁移）：热 id 的
+// 「回填→失效→再回填」churn 下簿记不得无界增长——LRU 形态（map 为真相
+// 源 + 链表节点唯一）结构上无重复追加，断言收紧为「churn 后链表与 map
+// 恰等量、热 id 驻留」。
 func TestLocationCacheOrderDedupOnHotIdChurn(t *testing.T) {
 	c := shortCache() // 正 400ms——churn 循环内不过期
 	id := mustID(t, "hot-churn")
@@ -376,10 +378,10 @@ func TestLocationCacheOrderDedupOnHotIdChurn(t *testing.T) {
 	c.PutPositive(id, loc) // 终态：热 id 驻留
 	sh := c.shardOf(id)
 	sh.mu.Lock()
-	orderLen, liveLen := len(sh.order), len(sh.entries)
+	lruLen, liveLen := sh.lru.Len(), len(sh.entries)
 	sh.mu.Unlock()
-	if orderLen > 2*liveLen+8 {
-		t.Fatalf("order bookkeeping = %d for %d live entries, want deduplicated", orderLen, liveLen)
+	if lruLen != liveLen || liveLen != 1 {
+		t.Fatalf("bookkeeping = lru %d / entries %d, want exactly 1/1 (no churn growth)", lruLen, liveLen)
 	}
 	if _, found, _ := c.Get(id); !found {
 		t.Fatal("hot id must remain cached after churn")

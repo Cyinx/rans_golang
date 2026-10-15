@@ -1,0 +1,5 @@
+prim_varint_neg	0d	varint 负值（zigzag）
+prim_varuint	ac02	varuint
+prim_fixed8	2a	fixed8
+prim_fixed32	efbeadde	fixed32 小端
+prim_fixed64	efbeaddebebafeca	fixed64 小端

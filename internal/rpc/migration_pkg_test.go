@@ -701,7 +701,6 @@ func startMigNode(t *testing.T, spec migNodeSpec) *migRemNode {
 		Resolve:            spec.rt.resolve,
 		DefaultCallTimeout: 5 * time.Second,
 		LocationCache:      spec.cache,
-		CheckpointStore:    spec.store,
 	})
 	if err != nil {
 		t.Fatalf("new migration node %d: %v", spec.id, err)

@@ -180,11 +180,20 @@ func TestReplyForwardEnqueueNonBlocking(t *testing.T) {
 
 	// 放行后帧异步离箱：回包按 Source 寻址、转发置位原样透传。
 	close(blocked.gate)
-	fr := <-blocked.sent
+	var fr gatedSent
+	for fr = range blocked.sent { // 票 12：跳过 Forward 漏斗随发的重定向提示
+		if fr.hdr.Type != protocol.MsgRedirectHint {
+			break
+		}
+	}
 	if fr.node != 2 || fr.hdr.Type != protocol.MsgError {
 		t.Fatalf("reply frame mismatch: node=%d type=%v", fr.node, fr.hdr.Type)
 	}
-	fr = <-blocked.sent
+	for fr = range blocked.sent { // 同上：跳过重定向提示
+		if fr.hdr.Type != protocol.MsgRedirectHint {
+			break
+		}
+	}
 	if fr.node != 2 || fr.hdr.Flags&protocol.FlagForwarded == 0 || string(fr.body) != "raw" {
 		t.Fatalf("forward frame mismatch: node=%d hdr=%+v body=%q", fr.node, fr.hdr, fr.body)
 	}

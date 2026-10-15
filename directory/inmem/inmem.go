@@ -41,34 +41,38 @@ func New() directory.Directory {
 }
 
 // nextIncLocked 取下一个纪元（调用方必须已持 i.mu）：per-id 严格递增，
-// 首个为 1，跨墓碑存续（墓碑/注销不清序列）。
-func (i *impl) nextIncLocked(id rans.ID) uint64 {
+// 首个为 1，跨墓碑存续（墓碑/注销不清序列）；floor 为纪元下限（0=无），
+// 先抬序列再 +1。
+func (i *impl) nextIncLocked(id rans.ID, floor uint64) uint64 {
+	if floor > i.inc[id] {
+		i.inc[id] = floor
+	}
 	i.inc[id]++
 	return i.inc[id]
 }
 
 // Register 原子注册（契约见 directory.Directory：四分支语义）：取号与
-// 写入在同一临界区内完成；self.Incarnation 入参被忽略（纪元派生自条目
-// 现值）。
+// 写入在同一临界区内完成；self.Incarnation 作纪元下限（0=无下限）。
 func (i *impl) Register(_ context.Context, id rans.ID, self directory.Owner, expected *directory.Owner) (bool, directory.Owner, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	cur, exists := i.m[id]
-	// 分支 2：现值归属即本实例（node+epoch）→ 重注册/收养 inc+1
-	if exists && !cur.tombstone && cur.owner.Node == self.Node && (cur.owner.Epoch == self.Epoch || cur.owner.Epoch == 0) {
-		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id)}
+	// 分支 2：现值归属即本实例（node+epoch 相等——票 15：epoch-0 条目不
+	// 再收养，经分支 3 CAS 接管自愈；registry-less 形态 0==0 自然命中）
+	if exists && !cur.tombstone && cur.owner.Node == self.Node && cur.owner.Epoch == self.Epoch {
+		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id, self.Incarnation)}
 		i.m[id] = entry{owner: owner}
 		return true, owner, nil
 	}
 	// 分支 3：expected 与现值全等 → CAS 接管 inc+1 写自归属
 	if exists && !cur.tombstone && expected != nil && cur.owner == *expected {
-		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id)}
+		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id, self.Incarnation)}
 		i.m[id] = entry{owner: owner}
 		return true, owner, nil
 	}
 	// 分支 1：无值或墓碑 → 纪元从残值+1 起写自归属
 	if !exists || cur.tombstone {
-		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id)}
+		owner := directory.Owner{Node: self.Node, Epoch: self.Epoch, Incarnation: i.nextIncLocked(id, self.Incarnation)}
 		i.m[id] = entry{owner: owner}
 		return true, owner, nil
 	}
@@ -103,7 +107,7 @@ func (i *impl) Transfer(_ context.Context, id rans.ID, expected, target director
 	if cur.tombstone || cur.owner != expected {
 		return false, 0, cur.owner, directory.ErrNotOwner
 	}
-	next := i.nextIncLocked(id)
+	next := i.nextIncLocked(id, 0)
 	owner := directory.Owner{Node: target.Node, Epoch: target.Epoch, Incarnation: next}
 	i.m[id] = entry{owner: owner}
 	return true, next, owner, nil

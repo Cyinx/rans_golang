@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/log"
 	"github.com/cyinx/rans_golang/internal/pawnite"
@@ -251,8 +252,12 @@ func passivateCore(ctx context.Context, tbl *activation.Table, id rans.ID, ent r
 	if store == nil {
 		return pawnite.HandoffOutcome{Err: errPassivateNoStore}
 	}
-	// 围栏：Put 携带本 incarnation 纪元（p 与快照同源实例）。
+	// 围栏：Put 携带本 incarnation 纪元（p 与快照同源实例）；stale 拒写=
+	// 更新的化身已落库，陈旧状态本就不可落——按无快照直接终局（成功形态）。
 	if err := store.Put(ctx, id, p.Incarnation(), snap); err != nil {
+		if errors.Is(err, checkpoint.ErrStaleIncarnation) {
+			return pawnite.HandoffOutcome{}
+		}
 		return pawnite.HandoffOutcome{Err: fmt.Errorf("rans: passivate: snapshot put failed: %w", err)}
 	}
 	return pawnite.HandoffOutcome{}

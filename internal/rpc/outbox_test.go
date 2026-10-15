@@ -108,34 +108,15 @@ func (f *outboxFakeSend) waitArrivals(t *testing.T, target rans.NodeID, want int
 }
 
 // newTestOutbox 构造带独立注册表的发件箱（Close 挂 Cleanup）。
-func newTestOutbox(t *testing.T, capacity, shards int, send func(context.Context, rans.NodeID, wire.Header, []byte) error) (*Outbox, *metrics.Registry) {
+func newTestOutbox(t *testing.T, capacity int, send func(context.Context, rans.NodeID, wire.Header, []byte) error) (*Outbox, *metrics.Registry) {
 	t.Helper()
 	reg := metrics.New("outbox-test")
-	o, err := NewOutbox(OutboxConfig{Capacity: capacity, Shards: shards, Send: send, Metrics: reg})
+	o, err := NewOutbox(OutboxConfig{Capacity: capacity, Send: send, Metrics: reg})
 	if err != nil {
 		t.Fatalf("new outbox: %v", err)
 	}
 	t.Cleanup(o.Close)
 	return o, reg
-}
-
-// distinctShardTargets 返回 k 个落在 k 个不同分片的目标节点号（慢目标只
-// 拖同分片——分片间并行断言的前提）。
-func distinctShardTargets(t *testing.T, o *Outbox, k int) []rans.NodeID {
-	t.Helper()
-	seen := map[int]bool{}
-	var out []rans.NodeID
-	for id := rans.NodeID(1); id < 4096 && len(out) < k; id++ {
-		s := o.shardOf(id)
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, id)
-		}
-	}
-	if len(out) < k {
-		t.Fatalf("cannot find %d distinct shards", k)
-	}
-	return out
 }
 
 // putTell 入箱一帧（MessageID 携带序号作断言载荷），失败即 Fatal。
@@ -173,13 +154,13 @@ func waitReading(t *testing.T, reg *metrics.Registry, name string, want float64)
 	}
 }
 
-// 1. 分片 FIFO：同目标并发乱序入箱保序送达（送达序 == 分片队列序）；
-// 不同目标（异分片）并行互不阻塞——慢目标卡死首帧时快目标照常清空。
+// 1. 目标 FIFO：同目标并发乱序入箱保序送达（送达序 == 目标队列序）；
+// 不同目标并行互不阻塞——慢目标卡死首帧时快目标照常清空（票 04 按目标
+// 分队列；回归锚：退回全局单 worker 形态即红）。
 func TestOutbox_PerTargetFIFO(t *testing.T) {
 	fake := newOutboxFakeSend()
-	o, _ := newTestOutbox(t, 1024, 8, fake.send)
-	ts := distinctShardTargets(t, o, 3)
-	tStuck, tSame, tFast := ts[0], ts[0], ts[2] // tSame 与 tStuck 同分片同目标
+	o, _ := newTestOutbox(t, 1024, fake.send)
+	tStuck, tFast := rans.NodeID(2), rans.NodeID(9)
 
 	// 同目标 FIFO——阶段 A（确定性序）：worker 停在首帧发送段，随后并发
 	// 入箱 20 帧；队列序在入箱完成后冻结，可整队快照（包内测试缝）。
@@ -190,17 +171,20 @@ func TestOutbox_PerTargetFIFO(t *testing.T) {
 		wg.Add(1)
 		go func(seq uint64) {
 			defer wg.Done()
-			putTell(t, o, context.Background(), tSame, seq)
+			putTell(t, o, context.Background(), tStuck, seq)
 		}(uint64(1 + i))
 	}
 	wg.Wait()
-	s := o.shards[o.shardOf(tStuck)]
-	s.mu.Lock()
+	q, ok := o.queueFor(tStuck)
+	if !ok {
+		t.Fatal("queueFor must not reject a live outbox")
+	}
+	q.mu.Lock()
 	var queued []uint64
-	for _, it := range s.queue {
+	for _, it := range q.queue {
 		queued = append(queued, it.hdr.MessageID)
 	}
-	s.mu.Unlock()
+	q.mu.Unlock()
 	if len(queued) != n {
 		t.Fatalf("queued %d frames after concurrent puts, want %d", len(queued), n)
 	}
@@ -213,9 +197,8 @@ func TestOutbox_PerTargetFIFO(t *testing.T) {
 		}
 	}
 
-	// 阶段 B（分片间并行）：tStuck 重新卡死首帧，tFast（异分片）快速放行
-	// ——快目标的 n 帧全部送达时慢目标仍停在首帧。单 worker 突变下快目
-	// 标被队头阻塞，本断言变红。
+	// 阶段 B（跨目标并行）：tStuck 重新卡死首帧，tFast 快速放行——快目
+	// 标的 n 帧全部送达时慢目标仍停在首帧。
 	fake.block(tStuck)
 	fake.release(tFast)
 	putTell(t, o, context.Background(), tStuck, 2000)
@@ -224,7 +207,7 @@ func TestOutbox_PerTargetFIFO(t *testing.T) {
 	}
 	fake.waitArrivals(t, tFast, n)
 	if c := len(fake.arrivalSeqs(tStuck)) - (n + 1); c != 0 {
-		t.Fatalf("slow target advanced %d frames while gated, want 0 (cross-shard parallelism broken)", c)
+		t.Fatalf("slow target advanced %d frames while gated, want 0 (cross-target parallelism broken)", c)
 	}
 }
 
@@ -233,7 +216,7 @@ func TestOutbox_PerTargetFIFO(t *testing.T) {
 // Canceled），绝不永久阻塞；放行排空后恢复快速返回。
 func TestOutbox_TellBlocksUntilCtx(t *testing.T) {
 	fake := newOutboxFakeSend()
-	o, reg := newTestOutbox(t, 2, 1, fake.send)
+	o, reg := newTestOutbox(t, 2, fake.send)
 	tgt := rans.NodeID(1)
 
 	// 箱不满：入箱即返回。首帧入箱后等 worker 取走进入发送段（深度归零
@@ -242,8 +225,12 @@ func TestOutbox_TellBlocksUntilCtx(t *testing.T) {
 	defer fastCancel()
 	putTell(t, o, fastCtx, tgt, 1)
 	waitReading(t, reg, metrics.NameOutboxDepth, 0)
-	putTell(t, o, fastCtx, tgt, 2)
-	putTell(t, o, fastCtx, tgt, 3)
+	// #2/#3 用长预算（票 05 写出时刻过期检查）：满箱段耗去的 200ms 不应
+	// 使在箱帧放行后被丢弃——它们要在放行后真实送达（恢复快速返回断言）。
+	queuedCtx, queuedCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer queuedCancel()
+	putTell(t, o, queuedCtx, tgt, 2)
+	putTell(t, o, queuedCtx, tgt, 3)
 	waitReading(t, reg, metrics.NameOutboxDepth, 2) // 满箱：容量 2，#2/#3 在箱
 
 	// 满箱 + 预算到期：阻塞至 ctx 到期返回 Timeout（阻塞时长尊重预算）。
@@ -274,7 +261,7 @@ func TestOutbox_TellBlocksUntilCtx(t *testing.T) {
 	// 放行排空后：箱不满恢复快速返回。
 	fake.release(tgt)
 	fake.waitArrivals(t, tgt, 3)
-	putTell(t, o, fastCtx, tgt, 6)
+	putTell(t, o, queuedCtx, tgt, 6)
 }
 
 // mustShortCtx 带短预算的测试 ctx。
@@ -285,13 +272,13 @@ func mustShortCtx(t *testing.T, d time.Duration) context.Context {
 	return ctx
 }
 
-// 3. 指标计数（H11 决策 11）：深度随在箱积压增长；发送失败按帧计数；
-// 关箱弃置在箱帧计丢弃。全部经构造注入的注册表读数断言。
+// 3. 指标计数（H11 决策 11 + 票 04 熔断）：深度随在箱积压增长；发送失
+// 败即开断（首帧失败计数 1，同目标在箱帧被清扫计丢弃）；关箱弃置在箱帧
+// 计丢弃、在途帧取消计发送失败。全部经构造注入的注册表读数断言。
 func TestOutbox_Metrics(t *testing.T) {
 	fake := newOutboxFakeSend()
-	o, reg := newTestOutbox(t, 64, 4, fake.send)
-	ts := distinctShardTargets(t, o, 2)
-	tStuck, tFail := ts[0], ts[1]
+	o, reg := newTestOutbox(t, 64, fake.send)
+	tStuck, tFail := rans.NodeID(2), rans.NodeID(9)
 	fake.setFail(tFail, true)
 
 	// 深度：worker 卡在 tStuck 首帧（出箱），随后 3 帧留箱。
@@ -303,23 +290,32 @@ func TestOutbox_Metrics(t *testing.T) {
 		t.Fatalf("outbox depth = %v, want 3", v)
 	}
 
-	// 发送失败：tFail 的 3 帧门开即败，逐帧计数。
+	// 发送失败即熔断（票 04，开断阈值 2）：tFail 的 3 帧入箱（门开着、
+	// 逐帧失败）——前两帧真实发送各计一次失败，第二帧触发开断，第三帧
+	// 被清扫计丢弃：send_failed=2、breaker_opened=1。
 	fake.release(tFail)
 	for i := 0; i < 3; i++ {
 		putTell(t, o, context.Background(), tFail, uint64(10+i))
 	}
-	if v := waitReading(t, reg, metrics.NameOutboxSendFailed, 3); v != 3 {
-		t.Fatalf("outbox send failures = %v, want 3", v)
+	if v := waitReading(t, reg, metrics.NameOutboxSendFailed, 2); v != 2 {
+		t.Fatalf("outbox send failures = %v, want 2 (threshold sends)", v)
+	}
+	if v := waitReading(t, reg, metrics.NameOutboxDropped, 1); v != 1 {
+		t.Fatalf("outbox breaker sweeps = %v, want 1", v)
+	}
+	if v := waitReading(t, reg, metrics.NameOutboxBreakerOpened, 1); v != 1 {
+		t.Fatalf("outbox breaker openings = %v, want 1", v)
 	}
 
-	// 丢弃：关箱弃置在箱 3 帧（静默丢失面——计数留痕）；卡在发送段的
-	// 首帧随关箱取消，计入发送失败。
+	// 关箱：弃置 tStuck 在箱 3 帧（静默丢失面——计数留痕）；卡在发送段
+	// 的首帧随关箱取消，计入发送失败（并使 tStuck 也开断——断言见上式
+	// 的姊妹读数，不再单独断言）。
 	o.Close()
-	if v := waitReading(t, reg, metrics.NameOutboxDropped, 3); v != 3 {
-		t.Fatalf("outbox drops = %v, want 3", v)
+	if v := waitReading(t, reg, metrics.NameOutboxDropped, 4); v != 4 {
+		t.Fatalf("outbox drops after close = %v, want 4", v)
 	}
-	if v := waitReading(t, reg, metrics.NameOutboxSendFailed, 4); v != 4 {
-		t.Fatalf("outbox send failures after close = %v, want 4 (in-flight frame canceled)", v)
+	if v := waitReading(t, reg, metrics.NameOutboxSendFailed, 3); v != 3 {
+		t.Fatalf("outbox send failures after close = %v, want 3 (in-flight frame canceled)", v)
 	}
 	if v := reading(t, reg, metrics.NameOutboxDepth); v != 0 {
 		t.Fatalf("outbox depth after close = %v, want 0", v)
@@ -331,7 +327,7 @@ func TestOutbox_Metrics(t *testing.T) {
 // 兵，绝不阻塞；腾位后恢复即入。关箱拒绝与 Put 同型。
 func TestOutbox_TryPutFullDropsAndCounts(t *testing.T) {
 	fake := newOutboxFakeSend()
-	o, reg := newTestOutbox(t, 2, 1, fake.send)
+	o, reg := newTestOutbox(t, 2, fake.send)
 	tgt := rans.NodeID(1)
 
 	// 首帧入箱并等 worker 取走进入发送段（深度归零——出箱是异步面），
@@ -361,54 +357,7 @@ func TestOutbox_TryPutFullDropsAndCounts(t *testing.T) {
 	}
 }
 
-// 调用帧排队过预算的发送段中止（健全性锁）：单分片队头被门挂住，调用帧
-// 在箱内排队至调用方预算耗尽；放行队头后 worker 取到的是已过期帧——
-// SendCall 必须收到已到期的 ctx 与 deadline（真实面据此确定不送出，不产
-// 生迟到执行），发送失败经 fail 回投。fake 的写读经 fail 通道定序，无竞态。
-func TestOutbox_CallFrameExpiredBudgetAbortsAtSend(t *testing.T) {
-	fake := newOutboxFakeSend()
-	var gotCtxErr error
-	var gotDeadline time.Time
-	failErrs := make(chan error, 1)
-	o, err := NewOutbox(OutboxConfig{
-		Capacity: 8,
-		Shards:   1,
-		Send:     fake.send,
-		SendCall: func(ctx context.Context, _ rans.NodeID, _ wire.Header, _ []byte, deadline time.Time) error {
-			gotCtxErr = ctx.Err()
-			gotDeadline = deadline
-			return errors.New("outbox fake: expired frame")
-		},
-		Metrics: metrics.New("outbox-call-test"),
-	})
-	if err != nil {
-		t.Fatalf("new outbox: %v", err)
-	}
-	t.Cleanup(o.Close)
-
-	if err := o.Put(context.Background(), rans.NodeID(2), wire.Header{MessageID: 1}, nil); err != nil {
-		t.Fatalf("head tell: %v", err)
-	}
-	cctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if err := o.PutCall(cctx, rans.NodeID(3), wire.Header{MessageID: 2}, nil, func(err error) { failErrs <- err }); err != nil {
-		t.Fatalf("put call frame: %v", err)
-	}
-	<-cctx.Done() // 调用帧预算在箱内耗尽（队头仍被门挂住，帧未出箱）
-
-	fake.release(rans.NodeID(2))
-	select {
-	case ferr := <-failErrs:
-		if ferr == nil {
-			t.Fatal("fail must receive the send error of the expired frame")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("call-frame send never completed after head release")
-	}
-	if gotCtxErr == nil {
-		t.Fatal("SendCall must be invoked with an expired ctx (budget burned in queue)")
-	}
-	if gotDeadline.IsZero() || !time.Now().After(gotDeadline) {
-		t.Fatalf("SendCall deadline = %v, want an already-passed request deadline", gotDeadline)
-	}
-}
+// 调用帧排队过预算（票 05 语义更新）：原断言「SendCall 收到已过期 ctx 由
+// 发送面中止」——写出时刻过期检查落地后升级为「过期帧不进发送面、出箱
+// 即回投确定未送出」，由 outbox_budget_test.go 的 TestOutbox_ExpiredFrame
+// NotSent 与 TestOutbox_BudgetRestampedAtSend 接管钉住。

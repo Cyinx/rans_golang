@@ -84,6 +84,11 @@ func (r *Responder) Reply(v any, err error) {
 // deadline 过后 Reply 丢弃且无效）。Defer 返回后本请求不再计入执行看门狗
 // ——延迟应答不算卡死。
 //
+// 实例终局语义（票 11）：Responder 不跨实例终局存活——实体到达终局（钝化/
+// 迁移/销毁/强弃/停机）时，未 Reply 的 Responder 由运行时立即以
+// Timeout+Deactivated 收场（调用方不必等到自身 deadline），此后迟到的
+// Reply 丢弃且无效。
+//
 // 误用形态（编程错误）：非 Handle ctx（含 Tell 单向投递的 Handle——单向
 // 无应答面）调用 Defer、同一请求上重复 Defer——均 panic 于调用点；返回
 // Deferred 却未 Defer——非 panic，边界回 CodeError+ReasonHandler 错误应答

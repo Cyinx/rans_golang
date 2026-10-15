@@ -34,9 +34,10 @@ type Owner struct {
 // 在实体 Handle 内调用（调用方自备预算——运行时内部调用均带预算）。
 type Directory interface {
 	// Register 原子注册（单键读-比-写，H13 四分支语义）。self 是本实例
-	// 归属（Node/Epoch 参与比对与写入；Incarnation 入参被忽略——纪元由
-	// 条目现值派生）。expected 非空时为 CAS 接管的期望归属（与现值全等
-	// 才赢）。返回值 current 恒为「本调用后的条目归属」：
+	// 归属（Node/Epoch 参与比对与写入；Incarnation 作纪元下限——赢分支
+	// 取号 = max(现值, 下限)+1，0 = 无下限，裁决不受影响）。expected
+	// 非空时为 CAS 接管的期望归属（与现值全等才赢）。返回值 current 恒为
+	// 「本调用后的条目归属」：
 	//   - 赢（true）：条目此前无值/墓碑（纪元 = 墓碑残值+1 起写自归属）、
 	//     或现值归属即本实例 node+epoch（重注册/收养，inc+1）、或 expected
 	//     与现值全等（CAS 接管，inc+1 写自归属）——current 是含新纪元的

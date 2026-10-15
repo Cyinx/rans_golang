@@ -35,6 +35,9 @@ func (p *Pawnite) finish(ctx context.Context) {
 	late := p.takeInboxLocked()
 	p.mu.Unlock()
 	p.disposeLate(late)
+	// 延迟应答终局收场（票 11）：未 Reply 的 Responder 立即以
+	// Timeout+Deactivated 收场，迟到 Reply 由记账包装器丢弃。
+	p.settleDeferred()
 	p.runOnEvictOnce()
 }
 

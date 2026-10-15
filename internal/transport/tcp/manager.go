@@ -12,6 +12,9 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/cyinx/rans_golang/internal/log"
 
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/internal/transport"
@@ -25,12 +28,27 @@ var errAlreadyListening = errors.New("rans: listen: already listening")
 // （无心跳、无收口的连接或监听）不是合法状态。
 var ErrManagerClosed = errors.New("rans: manager: closed")
 
+// drainWaitBudget 连接收敛等待旧连接排空的有界预算（票 06；与
+// retireLinger 同量级——对端正常收口毫秒级完成，僵死时到点放行）。
+const drainWaitBudget = 2 * time.Second
+
+// ErrWrongPeer SendToNode 的对端身份不符（票 02）：解析到的地址已被其他
+// 节点复用（如 k8s pod IP 复用）——帧确定未投递（rpc 网关包装为
+// Unavailable+SendFailed，调用方可无条件重试）；连接本身留给真实对端。
+var ErrWrongPeer = errors.New("rans: send: connection peer mismatch")
+
 // managedConn Manager 视角的连接登记项：三张表（byAddr/byNode/conns）
 // 的值类型，携带连接的经理侧私有状态。
 type managedConn struct {
 	c     *Conn
 	addr  string        // 拨号目标地址；listener 接入的连接为 ""（不进 byAddr）
 	ready chan struct{} // 握手完成即 close（SendToNode 的就绪等待点）
+
+	// peer 握手得到的对端节点号（票 02：SendToNode 的身份校验面）；mu 写
+	//（registerNode，先于 close(ready)）、ready 关闭后免锁读。0 = 尚未握手。
+	peer rans.NodeID
+	// peerWarned 身份不符的 Warn 单次标记（同一连接只告警一次）。
+	peerWarned atomic.Bool
 
 	superseded atomic.Bool // 被同节点新连接替换：其 Lost 不再上报（节点仍有新连接）
 }
@@ -73,15 +91,16 @@ type Manager struct {
 	handler transport.Handler
 	pool    *wire.PagePool
 
-	mu       sync.Mutex
-	byAddr   map[string]*managedConn      // 拨号目标地址 → 连接（懒建缓存）
-	byNode   map[rans.NodeID]*managedConn // 对端节点号 → 连接（握手完成后登记）
-	conns    map[*managedConn]struct{}
-	dialing  map[string]*dialFlight // 进行中的单飞拨号
-	hadConn  map[string]struct{}    // 曾成功建连的地址集（重拨判据：断连后再拨即计数）
-	listener net.Listener
-	hbCancel context.CancelFunc
-	closed   bool // Close 终态旗标（mu 保护）：post-close 拨号/监听/心跳全拒
+	mu          sync.Mutex
+	byAddr      map[string]*managedConn      // 拨号目标地址 → 连接（懒建缓存）
+	byNode      map[rans.NodeID]*managedConn // 对端节点号 → 连接（握手完成后登记）
+	acceptStart sync.Once                    // accept 循环单发（ListenBind+StartAccept 的次序拆分面）
+	conns       map[*managedConn]struct{}
+	dialing     map[string]*dialFlight // 进行中的单飞拨号
+	hadConn     map[string]struct{}    // 曾成功建连的地址集（重拨判据：断连后再拨即计数）
+	listener    net.Listener
+	hbCancel    context.CancelFunc
+	closed      bool // Close 终态旗标（mu 保护）：post-close 拨号/监听/心跳全拒
 
 	lastBatch atomic.Int64 // 最近一次写冲刷的帧数（跨连接，观测面）
 	closeOnce sync.Once
@@ -173,6 +192,7 @@ func (m *Manager) removeConnTablesLocked(mc *managedConn) {
 // （addr=""）无 getOrConnect 死检查兜底，此处即该连接最后的清表点。
 func (m *Manager) registerNode(mc *managedConn, peer rans.NodeID) {
 	m.mu.Lock()
+	mc.peer = peer // 票 02：先于 close(ready) 落位，SendToNode 就绪后可读
 	select {
 	case <-mc.c.Done():
 		m.removeConnTablesLocked(mc)
@@ -199,11 +219,21 @@ func (m *Manager) registerNode(mc *managedConn, peer rans.NodeID) {
 		mc.c.Retire()
 		return
 	}
-	close(mc.ready)
 	if replacing {
 		old.superseded.Store(true) // 先标记后退役：其 Lost 上报被抑制
 		old.c.Retire()
+		// 发送侧保序缓解（票 06）：新连接的 ready 在旧连接写出全部在队帧
+		// 之后才放行——新旧交接期的发送序不交错（收端两读循环的交错窗口
+		// 由此显著缩小，FIFO 承诺收窄为「同一连接内」）。有界等待：超时
+		// 照常放行（僵死连接不阻塞收敛）并告警留痕。
+		select {
+		case <-old.c.Drained():
+		case <-time.After(drainWaitBudget):
+			log.Warn("rans/tcp: new conn ready before old conn drained (bounded wait exhausted)",
+				"peer", peer)
+		}
 	}
+	close(mc.ready)
 }
 
 // connLost 连接断开终态：身份守卫清表（旧连接的 Lost 不得误删新连接的
@@ -267,6 +297,12 @@ func (m *Manager) SendToNode(ctx context.Context, node rans.NodeID, resolve func
 			return err
 		}
 	}
+	// 就绪等待的 ctx 优先（票 05）：ctx 已结束时确定性返回 ctx 结果——
+	// ready 与 ctx.Done 同时就绪的 select 随机选不再可能送出调用方已放弃
+	// 的帧。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-mc.ready:
 	case <-mc.c.retired:
@@ -281,6 +317,19 @@ func (m *Manager) SendToNode(ctx context.Context, node rans.NodeID, resolve func
 		return fmt.Errorf("rans: send: connection to node %d closed before ready", node)
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err // 就绪后的复检：等待期间调用方已放弃
+	}
+	// 对端身份校验（票 02）：就绪连接的握手对端与目标不符 = 解析地址已被
+	// 其他节点复用。帧不送出（确定未投递），连接留给真实对端复用；解析结
+	// 果的失效由上层视图/缓存承接（票 01 事件失效）。
+	if p := mc.peer; p != node {
+		if mc.peerWarned.CompareAndSwap(false, true) {
+			log.Warn("rans/tcp: resolved address belongs to a different node; frame not delivered",
+				"want", node, "got", p, "addr", mc.addr)
+		}
+		return fmt.Errorf("rans: send: node %d resolved to node %d's address: %w", node, p, ErrWrongPeer)
 	}
 	return mc.c.Send(ctx, hdr, body)
 }

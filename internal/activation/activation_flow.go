@@ -2,15 +2,18 @@ package activation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/ctxkey"
 	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/pawnite"
 )
 
@@ -29,6 +32,16 @@ const cleanupUnregisterTimeout = 5 * time.Second
 // 不会死锁（onActivated 内对同一 id 调 Destroy 会自等待 Pawnite 串行
 // 队列，见字段注释的重入边界）。
 func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite, error) {
+	if m.sealed.Load() {
+		return nil, ErrTableSealed
+	}
+	// epoch-0 闸门（票 14）：registry 形态下未取号（SelfEpoch==0，Start
+	// 前/取号失败终态）的激活直接拒绝——永不写 epoch-0 条目；错误可重试
+	//（Start 成功后同请求即恢复）。registry-less 形态代际恒 0，不设闸。
+	if m.registryForm && m.SelfEpoch() == 0 {
+		return nil, fmt.Errorf("%w: node epoch not allocated (start pending or failed)",
+			ErrActivationFailed)
+	}
 	if p, ok := m.GetLocal(id); ok {
 		return p, nil
 	}
@@ -56,9 +69,12 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 		//（可能重、可能 panic、可能被竞争丢弃），在 m.mu 临界区外执行；
 		// 重锁后双检——命中既有条目即回到环首判定（活实例复用返回、陈旧
 		// 清理后重试，构造物按工厂契约无副作用、直接丢弃）。工厂 panic
-		// 时无锁在手，向上传播即无死锁面。
+		// 收敛为 ErrFactoryPanic 返回（无锁在手、零表/目录副作用）。
 		m.mu.Unlock()
-		ent := f(id)
+		ent, err := m.construct(f, id)
+		if err != nil {
+			return nil, err
+		}
 		m.mu.Lock()
 		if m.peekLocal(id) != nil {
 			continue // 双检命中：既有实例接管，构造物让位（环首同款判定）
@@ -186,8 +202,20 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 				// ReasonActivationFailed) 回绝（注册后失败属执行前确定性失败），
 				// 本地调用方拿到 ErrActivationFailed 后可重试——不同步阻断
 				// pawnite 构造。
+				// 启动窗口收口（成员面形态）：代际未发布（liveness 首写在
+				// 途）时有界等待——epoch-0 条目的有效性在路由与激活两侧
+				// 语义分叉，窗口内落位即歧义；超时按 epoch-0 形态继续
+				//（未取号节点的既有行为）。
+				m.awaitEpochPublished(ctx)
+				// 纪元下限先于首注册定稿（目录键丢失/复活形态下取号仍高于
+				// 持久层围栏水位——写入不被静默拒绝）。
+				floor, ferr := m.fencingFloor(ctx, id, ent)
+				if ferr != nil {
+					actErr = ferr
+					return actErr
+				}
 				won, cur, err := m.dir.Register(ctx, id,
-					directory.Owner{Node: m.self, Epoch: m.SelfEpoch()}, nil)
+					directory.Owner{Node: m.self, Epoch: m.SelfEpoch(), Incarnation: floor}, nil)
 				if err != nil {
 					actErr = fmt.Errorf("register: %w", err)
 					m.observeRegisterFailure(id, err)
@@ -198,14 +226,20 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 					//（误判由 inc 围栏 + SelfFence 兜底）；仍输按输家收场。
 					prev := cur
 					won, cur, err = m.dir.Register(ctx, id,
-						directory.Owner{Node: m.self, Epoch: m.SelfEpoch()}, &prev)
+						directory.Owner{Node: m.self, Epoch: m.SelfEpoch(), Incarnation: floor}, &prev)
 					if err != nil {
 						actErr = fmt.Errorf("register takeover: %w", err)
 						m.observeRegisterFailure(id, err)
 						return actErr
 					}
 					if won {
-						// 接管赢方直发所有权丢失通知（H13 决策 22）。
+						// 接管赢方直发所有权丢失通知（H13 决策 22）+ B9 观测。
+						log.Info("rans/activation: dead-owner takeover won",
+							"uuid", id.String(), "prev_node", prev.Node,
+							"prev_epoch", prev.Epoch, "prev_inc", prev.Incarnation,
+							"inc", cur.Incarnation)
+						m.metricsReg().Counter(metrics.NameOwnershipTakeoverWon,
+							"dead-owner CAS takeovers won by this node").Add(1)
 						m.notifyTakeover(prev, id)
 					}
 				}
@@ -225,6 +259,13 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 				inst.owner.Store(&owner) // 实例标记首写：终局 cleanup 据此实例级注销（先于下方守卫，覆盖注册返回与守卫之间的强弃交错）
 				p.AssignIncarnation(inc) // 令牌落位（投递层经 p.Incarnation() 包装 Handle ctx；Register 取号恒 ≥1，0=未围栏哨兵不占）
 				ctx = ctxkey.WithIncarnation(ctx, inc)
+				// 换代复核：注册 IO 在飞期间 Liveness 换代（成员键丢失重取号）——
+				// 本条目以旧代际落位，对本端成员视图已死：激活失败（可重试——
+				// 重试携带新代际），终局 cleanup 按实例标记条件注销。
+				if cur.Epoch != 0 && cur.Epoch != m.SelfEpoch() {
+					actErr = fmt.Errorf("rans: activate: node epoch moved during registration (%d → %d)", cur.Epoch, m.SelfEpoch())
+					return actErr
+				}
 				// 注册后让位守卫：注册 IO 在飞期间看门狗强弃（StateDestroyed）
 				// 或 Destroy 抢先置 Destroying——实例已死，刚赢得的注册是幽灵
 				// 条目（无本地实例却钉死归属），就地实例级注销后让位返回 nil
@@ -260,15 +301,21 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 					// 起被 ErrStaleIncarnation 拒（否则围栏窗要敞到首轮周期
 					// checkpoint）。成功即「当前状态已持久」（此刻实体状态=包字节
 					// =落库字节，恢复后 Activate 前无任何执行）：ckptEpoch 同款
-					// 抬升，首轮 sweep 判干净，省一次同内容重写；失败仅 Warn 不
-					// 阻断激活（尽力而为档）——不标记，首轮 sweep 的 Put 落库
-					// 时围栏窗才收口。
+					// 抬升，首轮 sweep 判干净。stale 拒写=更新的化身已落库——
+					// 包状态过期不得对外服务，激活失败（可重试：重激活从 Store
+					// 读到新状态）；其余失败仅 Warn（尽力而为档，围栏窗敞到
+					// 首轮 sweep 收口）。
 					if m.store != nil {
-						if perr := m.store.Put(ctx, id, p.Incarnation(), snap); perr != nil {
+						perr := m.store.Put(ctx, id, p.Incarnation(), snap)
+						switch {
+						case perr == nil:
+							inst.ckptEpoch.Store(p.Epoch() + 1)
+						case errors.Is(perr, checkpoint.ErrStaleIncarnation):
+							actErr = fmt.Errorf("rans: activate: post-restore persist rejected as stale: %w", perr)
+							return actErr
+						default:
 							log.Warn("rans/activation: post-restore snapshot persist failed; stale-write fencing deferred to first checkpoint (best effort)",
 								"uuid", id.String(), "err", perr)
-						} else {
-							inst.ckptEpoch.Store(p.Epoch() + 1)
 						}
 					}
 				}
@@ -294,7 +341,7 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 				// onActivated 钩子：目录注册与实体 Activate 都成功之后触发；
 				// 运行在 Pawnite run goroutine 上，不持任何表锁。
 				// （续租不在此接线：Track 前移到注册成功点
-				// trackLease——装载期也在续租域内；本钩子是纯用户通知面。）
+				// 装载期通知面。）
 				m.fireOnActivated(id)
 				return nil
 			}
@@ -363,6 +410,18 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 		// （Destroying）：维持异步语义；失败路径的终局清理由 OnEvict 身份守卫逐出闭环。
 		return p, nil
 	}
+}
+
+// construct 调用用户工厂并 recover：远端激活跑在传输读循环上，工厂缺陷
+// 不得崩进程——panic 留痕计数后收敛为不可重试的 ErrFactoryPanic。
+func (m *Table) construct(f rans.Factory, id rans.ID) (ent rans.Entity, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.observeFactoryPanic(id, r)
+			ent, err = nil, ErrFactoryPanic
+		}
+	}()
+	return f(id), nil
 }
 
 // unregisterInstance 实例级条件注销（register-first）：注册已先行、

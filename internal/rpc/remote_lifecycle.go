@@ -36,41 +36,35 @@ const (
 // 终止——不留每实例恒漏 1 goroutine 的半开组合体），失败后的 Remote 不可
 // 复用，宿主重建重试。
 func (r *Remote) Start(ctx context.Context) error {
+	if err := r.Bind(ctx); err != nil {
+		return err
+	}
+	r.Accept()
+	return nil
+}
+
+// Bind 只绑定监听不接入（票 14 的 Start 次序拆分面）：返回实际地址并存
+// Addr——供 node 在同步首写成员键（键值携带真实地址）之后才 Accept。
+// 失败即终态（内部 Close 收口）。
+func (r *Remote) Bind(ctx context.Context) error {
 	addr := r.cfg.Addr
 	if addr == "" {
 		addr = defaultListenAddr
 	}
-	bound, err := r.conns.Listen(ctx, addr)
+	bound, err := r.conns.ListenBind(ctx, addr)
 	if err != nil {
 		_ = r.Close()
 		return fmt.Errorf("rans: listen: node %d: %w", r.cfg.NodeID, err)
 	}
 	r.addr.Store(&bound)
-	r.conns.StartHeartbeat(r.runCtx, heartbeatPingInterval, heartbeatPongTimeout)
-	r.startPeriodicTasks()
 	return nil
 }
 
-// startPeriodicTasks 起跑周期任务族（Start 内 listen 成功后调用）：
-//   - 看门狗（规格 §14.2 三形态）：缺省参数开跑，cfg.Watchdog 提供则覆盖
-//     （零值字段回落缺省）；激活卡死的收敛兜底（强弃）在此部署——
-//     无需进程重启；
-//   - 周期 checkpoint：CheckpointStore 已配置才接线（脏纪元门控在
-//     lifecycle.CheckpointSweep 复合体内）。
-//
-// 两者共享 runCtx（Shutdown/Close 停序收口）。Start 的 listen 对二次调用
-// 本就报错，本方法只在 listen 成功后到达恰一次。
-func (r *Remote) startPeriodicTasks() {
-	wdCfg := lifecycle.WatchdogConfig{}
-	if r.cfg.Watchdog != nil {
-		wdCfg = *r.cfg.Watchdog
-	}
-	go lifecycle.NewWatchdog(r.cfg.Manager, wdCfg).Run(r.runCtx)
-	if r.cfg.CheckpointStore != nil {
-		go lifecycle.NewCheckpointSweeper(r.cfg.Manager, lifecycle.CheckpointSweeperConfig{
-			Interval: r.cfg.CheckpointInterval,
-		}).Run(r.runCtx)
-	}
+// Accept 开始接入（Bind 的后半）+ 起连接心跳（票 14：同步首写成员键之
+// 后调用）。
+func (r *Remote) Accept() {
+	r.conns.StartAccept()
+	r.conns.StartHeartbeat(r.runCtx, heartbeatPingInterval, heartbeatPongTimeout)
 }
 
 // Addr 返回绑定地址（Start 前为空串）；testkit 据此建立 resolver 表。
@@ -198,9 +192,18 @@ func (r *Remote) unregisterNode() {
 	if !ok {
 		return
 	}
+	// 守卫注销需要本节点当前代际：未接线（NodeEpoch nil）或未取号（0）时
+	// 跳过注销——键交给 TTL 过期（守卫档不得退化为无条件删除）。
+	var epoch uint64
+	if r.cfg.NodeEpoch != nil {
+		epoch = r.cfg.NodeEpoch()
+	}
+	if epoch == 0 {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), drainUnregisterWindow) // 例外②：节点注销窗（drainUnregisterWindow 集中定义——排空 ctx 可能已耗尽，注销不该被跳过也不能因目录僵死挂死停序）
 	defer cancel()
-	if err := reg.UnregisterNode(ctx, r.cfg.NodeID); err != nil {
+	if err := reg.UnregisterNode(ctx, r.cfg.NodeID, epoch); err != nil {
 		log.Warn("rans/rpc: node unregister on drain failed",
 			"self", r.cfg.NodeID, "err", err)
 	}
@@ -236,6 +239,9 @@ func (r *Remote) OnConnectionLost(peer rans.NodeID) {
 	log.Debug("rans/rpc: peer lost", "self", r.cfg.NodeID, "peer", peer)
 	if r.cfg.LocationCache != nil {
 		r.cfg.LocationCache.InvalidateNode(peer)
+	}
+	if r.cfg.RoutingView != nil {
+		r.cfg.RoutingView.Invalidate() // 票 01：连接丢失=拓扑信号
 	}
 	r.gw.FailPendingForNode(peer, fmt.Errorf("rans: conn: node %d connection lost", peer))
 }

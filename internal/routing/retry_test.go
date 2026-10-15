@@ -207,7 +207,8 @@ func TestRetryRingRealBackoffTimingBounds(t *testing.T) {
 }
 
 // TestRetryRingCtxCancelDuringBackoffAborts ctx 在退避期间取消 → 中止且
-// 不再调 attempt，返回末次错误。
+// 不再调 attempt，收场为 CtxOutcome（票 13：取消→Canceled 的 *rans.Error，
+// 不再泄漏上一次尝试的错误）。
 func TestRetryRingCtxCancelDuringBackoffAborts(t *testing.T) {
 	rec := &attemptRecorder{fails: []error{sendFailed()}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -216,8 +217,8 @@ func TestRetryRingCtxCancelDuringBackoffAborts(t *testing.T) {
 		return time.Hour
 	}
 	got := InvokeWithBackoff(ctx, DefaultOptions(), cancellingBackoff, rec.attempt)
-	if !errors.Is(got, rec.fails[0]) {
-		t.Fatalf("cancelled-during-backoff error = %v, want last attempt error %v", got, rec.fails[0])
+	if rans.CodeOf(got) != rans.CodeCanceled {
+		t.Fatalf("cancelled-during-backoff error = %v (code=%v), want Canceled", got, rans.CodeOf(got))
 	}
 	if n := rec.count(); n != 1 {
 		t.Fatalf("attempts = %d, want 1 (cancel must abort before retry)", n)
@@ -225,20 +226,21 @@ func TestRetryRingCtxCancelDuringBackoffAborts(t *testing.T) {
 }
 
 // TestRetryRingCtxCancelBeforeBackoffAborts attempt 失败的同时取消 ctx：
-// 环进入退避时 ctx 已 done → 中止并返回末次错误，不再调 attempt。
+// 环进入退避时 ctx 已 done → 中止并收场为 CtxOutcome（票 13：取消→
+// Canceled），不再调 attempt。
 func TestRetryRingCtxCancelBeforeBackoffAborts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	calls := 0
-	stale := remoteNotFound() // 固定实例用于末次错误同一性断言
+	stale := remoteNotFound()
 	attempt := func(context.Context) error {
 		calls++
 		cancel() // 失败的同时 ctx 已取消
 		return stale
 	}
 	got := InvokeWithBackoff(ctx, DefaultOptions(), func(int) time.Duration { return 0 }, attempt)
-	if !errors.Is(got, stale) {
-		t.Fatalf("ctx-done-at-backoff error = %v, want last attempt error %v", got, stale)
+	if rans.CodeOf(got) != rans.CodeCanceled {
+		t.Fatalf("ctx-done-at-backoff error = %v (code=%v), want Canceled", got, rans.CodeOf(got))
 	}
 	if calls != 1 {
 		t.Fatalf("attempts = %d, want 1 (no retry when ctx done before backoff)", calls)

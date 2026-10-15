@@ -2,11 +2,10 @@ package rpc
 
 // 发件箱装配层行为锁（H11 决策 11/12 Tell 腿 + 停序③出站 flush 接线）：
 // 复用 remote_test.go 的回环双节点基座（startRemNode/resolveTable），时序
-// 断言走 channel。发件箱本体（分片 FIFO/满箱阻塞/指标）见 outbox_test.go。
+// 断言走 channel。发件箱本体（目标 FIFO/满箱阻塞/熔断/指标）见 outbox_test.go。
 
 import (
 	"context"
-	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -135,10 +134,9 @@ func TestRemoteTellThenCallOrdering_CrossNode(t *testing.T) {
 	}
 }
 
-// 4. 分片间并行不退化（守护锚）：一个分片的队头阻塞（目标节点 resolve
-// 恒失败，帧卡在发送重试段）不得拖慢其他分片的 Tell→Call——Call 请求帧
-// 入箱后按目标分片隔离，不引入跨分片全局阻塞。jam 节点与健康节点 2 刻意
-// 落在不同分片（同分片异目标互相排队是哈希分片的既有代价，不属本断言）。
+// 4. 跨目标并行不退化（守护锚，票 04 按目标分队列）：一个目标的发送腿
+// 阻塞（resolve 恒失败，帧卡在发送重试段）不得拖慢其他目标的 Tell→Call
+// ——Call 请求帧按目标隔离入队。
 func TestRemoteTellThenCallOrdering_MultiTarget(t *testing.T) {
 	dir := inmem.New()
 	rt := &resolveTable{}
@@ -155,12 +153,9 @@ func TestRemoteTellThenCallOrdering_MultiTarget(t *testing.T) {
 			return nil, nil
 		},
 	})
-	// jam 目标不进地址表：resolve 恒失败，其分片 worker 在发送重试段空转；
-	// 与节点 2 分片不同（缺省 16 分片下顺延到首个异分片节点号）。
+	// jam 目标不进地址表：resolve 恒失败，其专属 worker 在发送重试段空转
+	//（票 04 后按目标隔离——与节点 2 天然互不阻塞）。
 	jam := rans.NodeID(3)
-	for nodeA.rem.outbox.shardOf(jam) == nodeA.rem.outbox.shardOf(2) {
-		jam++
-	}
 	rt.set(map[rans.NodeID]string{1: nodeA.rem.Addr(), 2: nodeB.rem.Addr()})
 	ctx := context.Background()
 
@@ -188,60 +183,7 @@ func TestRemoteTellThenCallOrdering_MultiTarget(t *testing.T) {
 	}
 }
 
-// 5. 调用帧排队过预算的收场（健全性锁，与 4 相反——这里要的就是同分片
-// 队头阻塞）：jam 目标与节点 2 同分片，其 Tell 卡住分片 worker；预算
-// 300ms 的 Call 排队其后，必须按自身预算快速收场（Timeout 类，不因队头
-// 挂起），且测试窗口内对端从未收到该请求帧——过期帧由发送段按预算中
-// 止，不产生迟到执行。
-func TestRemoteCallQueuedBehindJamFailsAtBudget(t *testing.T) {
-	dir := inmem.New()
-	rt := &resolveTable{}
-	handled := make(chan string, 4)
-	nodeA := startRemNode(t, dir, rt, nodeSpec{id: 1})
-	nodeB := startRemNode(t, dir, rt, nodeSpec{
-		id: 2,
-		handle: func(_ context.Context, req any) (any, error) {
-			handled <- req.(string)
-			return "ok", nil
-		},
-	})
-	jam := rans.NodeID(3)
-	for nodeA.rem.outbox.shardOf(jam) != nodeA.rem.outbox.shardOf(2) {
-		jam++
-	}
-	rt.set(map[rans.NodeID]string{1: nodeA.rem.Addr(), 2: nodeB.rem.Addr()})
-	ctx := context.Background()
-
-	jamID := mustUUID(t, "call-jam-head")
-	if _, _, err := dir.Register(ctx, jamID, directory.Owner{Node: jam}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := nodeA.rem.SendOneWay(ctx, jamID, "stuck"); err != nil {
-		t.Fatalf("tell to jam target: %v", err)
-	}
-
-	id := mustUUID(t, "call-jam-victim")
-	if _, _, err := dir.Register(ctx, id, directory.Owner{Node: 2}, nil); err != nil {
-		t.Fatal(err)
-	}
-	cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, err := nodeA.rem.Call(cctx, id, "victim")
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("call queued behind a jammed shard head must fail at its own budget")
-	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("call took %v to fail; must be bounded by its 300ms budget, not the shard head", elapsed)
-	}
-	var re *rans.Error
-	if !errors.As(err, &re) || re.Code != rans.CodeTimeout {
-		t.Fatalf("call error = %v, want *rans.Error{Timeout}", err)
-	}
-	select {
-	case s := <-handled:
-		t.Fatalf("peer must not receive the expired call frame in-window, got %q", s)
-	default:
-	}
-}
+// 5.（票 04 删除）原「同分片队头阻塞下排队过预算的 Call 按预算收场」的
+// 分片前提随按目标分队列消亡——同目标排队形态由包内单测
+// TestOutbox_CallFrameExpiredBudgetAbortsAtSend 钉住，端到端「排队过预算
+// 零执行」由票 05 的 testkit 红测接管。

@@ -8,6 +8,7 @@ package testkit
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/directory"
@@ -42,7 +43,10 @@ func TestStaleRouting_ConvergesWithoutWatcher(t *testing.T) {
 	var id rans.ID
 	var owner int
 	for i := 0; i < 10; i++ {
-		cand := mustID(t, "counter", "stale-conv")
+		// 逐次新身份（票 03 语义适配：首激活候选含本节点——同 id 一旦
+		// 落在调用方即本地命中，重试同 id 永不改判；原固定 key 在排除
+		// self 的旧放置下碰巧成立）。
+		cand := mustID(t, "counter", fmt.Sprintf("stale-conv-%d", i))
 		if _, err := n2.Call(ctx, cand, 0); err != nil {
 			t.Fatalf("seed call: %v", err)
 		}

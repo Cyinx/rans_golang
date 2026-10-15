@@ -35,7 +35,7 @@ func TestHandshakeVersionIntersectionTable(t *testing.T) {
 		{"[2,2]x[3,3] disjoint", 2, 2, 3, 3, false},
 		{"[3,5]x[5,6] intersect at 5", 3, 5, 5, 6, true},
 		{"[3,3]x[3,5] intersect at 3", 3, 3, 3, 5, true},
-		{"[4,4]x[3,3] disjoint", 4, 4, 3, 3, false},
+		{"[5,5]x[4,4] disjoint", 5, 5, 4, 4, false},
 		{"[1,9]x[5,5] intersect", 1, 9, 5, 5, true},
 	}
 	for _, tc := range cases {
@@ -60,24 +60,24 @@ func TestHandshakeDecodeVersionGate(t *testing.T) {
 		raw[3] = byte(vmax >> 8)
 		return raw
 	}
-	// [3,3]×[3,3]：通。
-	if _, err := DecodeHandshake(mk(3, 3)); err != nil {
-		t.Fatalf("[3,3] must decode: %v", err)
+	// [5,5]×[5,5]：通。
+	if _, err := DecodeHandshake(mk(5, 5)); err != nil {
+		t.Fatalf("[5,5] must decode: %v", err)
 	}
-	// [3,5]×[3,3]：交于 3，通（未来对端向前兼容本端）。
-	if _, err := DecodeHandshake(mk(3, 5)); err != nil {
-		t.Fatalf("[3,5] must decode against [3,3]: %v", err)
+	// [5,7]×[5,5]：交于 5，通（未来对端向前兼容本端）。
+	if _, err := DecodeHandshake(mk(5, 7)); err != nil {
+		t.Fatalf("[5,7] must decode against [5,5]: %v", err)
 	}
-	// [2,2]×[3,3]：拒——ErrHandshakeVersion（非畸形，版本语义错误）。
-	if _, err := DecodeHandshake(mk(2, 2)); !errors.Is(err, ErrHandshakeVersion) {
-		t.Fatalf("[2,2] must be rejected with ErrHandshakeVersion, got %v", err)
-	}
-	// [4,4]×[3,3]：拒——对端只讲 ≥4，本端到不了。
+	// [4,4]×[5,5]：拒——ErrHandshakeVersion（v4 集群属断点前版本）。
 	if _, err := DecodeHandshake(mk(4, 4)); !errors.Is(err, ErrHandshakeVersion) {
 		t.Fatalf("[4,4] must be rejected with ErrHandshakeVersion, got %v", err)
 	}
+	// [6,6]×[5,5]：拒——对端只讲 ≥6，本端到不了。
+	if _, err := DecodeHandshake(mk(6, 6)); !errors.Is(err, ErrHandshakeVersion) {
+		t.Fatalf("[6,6] must be rejected with ErrHandshakeVersion, got %v", err)
+	}
 	// 区间倒置：畸形。
-	if _, err := DecodeHandshake(mk(5, 3)); !errors.Is(err, codec.ErrMalformed) {
+	if _, err := DecodeHandshake(mk(6, 4)); !errors.Is(err, codec.ErrMalformed) {
 		t.Fatalf("inverted version range must be malformed, got %v", err)
 	}
 }

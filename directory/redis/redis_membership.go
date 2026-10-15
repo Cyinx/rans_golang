@@ -28,6 +28,8 @@ type nodeValue struct {
 	Kinds    []string `json:"kinds"`
 	Draining bool     `json:"draining,omitempty"`
 	Epoch    uint64   `json:"epoch,omitempty"`
+	ProtoMin uint16   `json:"pmin,omitempty"`
+	ProtoMax uint16   `json:"pmax,omitempty"`
 }
 
 // encodeNodeValue 编码判活键值：nil kinds 归一为 []（线上格式恒为 JSON
@@ -43,6 +45,8 @@ func encodeNodeValue(info directory.NodeInfo) (string, error) {
 		Kinds:    kinds,
 		Draining: info.Draining,
 		Epoch:    info.Epoch,
+		ProtoMin: info.ProtoMin,
+		ProtoMax: info.ProtoMax,
 	})
 	if err != nil {
 		return "", fmt.Errorf("rans: register: encode node value: %w", err)
@@ -92,6 +96,43 @@ func (d *Directory) RegisterNode(ctx context.Context, node rans.NodeID, info dir
 		return err
 	}
 	return nil
+}
+
+// RenewNode 比对续期（directory.NodeRegistry 契约）：判活键上的单键
+// luaRenew——键缺席 → RenewAbsent 且不重建；键内代际更大 →
+// RenewSuperseded 且值不动；否则覆写并续 TTL → RenewRenewed，总表照旧
+// 双写（撕裂容忍面同 RegisterNode）。
+func (d *Directory) RenewNode(ctx context.Context, node rans.NodeID, info directory.NodeInfo) (directory.RenewResult, error) {
+	val, err := encodeNodeValue(info)
+	if err != nil {
+		return 0, err
+	}
+	res, err := scriptRenew.Run(ctx, d.cli,
+		[]string{d.nodeKey(node)},
+		[]interface{}{val, d.heartbeatTTL.Milliseconds(), info.Epoch},
+	).Slice()
+	if err != nil {
+		return 0, err
+	}
+	if len(res) != 1 {
+		return 0, fmt.Errorf("rans: renew: script reply %v, want 1-element array", res)
+	}
+	switch v := res[0].(type) {
+	case int64:
+		switch v {
+		case 1:
+			// Renewed：总表照旧双写（撕裂容忍面同 RegisterNode）。
+			return directory.RenewRenewed, d.cli.HSet(ctx, d.rosterKey(),
+				strconv.Itoa(int(node)),
+				strconv.FormatInt(time.Now().UnixMilli(), 10)).Err()
+		case -1:
+			return directory.RenewSuperseded, nil
+		default:
+			return directory.RenewAbsent, nil
+		}
+	default:
+		return 0, fmt.Errorf("rans: renew: script reply %v, want integer element", res)
+	}
 }
 
 // NextNodeEpoch 取节点代际（directory.NodeRegistry 契约）：{reg} 键族全局
@@ -217,6 +258,23 @@ func (d *Directory) liveNodes(ctx context.Context) (map[rans.NodeID]nodeValue, e
 		}
 	}
 	return live, nil
+}
+
+// Nodes 存活节点全量信息（directory.NodeRegistry 契约；含 draining）：
+// liveNodes 判活收敛内核直出。
+func (d *Directory) Nodes(ctx context.Context) (map[rans.NodeID]directory.NodeInfo, error) {
+	live, err := d.liveNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[rans.NodeID]directory.NodeInfo, len(live))
+	for n, v := range live {
+		out[n] = directory.NodeInfo{
+			Addr: v.Addr, Kinds: v.Kinds, Draining: v.Draining,
+			Epoch: v.Epoch, ProtoMin: v.ProtoMin, ProtoMax: v.ProtoMax,
+		}
+	}
+	return out, nil
 }
 
 // NodeIDs 返回成员视图当前节点集（升序去重，directory.NodeRegistry）：

@@ -104,7 +104,7 @@ var Kinds = map[string]rans.Factory{
 // RansShapes 消息形状清单：每消息每字段一条 "TypeName:Field:Order:Type"
 // （Type 为源码形态类型串），零字段消息一条仅类型名条目（增删/改名零字段
 // 消息同样翻指纹），整体字典序。init 里登记进 codec 全量形状集——H9 起
-// codec.SchemaDigest() 即该集合摘要，随握手 v3 观测（漂移告警计数，
+// codec.SchemaDigest() 即该集合摘要，随握手观测（漂移告警计数，
 // StrictSchema 拒连）；形状声明随生成物自动接线，不经 node 配置传入。
 // 变量与登记 init 恒成对生成。
 var RansShapes = []string{

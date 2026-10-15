@@ -44,7 +44,7 @@ func (e *reenterRaceEntity) Handle(ctx context.Context, msg any) (any, error) {
 				<-e.release
 				return nil, nil
 			},
-			func(any, error) { e.flag = true })
+			func(context.Context, any, error) { e.flag = true })
 		return nil, nil
 	case "get":
 		return e.flag, nil

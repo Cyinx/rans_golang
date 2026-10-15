@@ -94,6 +94,15 @@ func (s *FaultStore) Get(ctx context.Context, id rans.ID) ([]byte, bool, error) 
 	return s.Store.Get(ctx, id)
 }
 
+// HighWater 透传底座高水位（嵌入 Store 接口会遮蔽该能力面——不转发则
+// 激活下限在全部 FaultStore 测试下静默失效；底座无该面时 (0,false,nil)）。
+func (s *FaultStore) HighWater(ctx context.Context, id rans.ID) (uint64, bool, error) {
+	if hwr, ok := s.Store.(checkpoint.HighWaterReader); ok {
+		return hwr.HighWater(ctx, id)
+	}
+	return 0, false, nil
+}
+
 // Put 透传 + 延迟 + 注入判定（注入命中计入统计）。
 func (s *FaultStore) Put(ctx context.Context, id rans.ID, incarnation uint64, snapshot []byte) error {
 	s.mu.Lock()

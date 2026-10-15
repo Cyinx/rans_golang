@@ -6,7 +6,6 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -84,12 +83,15 @@ var _ connSender = (*tcp.Manager)(nil)
 // 重连换连接）。Gateway 自身不构造应答，写 SourceNodeID 的职责在调用方
 // （分发器 / Remote）。
 type Gateway struct {
+	// cancelQueue 取消通知的发件箱（票 12；SetCancelQueue 装配期注入，
+	// nil = 直发形态）。
+	cancelQueue   *Outbox
 	conns         connSender
 	resolve       func(ctx context.Context, n rans.NodeID) (string, error)
 	pool          *wire.PagePool
 	defTimeout    time.Duration // 无 deadline 调用的防御缺省预算（默认 30s）
 	retryInterval time.Duration // 发送重试间隔（默认 2s；测试可缩短）
-	ids           wire.IDGen    // 进程内单调（陷阱 7）
+	ids           *wire.IDGen   // 进程内单调（陷阱 7）；随机起点，跨同号重启不复用
 
 	sweepInterval time.Duration // deadline 扫描周期（默认 250ms；测试可缩短）
 
@@ -134,6 +136,7 @@ func NewGatewayWithSweep(conns connSender, resolve func(ctx context.Context, n r
 		pool:          pool,
 		defTimeout:    defTimeout,
 		retryInterval: defaultRetryInterval,
+		ids:           wire.NewIDGen(),
 		sweepInterval: sweepInterval,
 		pt:            newPendingTable(defaultMaxPending),
 		stopCh:        make(chan struct{}),
@@ -142,6 +145,13 @@ func NewGatewayWithSweep(conns connSender, resolve func(ctx context.Context, n r
 	}
 	go g.sweepLoop()
 	return g
+}
+
+// RetargetPending 改写 in-flight 请求的目标节点（票 12：重定向提示收端
+// 的 pending 跟随面——仲裁输家把请求转发给赢家后，源的取消/判停通知随
+// 之改道赢家）。from 守卫由 pendingTable.retarget 承担。
+func (g *Gateway) RetargetPending(id uint64, from, to rans.NodeID) bool {
+	return g.pt.retarget(id, from, to)
 }
 
 // Close 停止 deadline 扫描器 goroutine（幂等，可重复调用）。调用方须先让
@@ -312,7 +322,9 @@ func (g *Gateway) SendRequestQueued(ctx context.Context, target rans.NodeID, hdr
 		}
 		return r.hdr, r.body, nil
 	case <-ctx.Done():
-		return wire.Header{}, nil, g.canceledOutcome(ctx, target, hdr)
+		// 取消跟随（票 12）：目标取 pending 当前值（重定向提示可能已改道
+		// 赢家），不用发送时捕获的 target。
+		return wire.Header{}, nil, g.canceledOutcome(ctx, g.pt.currentTarget(id, target), hdr)
 	}
 }
 
@@ -413,85 +425,4 @@ func (g *Gateway) SendOneWay(ctx context.Context, target rans.NodeID, hdr wire.H
 // 摘除与缓存清扫仍由单向帧耗尽和连接丢失事件承载。
 func (g *Gateway) SendOneWayBounded(ctx context.Context, target rans.NodeID, hdr wire.Header, envBytes []byte, deadline time.Time) error {
 	return g.sendWithRetry(ctx, target, hdr, envBytes, deadline, false)
-}
-
-// sendWithRetry 端点发送韧性：瞬时
-// 发送失败（resolve 失败/拨号失败/连接未就绪/写出错误）按 retryInterval
-// 间隔重试至多 maxSendRetries 次，ctx 取消即止；耗尽后触发
-// OnEndpointTerminated 并返回包装的末次错误。body 所有权仅在最终成功的
-// 那次尝试随 Send 移交连接，失败尝试不移交（重试可安全复用同一 body）。
-// 首次重试免退避（attempt 1 即时），自第二次起按 retryInterval 线性退避：
-// 收敛期的瞬时失败（退役连接/陈旧条目/就绪前死亡）在首次即时重试后经 byNode
-// 即刻落到存活连接，不该吃 2s 间隔；真端点失联仍有后续退避兜底。
-//
-// deadline（零值 = 无预算，SendOneWay 形态）：请求-响应调用的发送阶段与
-// 等待段共用 pending deadline——预算耗尽即收场（此前尝试全部失败 ⟹ 消息
-// 从未送出，按 Unavailable+SendFailed 确定未投递收场；不触发端点判停——节点未必
-// 失联，是本请求没了预算）。退避启动前预检：退避全程已在预算外时不再白等。
-//
-// notifyExhausted 控制重试耗尽是否触发端点判停：true（单向/直发形态）
-// ——FailPendingForNode 摘除该节点全部在途表项并投递 ConnectionLost；
-// false（调用帧发送面）——判停会把本请求刚耗尽的表项摘走、等待段读到
-// ConnectionLost（歧义类），覆盖掉 fail 回投的确定未投递形态，夺走非幂
-// 等调用方的无条件重试权。
-func (g *Gateway) sendWithRetry(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte, deadline time.Time, notifyExhausted bool) error {
-	var lastErr error
-	for attempt := 0; attempt <= maxSendRetries; attempt++ {
-		if attempt > 1 && !errors.Is(lastErr, tcp.ErrRetiring) {
-			if !deadline.IsZero() && !time.Now().Add(g.retryInterval).Before(deadline) {
-				return g.sendBudgetExhausted(target, lastErr)
-			}
-			t := time.NewTimer(g.retryInterval)
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				t.Stop()
-				return ctxOutcome(ctx)
-			}
-		}
-		err := g.conns.SendToNode(ctx, target, g.resolve, hdr, body)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			return g.sendBudgetExhausted(target, err)
-		}
-		if errors.Is(err, tcp.ErrManagerClosed) {
-			// 管理器已关停（Stop/Drain 后的残余发送）：终态，重试无意义。
-			return fmt.Errorf("%w: %w", errSendFailed, err)
-		}
-		if ctx.Err() != nil {
-			return ctxOutcome(ctx)
-		}
-	}
-	if notifyExhausted {
-		g.fireEndpointTerminated(target)
-	}
-	// Unavailable+SendFailed 形态先行（统一错误模型）：连接类失败＝
-	// 确定未投递，分类唯一表归 RetryUnconditional。
-	return fmt.Errorf("%w: send to node %d failed after %d retries: %w",
-		errSendFailed, target, maxSendRetries, lastErr)
-}
-
-// sendBudgetExhausted 发送阶段的请求预算收场：所有尝试都失败＝消息从未
-// 送出连接，按确定未投递哨兵包装（Classify 归 RetryUnconditional——环内
-// 下一 attempt 以新预算重走路由）。
-func (g *Gateway) sendBudgetExhausted(target rans.NodeID, lastErr error) error {
-	if lastErr != nil {
-		return fmt.Errorf("%w: send to node %d aborted at request deadline: %w",
-			errSendFailed, target, lastErr)
-	}
-	return fmt.Errorf("%w: send to node %d aborted at request deadline",
-		errSendFailed, target)
-}
-
-// fireEndpointTerminated 触发端点判停（锁外调用构造期注入的回调——
-// NewGateway 的 onEndpointTerminated 参数，构造期定死）。
-func (g *Gateway) fireEndpointTerminated(node rans.NodeID) {
-	if g.onTerminated == nil {
-		log.Warn("rans/rpc: endpoint terminated after send retries exhausted", "node", node)
-		return
-	}
-	g.onTerminated(node)
 }

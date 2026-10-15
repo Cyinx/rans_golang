@@ -1,9 +1,39 @@
-# rans_golang 消费方升级通知（v0.7.0 → v0.24.0 合并稿）
+# rans_golang 消费方升级通知（v0.7.0 → v0.26.0 合并稿）
 
 > 面向：wanju_agent_server 等所有 `github.com/cyinx/rans_golang` 消费方。
 > 用途：一次性转达 v0.7.0 起的全部消费方可见变更；逐版本细节以仓库
 > `CHANGELOG.md` 与 tag 注记为准。**尚未接入的消费方直接按 v0.22.0 接入，
 > 只需读「新接入」一节。**
+
+## v0.26.0 专项升级要点（review14 修复批，滚动不兼容）
+
+**本版是断点版本：不支持滚动升级——先停全部节点、升二进制、再起全部。**
+`node.Start` 的启动代际检查会把混版本启动拦下：K8s StatefulSet 缺省
+`RollingUpdate` 会在新 pod 处失败——改 `OnDelete` 或缩容到 0 再升。
+握手版本升至 v4（v3 及更早节点直接拒连）；成员键值新增协议区间字段
+（`pmin`/`pmax`），未携带该字段的旧版本节点与 v4 节点互不相容。
+
+- **Redis 前提**（成员面「一死永死」的正确性依赖）：AOF 至少
+  `everysec`；`maxmemory-policy noeviction`；独立实例或独立 DB（避免
+  共享实例的键逐出）。Redis 故障转移窗口内的激活/围栏仍是尽力而为。
+- **宿主自持存储（如 MySQL）**：接 `node.Config.FencingFloor`——返回
+  该实体已被宿主存储接受的最大纪元（0=无；每次激活前调用，报错则激活
+  失败可重试）。建议升级后核对存量行纪元与当前目录纪元：下限钩子只保
+  新激活取号，不回填历史行。
+- **成员键丢失即批量止损（设计行为，不是故障）**：Redis 丢键/逐出（或
+  进程暂停 ≥ 成员 TTL）会让该节点当轮围栏销毁全部本地实体并重取号；
+  实体随访问重激活恢复（计数/状态从 Store 恢复），
+  `rans.membership.resurrected` 计数可见。
+- **配置迁移**：`node.KindOptions[k].Watchdog` → `node.Config.Watchdog.
+  KindOverrides[k]`（前者是从未被读取的死字段，已删除）；直接构造
+  `rpc.Config` 的用法删除 `Watchdog`/`CheckpointStore`/
+  `CheckpointInterval`（周期任务改由 node 装配，Standalone 亦生效）。
+- **第三方 `directory.NodeRegistry` 实现**：须补 `RenewNode`（比对续期
+  三态）与 `Nodes`（存活全量信息）方法，`UnregisterNode` 签名加纪元
+  参数（0=无条件、非 0 比较删除）；成员键值需承载 `pmin`/`pmax`。
+- **新指标**：`rans.ownership.{takeover_won,stale_fenced,lost_sent,
+  lost_received}`、`rans.membership.{resurrected,superseded}`；
+  `rans.lease.self_fenced` 口径改为按轮计数（原按实体）。
 
 ## v0.24.0 专项升级要点（edge 退役 + 全仓审查修复批，2026-10-13）
 
@@ -191,7 +221,7 @@ no-op）、本地 Tell 的 ReenterAfter 不再 panic、acceptLoop 对 EMFILE 退
 | `Manager.Destroy`、`Manager.DestroyCtx` | `Node.Destroy(ctx, id) error` | 只作用于本地实例，非本地返回 `Reason=NotLocal` |
 | `Manager.MigrateAsync`、`Remote.MigrateAsync` | `Node.Migrate(ctx, id) error` | 去掉 Async；同上 NotLocal 语义 |
 | `Manager.SetKindIdlePolicy`、`OffloadIdleAsync`、`lifecycle.RebalancerService` | `node.Config.KindOptions[k].Idle` + `node.Config.Rebalance` | 自动执行，不再暴露手动入口 |
-| `lifecycle.WatchdogConfig`、`WatchdogParams`、`KindOverrides` | `node.Config.Watchdog` + `node.Config.KindOptions[k].Watchdog` | |
+| `lifecycle.WatchdogConfig`、`WatchdogParams`、`KindOverrides` | `node.Config.Watchdog` + `node.Config.Watchdog.KindOverrides[k]` | |
 | `remote.LocalOnlyKinds` | internal（启用 edge 时 node 自动设置） | |
 | `remote.Placement`、`remote.KindPlacement`、`Manager.SetPlacement` | `node.Placement`（首次激活与迁移选点共用） | 候选集由 node 计算，自定义策略实现 `Pick(kind, self, candidates)` |
 | `membership.NewHeartbeatService` 及其 interval | internal；间隔为 `node.Config.Lease.Interval` | |
@@ -308,7 +338,7 @@ no-op）、本地 Tell 的 ReenterAfter 不再 panic、acceptLoop 对 EMFILE 退
 - **「Activate/Deactivate 可安全按令牌读写」从前提条件变为现实验**
   （v0.20.0 ②中「6.1 把装载挪进 Activate 后自动获得该保证」的预期落地）：
   交接窗保证快照先于 Deactivate、终快照零丢失（EX9/EX10）——消费方可在
-  Activate 装载状态、在 Deactivate/Handle 按 `pawnite.Fencing(ctx)` 令牌
+  Activate 装载状态、在 Deactivate/Handle 按 `rans.Incarnation(ctx)` 令牌
   条件写自有存储，优雅停机/钝化不再丢已确认写；
 - **6.1 开工门槛达成**（ISSUES V3③）：6.1（MySQL checkpoint.Store、钝化、
   滚动 drain）的前置「HR1+HR2 全部落地」已满足——钝化面 =
@@ -499,7 +529,7 @@ arbitration 示例为可运行形态）。有状态实体必须配 `CheckpointSt
   单调纪元（redis=`rans:{dir}:inc` 共享 Hash，无 TTL），三个快照写点
   （checkpoint/钝化/迁移）全部携带——被强弃 incarnation 的晚落 Put 由
   Store 侧拒绝（`ErrStaleIncarnation`）；实体 Handle 与 Activate/Deactivate
-  钩子的 ctx 都携带纪元（`pawnite.Fencing(ctx)` 读取），宿主直写自有存储
+  钩子的 ctx 都携带纪元（`rans.Incarnation(ctx)` 读取），宿主直写自有存储
   时以令牌做条件写。执行卡死强弃的 zombie 不启动 Deactivate；迁移卡死
   强弃后迟回 Won 的续体会启动 Deactivate 且收已取消 ctx（消费端三面合流
   select 依赖的落点）；双实例并发窗口上界=该 kind 生效停驻阈值
@@ -522,6 +552,30 @@ arbitration 示例为可运行形态）。有状态实体必须配 `CheckpointSt
   收口原语，宿主停序建议切换（v0.14.0）；
 - Redis Cluster 支持：`redis.Options.Addrs` 传种子列表即 cluster/哨兵形态
   （`{reg}`/`{dir}` 双原子域已真集群实测；DB 须 0）（v0.11.0–v0.13.1）。
+
+## v0.27.0 升级要点（断点：先停全部再升）
+
+- **停机升级**：StatefulSet 缺省 RollingUpdate 会在启动代际检查处失败——改 `OnDelete` 或缩容到 0 再升；握手 v4→v5，混版本集群互拒。
+- **Go API 迁移映射**（全部为编译期破坏，改完即完）：
+
+| 旧 | 新 |
+|---|---|
+| `nc.Lease.Interval` / `nc.Lease.SelfFence` | `nc.Liveness.Interval` / `nc.Liveness.SelfFence`（`LeaseConfig` → `LivenessConfig`） |
+| `nc.Outbox.Shards` | 删除（按目标分队列，无分片参数） |
+| `rans.ReenterAfter(ctx, work, then)` 的 `then func(v, err)` | `then func(ctx, v, err)`（续体 ctx 可用于出站调用；其内 `rans.Defer` panic——终局已由运行时收场） |
+| 指标名 `rans.lease.self_fenced` | `rans.membership.self_fenced` |
+
+- **Redis 配置**：哨兵（`MasterName`）、ACL（`Username`）、TLS
+  （`TLSConfig`）、单种子 Cluster（`Cluster: true`）现可配；ctx 预算
+  恒约束 Redis IO（慢命令被调用方 deadline 截断——此前最坏十余秒）。
+- **墓碑 TTL**（可选）：`TombstoneTTL > 0` 需纪元下限来源
+  （`HighWaterReader` Store 或 `FencingFloor`——`node.New` 校验拒绝）；
+  容量估算 ≈150 B × 曾激活实体数。
+- **宿主围栏**：自持存储（如 MySQL）直写的围栏契约与正确 SQL 配方见
+  README「宿主围栏契约」节——原升级通知中的 `ON DUPLICATE KEY UPDATE`
+  配方不可用（不支持 WHERE，无法表达严格小于拒绝）。
+- **互通前提**：与 rans_rust 的互通自 v0.20.0 后不成立（当前不互通）；
+  Go 侧金向量基准见 `testdata/vectors/`。
 
 ## 兼容性矩阵
 
@@ -552,11 +606,11 @@ rans 保持旧行为——正常装配走 redis/inmem 目录时不会出现 0）
   元数据行），写入前比较；旧纪元写入丢弃并留痕（zombie 续体写旧文件
   的病根与 checkpoint 同治）。
 - **宿主直写自有存储**（不经 checkpoint.Store 的业务写）：在 Handle/
-  Activate/Deactivate 内 `inc, ok := pawnite.Fencing(ctx)` 取令牌随写请求
+  Activate/Deactivate 内 `inc, ok := rans.Incarnation(ctx)` 取令牌随写请求
   下发，存储侧同样条件写——迟回的 zombie Handle（慢 LLM 调用事后返回）
   携带旧纪元即被拒。
 
-围栏取号成本：每次激活一次目录往返（redis HINCRBY 单键）；仲裁输家消耗
+围栏取号成本：每次激活一次目录往返（节点代际启动取号一次全程携带；仲裁输家消耗
 号段是正常现象（跳号无害，只求单调）。
 
 ## wanju_agent_server SSE→WS 迁移评估要点（v0.19.0，edge E3 交付面）

@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/pawnite"
 )
 
@@ -132,6 +134,21 @@ func Migrate(ctx context.Context, tbl *activation.Table, id rans.ID) error {
 		// 前置失败（并发销毁/二次迁移抢窗）：pawnite 语义原样透传，零副作用。
 		return err
 	default:
+		// stale 判输=源快照被更新的化身拒绝（Store 侧 CAS）：源实例确定
+		// 失主——围栏 + 实例身份守卫异步销毁（不回退 Active 继续服务）。
+		if cause != nil && errors.Is(cause, checkpoint.ErrStaleIncarnation) {
+			p.Fence()
+			tbl.MetricsRegistry().Counter(metrics.NameOwnershipStaleFenced,
+				"stale-incarnation writes that fenced or dropped the writing instance").Add(1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), staleDestroyBudget)
+				defer cancel()
+				if derr := DestroyPawn(ctx, tbl, id, p); derr != nil {
+					log.Warn("rans/activation: stale migration source destroy failed (entity stays fenced)",
+						"uuid", id.String(), "err", derr)
+				}
+			}()
+		}
 		return migrationLossError(migCtx, err, cause)
 	}
 }
@@ -221,11 +238,22 @@ func migCore(ctx context.Context, tbl *activation.Table, id rans.ID, ent rans.En
 		// 主张不得换锁，按确定性拒绝判输（无取消签名，输因不被预算遮蔽）。
 		return pawnite.MigrationOutcome{}, errOwnerNotCaptured
 	}
+	// 迁移目标代际（票 15）：registry 形态必须取到存活目标的真实代际——
+	// 取不到（目标不可见/读失败）即迁移失败，不再以 {target, 0} 换锁
+	//（epoch-0 归属是遗留形态，写给它只会制造下一个待接管条目）。目
+	// 标端激活闭包收到的换锁期望与随迁包源纪元的围栏语义都以真实代际
+	// 为前提。registry-less 形态无代际面，恒 0 换锁（0==0 分支 2/3 语义
+	// 不变）。
 	targetEpoch := uint64(0)
 	if reg, ok := tbl.Directory().(directory.NodeRegistry); ok {
-		if ep, alive, err := reg.NodeEpoch(ctx, target); err == nil && alive {
-			targetEpoch = ep
+		ep, alive, err := reg.NodeEpoch(ctx, target)
+		if err != nil {
+			return pawnite.MigrationOutcome{}, fmt.Errorf("rans: migrate: target %d epoch read: %w", target, err)
 		}
+		if !alive {
+			return pawnite.MigrationOutcome{}, fmt.Errorf("rans: migrate: target %d not alive in member view", target)
+		}
+		targetEpoch = ep
 	}
 	won, newInc, _, err := tbl.Directory().Transfer(ctx, id, expected,
 		directory.Owner{Node: target, Epoch: targetEpoch})

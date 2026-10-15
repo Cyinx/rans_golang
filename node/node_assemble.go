@@ -18,20 +18,21 @@ import (
 	"github.com/cyinx/rans_golang/internal/routing"
 	"github.com/cyinx/rans_golang/internal/rpc"
 	"github.com/cyinx/rans_golang/internal/testhooks"
+	"github.com/cyinx/rans_golang/internal/wire"
 )
 
-// New 按 QUICKSTART 装配序收编一个节点（目录来源三分支、续租/轮询/放置
+// New 按 QUICKSTART 装配序收编一个节点（目录来源三分支、存活节拍/轮询/放置
 // 缺省、remote 装配、lease tracker、缓存失效钩子、指标注册）。
 // 目录来源：Directory.Injected 注入（调用方持有）> Directory.Redis 自建
 // （Shutdown 时关闭）> 缺省 inmem（单节点形态）。inmem 形态的地址解析缺
 // 省 = 自解析（本节点 → Start 后实际地址；其他节点号报错——单节点形态无
 // 合法远端，多节点 in-process 测试经 TestHooks.Resolve 注入共享表）；
-// redis 形态的解析/放置/续租/轮询缺省全部内置。装配失败返回错误并关闭
+// redis 形态的解析/放置/存活节拍/轮询缺省全部内置。装配失败返回错误并关闭
 // 自建目录（注入目录归调用方），不留半开组合体。不阻塞（无网络 IO——
 // redis 目录的连接懒建于 Start）；非并发安全（装配期单线程约定——构造
 // 一次给全，无运行期 Set 面）。
 //
-// 配置一次给全：激活表的钩子/续租接线/迁移注入面/闲置策略全部经 Options
+// 配置一次给全：激活表的钩子/存活节拍接线/迁移注入面/闲置策略全部经 Options
 // 在构造期定死；随迁包两端由 rpc.New 经 BindMigrationPackages 在装配期
 // 补齐（Start 前单写，之后同样不可变）。
 func New(cfg Config) (*Node, error) {
@@ -51,7 +52,7 @@ func New(cfg Config) (*Node, error) {
 	}
 	n := &Node{cfg: cfg, dir: dir, closeDir: closeDir, mreg: mreg}
 	// 例外①（spec §5.1）：节点根 ctx（进程级生命周期）——Start 的调用方
-	// ctx 只辖监听建立；周期体（续租/存活/轮询/闲置回收）挂本 ctx，由
+	// ctx 只辖监听建立；周期体（存活/轮询/闲置回收）挂本 ctx，由
 	// Shutdown/Close 的停序 cancel 收口。
 	n.runCtx, n.runCancel = context.WithCancel(context.Background()) // 例外①（见上注）
 	// 位置缓存先于激活表构造（缓存失效钩子经 Options 引用它）。
@@ -60,8 +61,11 @@ func New(cfg Config) (*Node, error) {
 	// 迁移同走 PickForKind，候选只含声明承载该 kind 的节点）。
 	bridge := &placementBridge{policy: cfg.Placement, scanner: kindScannerOf(dir)}
 	opts := mgr.Options{
-		Placement: bridge.PickForKind,
+		Placement: bridge.PickForKindMigrate, // 迁移选点排除 self（票 03 两面分立）
 		Store:     cfg.Store,
+		Metrics:   mreg,
+		// 宿主纪元下限钩子透传（nil = 无——语义见 Config.FencingFloor）。
+		FencingFloor: cfg.FencingFloor,
 		// 位置缓存失效/更新钩子（规格 §9.2/陷阱 14 六类中的本地三类；
 		// 组装根构造期直接接线）：
 		// ① 本地销毁 → Invalidate（目录注销+本地逐出完成后触发）；
@@ -94,26 +98,46 @@ func New(cfg Config) (*Node, error) {
 		// 节点存活信号（独立接线面）：目录实现 NodeRegistry 才构造
 		//（inmem 等基础面无成员键语义，不构造）。
 		if reg, ok := dir.(directory.NodeRegistry); ok {
-			selfFenced := mreg.Counter(metrics.NameLeaseSelfFenced,
-				"self-fence triggered (membership writes failing past threshold)")
+			// 按轮计数（每触发一轮恰一次：钩子从逐实体计改为按轮计）。
+			selfFenced := mreg.Counter(metrics.NameMembershipSelfFenced,
+				"self-fence rounds triggered (membership writes failing past threshold)")
+			// fenceLocal 实例身份围栏 + 异步 Retire 止损：捕获发生在围栏时刻
+			//（销毁时才读 InstanceOwner 会误杀换代后的新化身）；keep≠0 保留
+			// 新代际实例（换代第二遍）。
+			fenceLocal := func(keep uint64) int {
+				pred := func(*directory.Owner) bool { return true }
+				if keep != 0 {
+					pred = func(o *directory.Owner) bool { return o.Epoch != keep }
+				}
+				refs := n.mgr.FenceWhere(pred)
+				if len(refs) > 0 {
+					go func(refs []mgr.PawnRef) {
+						for _, r := range refs {
+							// 例外②：止损销毁预算（成员面循环不等待本 goroutine）。
+							ctx, cancel := context.WithTimeout(context.Background(), staleDestroyBudget)
+							_ = lifecycle.RetirePawn(ctx, n.mgr, r.ID, r.Pawn)
+							cancel()
+						}
+					}(refs)
+				}
+				selfFenced.Add(1)
+				return len(refs)
+			}
 			lv, err := membership.NewLiveness(membership.LivenessConfig{
 				Reg:       reg,
 				Self:      cfg.NodeID,
 				Interval:  n.leaseInterval(),
-				SelfFence: cfg.Lease.SelfFence,
+				SelfFence: cfg.Liveness.SelfFence,
 				MemberTTL: reg.MemberTTL(),
-				Fence: func(id rans.ID) {
-					selfFenced.Add(1)
-					n.mgr.Fence(id)
+				Fence:     fenceLocal,
+				OnSuperseded: func() {
+					// 让位（NodeID 重号）：封表 + 自关（新激活不可重试拒绝）。
+					n.mgr.Seal()
+					go func() { _ = n.Close() }()
 				},
-				LocalIDs: n.mgr.LocalIDs,
-				OnSelfFenceLost: func(ctx context.Context, id rans.ID) error {
-					// 实例级止损销毁（与所有权丢失通知同一销毁面）。
-					if o, ok := n.mgr.InstanceOwner(id); ok {
-						return lifecycle.DestroyInstance(ctx, n.mgr, id, o.Incarnation)
-					}
-					return nil
-				},
+				Metrics:  mreg,
+				ProtoMin: wire.HandshakeVersionMin,
+				ProtoMax: wire.HandshakeVersionMax,
 			})
 			if err != nil {
 				n.abandon(closeDir)
@@ -123,12 +147,42 @@ func New(cfg Config) (*Node, error) {
 			// 节点代际读取面接线（组装序：表先建、Liveness 后建，故经
 			// Bind 单写一次）：Register/Transfer 写入 Owner.Epoch 的取值源。
 			n.mgr.BindSelfEpoch(lv.NodeEpoch)
+			// 节点本地成员视图（票 01）：路由有效性/放置候选/地址解析三
+			// 消费面读视图，接管闸门/迁移代际读/销毁清理保持实时注册表读
+			//（双轨判定）。年龄上限=成员键 TTL（快照比判活键还老即不可信，
+			// 查询退保守存活）。
+			n.view = membership.NewLocalView(reg.Nodes, reg.MemberTTL(), cfg.Tuning.MembershipRefresh)
+			refreshFailed := mreg.Counter(metrics.NameMembershipViewRefreshFailed,
+				"local membership view refresh failures (over-age answers conservative-alive)")
+			invalCount := mreg.Counter(metrics.NameMembershipViewInvalidations,
+				"local membership view immediate invalidations (coalesced events counted)")
+			n.view.BindMetrics(func() { refreshFailed.Add(1) }, func() { invalCount.Add(1) })
+			viewAge := n.view
+			mreg.Gauge(metrics.NameMembershipViewAge,
+				"local membership view snapshot age in ms (-1 = never refreshed)",
+				func() float64 { return float64(viewAge.Age().Milliseconds()) })
+			bridge.view = n.view
 		}
 		// 位置缓存失效面（H13）：目录变更轮询（DirectoryWatcher）已随
-		// 续租拆除退役——陈旧正条目由路由梯子的成员代际有效性判定
+		// 陈旧正条目由路由梯子的成员代际有效性判定
 		//（死 owner 按 miss 收口）+ 正 TTL 30s 收敛。
 	}
+	var routingView rpc.RoutingView // typed-nil 接口陷阱：nil *LocalView 装进接口即非 nil
+	if n.view != nil {
+		routingView = n.view
+	}
 	resolve := n.resolver()
+	if n.view != nil {
+		// 地址解析视图优先（票 01）：快照命中零注册表读；miss/视图不可信
+		// 回落既有解析面（注册表实时 GET——新节点刚上线视图未刷新的窗口）。
+		v, base := n.view, resolve
+		resolve = func(ctx context.Context, node rans.NodeID) (string, error) {
+			if a, ok := v.Addr(node); ok {
+				return a, nil
+			}
+			return base(ctx, node)
+		}
+	}
 	n.rem, err = rpc.New(rpc.Config{
 		NodeID:             cfg.NodeID,
 		ClusterName:        cfg.ClusterName,
@@ -142,19 +196,23 @@ func New(cfg Config) (*Node, error) {
 		Resolve:            resolve,
 		DefaultCallTimeout: cfg.Calls.Default,
 		MaxCallTimeout:     cfg.Calls.Max,
+		StrictLocalCodec:   cfg.Calls.StrictLocalCodec,
 		OutboxCapacity:     cfg.Outbox.Capacity,
-		OutboxShards:       cfg.Outbox.Shards,
-		CheckpointStore:    cfg.Store,
 		LocationCache:      n.cache,
+		RoutingView:        routingView,
 		Placement:          bridge,
-		Watchdog:           n.watchdogConfig(),
 		PackageTTL:         cfg.Tuning.PackageTTL,
-		CheckpointInterval: cfg.Tuning.CheckpointInterval,
 		Metrics:            n.mreg,
-		Dial:               testDial(cfg.TestHooks),
-		WrapConn:           testWrapConn(cfg.TestHooks),
+		NodeEpoch: func() uint64 {
+			if n.lv != nil {
+				return n.lv.NodeEpoch()
+			}
+			return 0
+		},
+		Dial:     testDial(cfg.TestHooks),
+		WrapConn: testWrapConn(cfg.TestHooks),
 		// 停序头（Remote.Shutdown 阶段④最先执行，先于节点注销与关传输）：
-		// 先停续租/存活（在途一轮写完——次序颠倒会把注销过的成员键写活）、
+		// 先停存活节拍（在途一轮写完——次序颠倒会把注销过的成员键写活）、
 		// 再停轮询、最后收口自有 ctx 家族；错误并入 Shutdown 结果。
 		ShutdownTeardown: []func() error{n.stopHeartbeat,
 			func() error { n.runCancel(); return nil }},
@@ -195,7 +253,7 @@ func openDirectory(dc DirectoryConfig) (directory.Directory, bool, error) {
 	return inmem.New(), false, nil
 }
 
-func (n *Node) leaseInterval() time.Duration { return n.cfg.Lease.Interval }
+func (n *Node) leaseInterval() time.Duration { return n.cfg.Liveness.Interval }
 
 // resolver 地址解析三分支（调用方 ctx 贯穿——解析尊重调用预算，spec §5.1
 // 第 5 点）：TestHooks.Resolve 注入 ＞ 目录派生（redis 节点成员键）＞ inmem
@@ -246,8 +304,11 @@ func testWrapConn(h *testhooks.Hooks) func(net.Conn) net.Conn {
 	return h.WrapConn
 }
 
+// staleDestroyBudget 成员面止损 Retire 单实体预算（实例已围栏，超时无害）。
+const staleDestroyBudget = 30 * time.Second
+
 // watchdogConfig 全局看门狗参数换算（nil → 缺省参数开跑；零值字段回落缺
-// 省——透传内部形态，per-kind 覆盖在 KindOptions 装配期合入）。
+// 省——透传内部形态，per-kind 覆盖面即 Watchdog.KindOverrides）。
 func (n *Node) watchdogConfig() *lifecycle.WatchdogConfig {
 	wd := &lifecycle.WatchdogConfig{
 		Interval:          n.cfg.Watchdog.Interval,

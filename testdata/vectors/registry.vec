@@ -1,0 +1,4 @@
+reg_roster_key	72616e733a6e6f646573	成员总表键
+reg_epoch_key	72616e733a65706f6368	代际计数器键
+reg_entity_key	72616e733a653a7b63656c6c2f66777d	实体主键 hash tag 形态
+reg_node_key	72616e733a6e6f64653a33	节点判活键

@@ -22,7 +22,7 @@ type Metric struct {
 //     （rans.transport.reconnects_total）、最近写批量
 //     （rans.transport.batch_size）、握手摘要失配
 //     （rans.handshake.schema_mismatch）、出队过期即弃
-//     （rans.call.expired）、自检止损轮数（rans.lease.self_fenced，
+//     （rans.call.expired）、自检止损轮数（rans.membership.self_fenced，
 //     目录实现 NodeRegistry 的成员面形态才注册——逐节点事实随本快照
 //     逐节点观测）；
 //   - 快照是即时读数：Gauge 闭包在调用时刻采样，重复调用读数随运行状态

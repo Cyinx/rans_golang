@@ -12,9 +12,9 @@ Rans 分布式虚拟 actor 运行时的 Go 实现：单写者实体内核、Redi
   代码只写单实体逻辑，不做放置与寻址
 - **单写者执行内核**：每实体一个 pawnite 串行 loop，实体代码天然无并发
 - **Redis 目录仲裁**：三个原子单键 Lua（注册/收养/接管、条件注销墓碑、
-  换锁），实例级归属 `Owner{Node, Incarnation}` + 成员代际有效性判定；
+  换锁），实例级归属 `Owner{Node, Epoch, Incarnation}` 三元组 + 成员代际有效性判定；
   Redis Cluster 兼容（逐实体 hash tag 目录真分片）
-- **跨节点 RPC**：握手 v3（HMAC 认证 + SchemaDigest 观测）、统一调用入口
+- **跨节点 RPC**：握手 v5（HMAC 认证 + SchemaDigest 观测 + 启动代际检查拒绝混版本）、统一调用入口
   （`Call`/`Tell` + CallOption）、失败分类重试与毫秒级快速失败
 - **迁移与生命周期**：目录 CAS 换锁迁移（线性化点明确）、四段优雅排空、
   三看门狗（卸载/激活/执行卡死强弃）、闲置钝化与再平衡、checkpoint 快照
@@ -44,7 +44,7 @@ go run ./examples/reenter        # 让出重入：实体 A 经 Defer + ReenterAf
 
 # 2) 全量验证
 make test    # gofmt 门 + go vet + go test -race 全量（自动拉起 docker Redis 16379，契约/租约/集群套件真跑）
-make fuzz    # 原生 fuzz 两解码面：wire 帧 + 握手 v3 扩展对象（各 10s，种子入库）
+make fuzz    # 原生 fuzz 两解码面：wire 帧 + 握手扩展对象（各 10s，种子入库）
 # 无 Redis 环境裸 `go test ./...` 仍全绿（redis 套件按探活门禁 skip）
 # 外部 Redis 直连：export RANS_TEST_REDIS_ADDR=<host:port> RANS_TEST_REDIS_PASSWORD=<密码>
 #（或仓库根 redis.local.env，已 gitignore）——设置后 make test 跳过 docker 直连外部实例
@@ -79,8 +79,9 @@ rans.SetLogger(myLogger)     // 库日志统一门面（SetLogger(nil) 恢复 sl
 
 一个节点进程 = `node.New(Config)` 构造（全量校验、不启 goroutine）→
 `Start`/`Run` 起跑 → `Shutdown`（优雅排空）或 `Close`（立即停止）。目录、
-激活表、续租+失租销毁、位置缓存+目录变更监听、放置、地址解析、传输、
-看门狗与周期任务全部内置装配（等价性有测试锚定）。`examples/arbitration`
+激活表、节点存活信号（成员键比对续期 + 自围栏止损）、位置缓存+目录变更
+轮询、放置、地址解析、传输、看门狗与周期任务全部内置装配——Standalone
+形态同样有看门狗与周期 checkpoint（等价性有测试锚定）。`examples/arbitration`
 是多进程 Redis 形态的可运行样例，`testkit.NewCluster` 是同一骨架的测试封装。
 
 **单节点形态（Standalone：无传输、无握手，目录 inmem）**：
@@ -125,7 +126,7 @@ resp, err := n.Client().Call(ctx, id, msg, rans.Idempotent())    // 唯一调用
 要点：
 
 - **配置构造时一次给全，运行中不可变**：全仓无运行期 `Set*`；
-  per-kind 设置收拢在 `KindOptions`（看门狗覆盖 + 闲置回收策略）；
+  per-kind 闲置回收在 `KindOptions`、看门狗覆盖在 `Watchdog.KindOverrides`；
 - **调用一律经路由**：`n.Client()`（或实体内 `rans.ClientFrom(ctx)`）——
   本地命中走本地快路径，与远端同一错误形态（`*rans.Error`）；
 - **放置**：`Config.Placement` nil → 候选中随机（`node.RandomPlacement`）；
@@ -142,10 +143,11 @@ resp, err := n.Client().Call(ctx, id, msg, rans.Idempotent())    // 唯一调用
   cluster/哨兵形态（DB 须 0）。cluster 兼容性经真 3-master 集群实测背书
   （契约平移 + 真槽号 + 槽号散布断言；`RANS_TEST_REDIS_CLUSTER_ADDRS`
   门禁，未设即 skip）；
-- **双端同版本**：v0.22.0 起握手 v3 + 头部扩展块 + Error 帧结构化是
-  **同版本断点**（升级先停全部再升，同集群双端同版本，见
-  `docs/consumer-upgrade-notice.md` v0.22.0 节）。此后同一 VerMax 内
-  向后兼容（新字段只追加、旧端跳过），不再要求全集群停机。
+- **双端同版本**：v0.26.0 起握手版本即断点（当前 v5）——升级先停全部
+  再升；`node.Start` 启动代际检查按成员键协议区间拒绝混版本启动（见
+  `docs/consumer-upgrade-notice.md` 对应版本节）。
+  此后同一 VerMax 内向后兼容（新字段只追加、旧端跳过），不再要求全
+  集群停机。
 
 ## 架构
 
@@ -160,7 +162,7 @@ resp, err := n.Client().Call(ctx, id, msg, rans.Idempotent())    // 唯一调用
                  Error/Code/Reason/AppError、ctx 访问器、SetLogger）
                 │
 组装层      node（唯一组装根：Config/New/Start/Shutdown/Close/Run/Addr/Client/
-                 Destroy/Migrate/Metrics——目录、激活表、续租、
+                 Destroy/Migrate/Metrics——目录、激活表、成员存活、
                  位置缓存+目录变更监听、放置、传输、周期任务全部内置）
                 │
 端口与      directory（端口：Directory + 租约/换锁/成员能力接口）
@@ -177,22 +179,49 @@ resp, err := n.Client().Call(ctx, id, msg, rans.Idempotent())    // 唯一调用
 内部实现    internal/pawnite（执行内核） · activation（本地激活表+注册仲裁）
                  · lifecycle（迁移/钝化/checkpoint/看门狗/再平衡/排空）
                  · rpc（统一调用客户端+入站分发） · routing（失败分类/位置缓存/
-                 目录变更监听） · placement · membership（Liveness/LeaseKeeper）
-                 · transport(+tcp) · wire（帧/头部/握手 v3/页池） · protocol
+                 目录变更轮询） · placement · membership（Liveness）
+                 · transport(+tcp) · wire（帧/头部/握手/页池） · protocol
                  · metrics · ctxkey · log · testhooks
 ```
 
 | 包 | 职责 |
 |---|---|
 | `rans`（仓库根） | 契约层：实体身份 `ID{Kind,Key}`（`kind/key` 规范键）与 `NodeID`、实体契约 `Entity`/`Factory`/`Snapshotter`、统一调用面 `Client`（`Call`/`Tell` + `CallOption`，`Idempotent()`）、统一错误 `*Error{Code,Reason,Message,Node,AppCode,AppData}` + `CodeOf`/`ReasonOf` 与哨兵族、业务错误接口 `AppError`/`AppDataError`、ctx 访问器 `Self`/`Incarnation`/`ClientFrom`、日志入口 `SetLogger` |
-| `node` | 组装层（唯一组装根）：`Config`（构造时一次给全，运行中不可变）+ `New` 构造期全量校验、`Start`/`Shutdown`/`Close`/`Run` 生命周期面、统一调用入口 `Client()`、管理操作 `Destroy`/`Migrate`（只作用于本地实例）、观测 `Metrics()`、密钥装载 `LoadHMACKeyFromEnv`/`LoadHMACKeyFromFile`、放置策略 `Placement`/`RandomPlacement`；目录/续租/位置缓存+变更监听/传输/周期任务全部内置装配（见「最小装配清单（QUICKSTART）」） |
-| `directory` + `directory/redis` + `directory/inmem` | 目录端口（`Directory{Register,UnregisterIfOwner(Owner),Lookup}` + 租约/换锁/浏览/成员能力接口，实例级归属 `Owner{Node,Incarnation}`）与内存/Redis 两实现（Redis：三原子单键 Lua + TTL 判活 + class/node 索引）；`directory/contract` 是第三方适配器的可执行规格（`RunRegisterSuite`/`RunLeaseSuite`/`RunNodeMembershipSuite`） |
-| `checkpoint` | 快照存储接口 `Store{Get/Put/Delete}`（纪元围栏：回退写拒绝 `ErrStaleIncarnation`）+ InMemory 实现（持久实现归消费方）——迁移 CAS 前落储 / 激活兜底读 / 钝化与停机终快照的统一面 |
+| `node` | 组装层（唯一组装根）：`Config`（构造时一次给全，运行中不可变）+ `New` 构造期全量校验、`Start`/`Shutdown`/`Close`/`Run` 生命周期面、统一调用入口 `Client()`、管理操作 `Destroy`/`Migrate`（只作用于本地实例）、观测 `Metrics()`、密钥装载 `LoadHMACKeyFromEnv`/`LoadHMACKeyFromFile`、放置策略 `Placement`/`RandomPlacement`；目录/存活信号/位置缓存+变更轮询/传输/周期任务全部内置装配（见「最小装配清单（QUICKSTART）」） |
+| `directory` + `directory/redis` + `directory/inmem` | 目录端口（`Directory{Register,UnregisterIfOwner,Lookup,Transfer}` + 成员能力接口 `NodeRegistry`，实例级归属 `Owner{Node,Epoch,Incarnation}` 三元组；Register 支持纪元下限）与内存/Redis 两实现（Redis：五原子单键 Lua + 判活键）；`directory/contract` 是第三方适配器的可执行规格（`RunRegisterSuite`/`RunNodeMembershipSuite`） |
+| `checkpoint` | 快照存储接口 `Store{Get/Put/Delete}`（纪元围栏：回退写拒绝 `ErrStaleIncarnation`）+ InMemory 实现（持久实现归消费方）——迁移 CAS 前落储 / 激活兜底读 / 钝化与停机终快照的统一面 |；可执行契约套件 `checkpoint/contract.RunStoreSuite`（实现者注入即得全量行为断言——未命中/往返防御拷贝/严格小于拒绝/相等覆写/0 直通不抬水位/Delete 不撤销高水位/并发最大值胜出） |
+
 | `codec` | 编码面：varint/ZigZag、field-tag 对象编码原语、值序列化注册表（`Register`/`Encode`/`Decode`/`Serializer`）、形状登记与摘要（`RegisterShapes`/`SchemaDigest`——生成物 init 自动登记，握手表观测） |
 | `testkit` | 进程内多节点测试集群与故障注入原语（`NewCluster`/Kill/Partition/Slow + TLS/HMAC/StrictSchema 逐节点配置 + `FaultStore`/`InvHistory` 不变量检查器 + 租约故障注入），全部验收测试载体；故障注入经 `internal/testhooks` 逐节点生效（并行测试互不干扰）；`sigtermhelper/` 为 kill -TERM 优雅排空演练夹具兼宿主停机接线活样例 |
 | `cmd/ransgen` | 注解驱动的代码生成器（实体/调用/序列化器/wrapper/代理）+ `rans_schema.json` 清单产出与 `-check` 兼容检查（线协议演进门禁） |
 | `internal/*` | 实现细节（不进公开面，升级不受其影响）：执行内核 `pawnite`、激活表 `activation`、生命周期编排 `lifecycle`、调用面 `rpc`、路由/放置/成员 `routing`/`placement`/`membership`、传输 `transport(+tcp)`、线协议 `wire` 与共享小包 `protocol`/`metrics`/`ctxkey`/`log`、测试注入 `testhooks` |
 | examples | 四演示 main 包：`counter`（Standalone 单节点）、`chat`（双节点回环 + ransgen 生成物全形态）、`arbitration`（Redis 目录仲裁/再平衡/接管）、`reenter`（Defer + ReenterAfter 让出重入——长 IO 让出、让出期间他消息照常服务、then 聚合延迟回复） |
+
+> 代码注释中的规格/决策编号指向维护者内部文档（`docs/porting/`、`docs/decisions/`——随仓库分发）。
+
+## 宿主围栏契约（自持存储）
+
+消费方不经 `checkpoint.Store` 而在实体 Hook（Activate/Deactivate/Handle）里直写自有存储（如 MySQL）时，必须以 `rans.Incarnation(ctx)` 令牌自行承担围栏——一页式契约：
+
+- **按实体的单调高水位**（不是按行、不是按会话）：每个实体 id 持一个已接受的最大纪元；
+- **严格小于拒绝**：`inc < 已存最大值` 的写入必须拒绝（旧 incarnation 的残留在飞写）；**相等放行**（同纪元重试是常态）；**0 = 未围栏**直通且不抬高水位；
+- **比较与写入必须原子**（单语句条件更新或事务内 `SELECT … FOR UPDATE`）——先读后写的两步在并发下放行旧纪元；
+- **Delete 不撤销高水位**：实体删除后残留的旧纪元在飞写仍须被拒；
+- 推荐实现 `checkpoint.HighWaterReader` 同构的只读高水位面，或给运行时配 `node.Config.FencingFloor` 返回该最大纪元（每次激活前调用）。
+
+MySQL 参考配方（单行持高水位；受影响行语义已处理）：
+
+```sql
+-- 表：fence(entity_id PK, inc BIGINT UNSIGNED NOT NULL, ...)
+-- 写入（比较+写入原子；相等放行、严格小于拒绝）：
+UPDATE fence SET inc = ?, payload = ? WHERE entity_id = ? AND inc <= ?;
+-- 受影响行 0 且现存 inc > 新 inc → 拒绝（旧纪元）；0 行且行不存在 → 先 INSERT
+--（IGNORE 撞主键后重跑 UPDATE——同值重试在缺省受影响行语义下报 0 行，须
+-- 以「行不存在」区分，不能把 0 行一律当拒绝）。
+-- 高水位只读：SELECT inc FROM fence WHERE entity_id = ?;
+```
+
+注意 `INSERT … ON DUPLICATE KEY UPDATE` 不能携带 `WHERE` 条件——无法表达「严格小于拒绝」，不要用它实现本契约。
 
 ## 失败策略
 
@@ -249,7 +278,7 @@ TTL，五类失效钩子全部 node 内部接线，无手工配置面）：
   新请求按确定未执行回绝促重路由）→ ② 并行销毁全部本地实体（并行度
   max(8, CPU×8)，单实体失败不阻断；销毁 = 交接窗：在箱留存 → 终快照落
   Store → 条件注销）→ ③ 出站 flush（500ms 有界窗口内 pending 清空）→
-  ④ 停序（停心跳/续租 → 节点注销 → listener/连接 → 网关）。`n.Close()`
+  ④ 停序（停存活信号 → 节点注销（纪元守卫）→ listener/连接 → 网关）。`n.Close()`
   是立即路径：不排空、不注销、不留终快照（目录/成员键留待租约 TTL 过期，
   模拟崩溃即此形态）。kill -TERM 演练与停机接线活样例见
   `testkit/sigtermhelper/`（READY → SIGTERM → 优雅排空 → DRAINED →
@@ -259,7 +288,7 @@ TTL，五类失效钩子全部 node 内部接线，无手工配置面）：
   停驻超缺省 60s）、激活卡死（Activating 停驻超缺省 60s——本节点粘性请求
   黑洞的唯一收敛面）与执行卡死（Active 顶层执行停驻
   超缺省 120s）→ 强弃：在箱消息改道回绝、在途调用方解绑（Timeout 收场）、
-  条件目录注销、本地逐出。阈值全局 + `KindOptions[k].Watchdog` per-kind
+  条件目录注销、本地逐出。阈值全局 + `Watchdog.KindOverrides[k]` per-kind
   覆盖（LLM 类慢实体按轮长放宽）；强弃在 pawnite gate 内重验
   状态，陈旧快照零副作用。
 - **闲置钝化与再平衡**：`KindOptions[k].Idle`（`IdlePolicy`
@@ -391,7 +420,12 @@ go run ./cmd/ransgen \
   | `rans.call.expired` | Counter | 出队过期即弃累计（出队执行前预算已耗尽、未执行按 Timeout+Expired 回绝） | `Node.Metrics()` |
   | `rans.activation.failed` | Counter | 实体激活失败累计（进程内跨节点聚合） | 进程级注册表（OTel 导出/宿主 SDK 同源可见） |
   | `rans.checkpoint.final_failed` | Counter | 停机终快照预算内重试后仍失败累计（同上） | 进程级注册表 |
-  | `rans.lease.self_fenced` | Counter | 成员键连续写失败触发自围栏轮数累计（逐节点告警可归因） | `Node.Metrics()` |
+  | `rans.lease.self_fenced` | Counter | 存活节拍持续失败触发自围栏轮数累计（逐节点告警可归因） | `Node.Metrics()` |
+  | `rans.ownership.takeover_won` | Counter | 死 owner CAS 接管获胜累计 | `Node.Metrics()` |
+  | `rans.ownership.stale_fenced` | Counter | 陈旧落库拒写触发的围栏/失主止损累计 | `Node.Metrics()` |
+  | `rans.ownership.lost_sent` / `rans.ownership.lost_received` | Counter | 所有权丢失通知发出 / 收到并命中累计 | `Node.Metrics()` |
+  | `rans.membership.resurrected` | Counter | 存活期成员键丢失（重取号，旧代际作废）累计 | `Node.Metrics()` |
+  | `rans.membership.superseded` | Counter | 同 NodeID 更大代际占据成员键（让位）累计 | `Node.Metrics()` |
 
   节点配置面无任何运行期 `Set*`——全部配置在
   `node.New(Config)` 构造时一次给全，运行中不可变；`rans.SetLogger` 是唯一
@@ -418,11 +452,13 @@ go run ./cmd/ransgen \
 | 成员键存活期 | `node.Config.Directory.Redis`（redis.Options：HeartbeatTTL） | 2min | 判活键是节点存活唯一权威；LeaseTTL 已删除——实体主键无 TTL |
 | 心跳周期 / 自围栏 / 止损销毁并发与预算 | `node.Config.Lease`（Interval/SelfFence/MaxConcurrentDestroys/DestroyTimeout） | 30s / max(MemberTTL−2×Interval, Interval) / 8 / 30s | SelfFence：成员键写持续失败超阈值 → 本地全集关准入+止损销毁（接管误判的兜底）；<0 关闭 |
 | 节点成员键（Redis Registry） | internal（Liveness 每心跳周期无条件双写；零实体照写） | 判活键 TTL 同过期阈值 2min | 总表 `rans:nodes` 枚举 + 判活键 `rans:node:<id>` 探活，读面与 keyspace 规模解耦；判活键值 = JSON `{addr,kinds,draining,epoch}`；节点代际经 `{reg}` 全局计数器 `rans:epoch`（HINCRBY 取号，无 TTL）启动取号一次全程携带，同节点号重启代际严格递增 |
-| 看门狗（卸载/激活/执行） | `node.Config.Watchdog`（per-kind 覆盖 `KindOptions[k].Watchdog`） | 60s / 60s / 120s，周期 1s | **LLM 类慢实体必须按 kind 放宽** |
+| 看门狗（卸载/激活/执行） | `node.Config.Watchdog`（per-kind 覆盖 `Watchdog.KindOverrides[k]`） | 60s / 60s / 120s，周期 1s | **LLM 类慢实体必须按 kind 放宽** |
 | 周期 checkpoint | `node.Config.Tuning.CheckpointInterval` | 1min（单轮上限 1000） | 脏纪元门控 |
 | 随迁包 TTL / 包缓存容量 | `node.Config.Tuning.PackageTTL` / internal | 5min / 100_000 | 容量为高基数兜底 |
 | 位置缓存 TTL / 容量 | internal（恒装配，`DefaultLocationCacheMaxEntries`） | 正 30s 负 1s / 100_000（64 分片均摊） | 饱和准入 O(分片容量)；失效钩子由 node 内部接线，陈旧正条目由成员代际有效性判定即时收口 |
-| 节点发件箱 | `node.Config.Outbox`（Capacity/Shards） | 65_536 / 16 | 单向出站入箱即返、分片 worker 保同目标 FIFO；满策略按生产者分野（显式 Tell 阻塞至 ctx；事件/回包/转发满即丢计数 `rans.outbox.dropped`）；Call 请求帧同箱同分片入队——同一调用方先 Tell 后 Call 同一目标，对端先见 Tell（跨调用方不承诺；排队过预算的帧发送段中止，确定未送出）；Shards 建议 ≥ 集群节点数（超分片数时同分片节点共享单 worker 串行——排队等待线性于分片内前置帧数×单帧发送成本） |
+| 存活节拍（Liveness） | `node.Config.Liveness`（Interval/SelfFence） | Interval 30s / SelfFence 按 MemberTTL 推导 | 成员键比对续期（一死永死）；Start 次序=同步取号→绑定→首写成员键→接入（失败即终态） |
+| 节点本地成员视图 | `Tuning.MembershipRefresh` | 1s（下限 100ms） | 路由/放置/寻址读周期快照（注册表读放大收口）；死 owner 实时坐实（双轨判定） |
+| 节点发件箱 | `node.Config.Outbox`（Capacity） | 65_536 | 单向出站入箱即返、按目标分队列保同目标 FIFO（每目标专属 worker，跨目标互不阻塞）；死目标熔断（发送重试耗尽/端点判停即开断，冷却后探针自愈）；满策略按生产者分野（显式 Tell 阻塞至 ctx；事件/回包/转发满即丢计数 `rans.outbox.dropped`；控制帧走预留容量）。FIFO 承诺限于**同一连接内**的写出序——例外：连接收敛（新旧交接，发送侧缓解后窗口显著缩小但收端两读循环仍可能交错）、输家转发/重定向、迁移整箱转发、发送失败与故障（跨调用方同样不承诺） |
 | 放置正缓存 | internal（placementCacheTTL 常量） | 5s | routeMiss 选点回填短 TTL 正条目，只覆盖「选点→目录注册可见」激活窗 |
 | 迁移总预算 | internal（`DefaultMigrationBudget`） | 30s | 源端序列总预算 |
 | 再平衡 | `node.Config.Rebalance`（Threshold/Period/MaxPerRound） | 0=关 / 60s / 10 | 超阈自动卸载，配 `KindOptions[k].Idle` 迁移档 |

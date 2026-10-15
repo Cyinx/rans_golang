@@ -23,6 +23,17 @@ import (
 	"github.com/cyinx/rans_golang/internal/testhooks"
 )
 
+// metricsNodeEpoch 节点当前真实代际（票 15：外部种子注册以真实代际——
+// epoch-0 条目是遗留形态，路由真值面判死）。
+func metricsNodeEpoch(t *testing.T, dir *redis.Directory, n rans.NodeID) uint64 {
+	t.Helper()
+	ep, alive, err := dir.NodeEpoch(context.Background(), n)
+	if err != nil || !alive || ep == 0 {
+		t.Fatalf("node %d epoch: ep=%v alive=%v err=%v", n, ep, alive, err)
+	}
+	return ep
+}
+
 // nodeMetric 本节点快照的单指标读数（节点仪表落自有注册表，读数经
 // Node.Metrics()——进程级 Default 不承载节点装配的仪表）。
 func nodeMetric(n *Node, name string) float64 {
@@ -72,7 +83,7 @@ func metricsClusterDialCapture(t *testing.T, dir directory.Directory, kinds map[
 			NodeID: id, ClusterName: "node-metrics", Security: SecurityConfig{Insecure: true},
 			Directory: DirectoryConfig{Injected: dir},
 			Kinds:     kinds,
-			Lease:     LeaseConfig{Interval: 300 * time.Millisecond},
+			Liveness:  LivenessConfig{Interval: 300 * time.Millisecond},
 			Calls:     CallConfig{Default: 5 * time.Second},
 		}
 		if mut != nil {
@@ -117,7 +128,7 @@ func TestRedisMetricsPendingFailFast(t *testing.T) {
 	defer cancel()
 
 	idBlock := mustID(t, "blocker", "metrics-pending")
-	if _, _, err := dir.Register(ctx, idBlock, directory.Owner{Node: 2}, nil); err != nil {
+	if _, _, err := dir.Register(ctx, idBlock, directory.Owner{Node: 2, Epoch: metricsNodeEpoch(t, dir, 2)}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -188,7 +199,7 @@ func TestRedisMetricsReconnects(t *testing.T) {
 
 	idDial := mustID(t, "counter", "metrics-reconnect")
 	// 首拨：归属放 node2，node1 调用建立连接（首拨不计数）。
-	if _, _, err := dir.Register(ctx, idDial, directory.Owner{Node: 2}, nil); err != nil {
+	if _, _, err := dir.Register(ctx, idDial, directory.Owner{Node: 2, Epoch: metricsNodeEpoch(t, dir, 2)}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if v, err := n1.Client().Call(ctx, idDial, 0); err != nil || v != 1 {

@@ -1068,7 +1068,7 @@ func TestClusterDirectoryE2E(t *testing.T) {
 	if err != nil || len(m) != 3 {
 		t.Fatalf("NodeAddrs on cluster = %v (%v), want 3 nodes", m, err)
 	}
-	if err := d.UnregisterNode(ctx, 1); err != nil {
+	if err := d.UnregisterNode(ctx, 1, 0); err != nil {
 		t.Fatalf("UnregisterNode on cluster: %v", err)
 	}
 	if nodes, err := d.NodeIDs(ctx); err != nil || len(nodes) != 2 {

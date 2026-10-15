@@ -4,7 +4,11 @@ package routing
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
+
+	"github.com/cyinx/rans_golang"
 )
 
 // maxAttempts 总尝试上限 = 初次 + 2 次重试（规格 §9.2「上限 2 次」）。
@@ -50,11 +54,11 @@ func InvokeWithBackoff(ctx context.Context, opts InvokeOptions, backoff func(att
 			// 先显式检查再进 select：ctx 已 done 时确定性中止，不与
 			// 零/极短退避的立即到通计时器发生 select 随机二选一。
 			if ctx.Err() != nil {
-				return lastErr
+				return CtxOutcome(ctx)
 			}
 			select {
 			case <-ctx.Done():
-				return lastErr
+				return CtxOutcome(ctx)
 			case <-time.After(backoff(attemptNo - 1)):
 			}
 		}
@@ -75,6 +79,18 @@ func InvokeWithBackoff(ctx context.Context, opts InvokeOptions, backoff func(att
 		}
 	}
 	return lastErr
+}
+
+// CtxOutcome ctx 结束的统一收场错误（票 13）：超时→ErrTimeout、取消→
+// ErrCanceled 包装 ctx.Err()——「调用错误一律 *rans.Error」在重试环与路由
+// 的 ctx 结束收场成立（标准库判错两半均可达：Is(DeadlineExceeded) 经
+// 超时类的 Is 分支、Is(Canceled) 经包装链）。消费面：InvokeWithBackoff
+// 的两次尝试之间、rpc 路由的目录 Lookup ctx 结束。
+func CtxOutcome(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return rans.ErrTimeout
+	}
+	return fmt.Errorf("%w: %w", rans.ErrCanceled, ctx.Err())
 }
 
 // ShouldEnterRing 报告错误是否应进入重试环：可重试类（含幂等判定的

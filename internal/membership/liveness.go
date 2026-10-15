@@ -1,13 +1,14 @@
-// Liveness：节点存活信号（成员键写入）。每周期无条件
-// RegisterNode(self, nodeAddr, nodeKinds, draining)：零实体节点照写（空
-// 节点可见）、启动即写一次（冷启动窗口消除）、写失败仅 Warn 下轮重试。
-// 独立 goroutine 驱动，永不执行实体级工作、用户回调或目录批量 IO——同包
-// LeaseKeeper（逐实体续租）侧的任何阻塞都不能冻结节点存活信号。
+// Liveness：节点存活信号（成员键写入）。每周期 RenewNode 比对续期——
+// 键缺席即失主（一死永死：本代际作废、重取号、旧代际实例围栏止损，键不
+// 复活）；被更大代际占据即让位（NodeID 重号：停写 + 让位回调）。独立
+// goroutine 驱动，永不执行实体级工作、用户回调或目录批量 IO——实体侧
+// 任何阻塞都不能冻结节点存活信号。
 package membership
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -16,9 +17,10 @@ import (
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/metrics"
 )
 
-// LivenessConfig 构造 Liveness 的全部输入。Interval ≤0 → 30s（与续租面
+// LivenessConfig 构造 Liveness 的全部输入。Interval ≤0 → 30s（存活节拍
 // 共用缺省常量）。Reg 必填：无节点注册能力的目录（inmem 等基础面）不构造
 // 本组件（node 装配按 directory.NodeRegistry 能力探测接线）。
 type LivenessConfig struct {
@@ -31,24 +33,32 @@ type LivenessConfig struct {
 	// Interval 是成员键刷新周期（≤0 → 30s）。
 	Interval time.Duration
 
-	// SelfFence 自围栏阈值（H13 自 LeaseKeeper 迁入）：存活节拍（成员键
-	// 写/节点代际取号）持续失败超过该时长 → LocalIDs 全集关准入 +
-	// OnSelfFenceLost 止损销毁（接管误判的兜底）。0 →
-	// max(MemberTTL−2×Interval, Interval)；<0 关闭；每失败幕恰一次（写
-	// 恢复复位）。
+	// SelfFence 自围栏阈值：存活节拍（成员键写/续期/代际取号）持续失败
+	// 超过该时长 → Fence(0) 围栏全部本地实例（钩子自带异步止损销毁——
+	// 接管误判的兜底）。0 → max(MemberTTL−2×Interval, Interval)；<0 关
+	// 闭；每失败幕恰一次（写恢复复位）。
 	SelfFence time.Duration
 
 	// MemberTTL 判活键存活期（SelfFence 缺省推导基准；≤0 → 2×Interval）。
 	MemberTTL time.Duration
 
-	// Fence 逐实体同步关准入钩子（非阻塞；nil = 仅计数）。
-	Fence func(id rans.ID)
+	// Fence 实例围栏钩子（非阻塞；nil = no-op）：keepEpoch=0 围栏全部；
+	// 否则围栏 owner 已落位且 epoch≠keep 的实例。返回围栏数。SelfFence
+	// 触发与换代/让位处置共用本钩子——止损销毁由实现侧按围栏时刻捕获的
+	// 实例集异步执行（捕获发生在围栏时刻，杜绝销毁时才读归属的误杀窗）。
+	Fence func(keepEpoch uint64) int
 
-	// LocalIDs 本地激活表身份快照（止损范围；nil = 未接线）。
-	LocalIDs func() []rans.ID
+	// OnSuperseded 让位回调（Superseded 后恰一次，循环 goroutine 上同步
+	// 调用——封表/停进程的编排面；必须非阻塞或自行异步）。
+	OnSuperseded func()
 
-	// OnSelfFenceLost 止损销毁钩子（每实体一次，自备预算；nil = 仅关准入）。
-	OnSelfFenceLost func(ctx context.Context, id rans.ID) error
+	// Metrics 观测注册表（resurrected/superseded 计数落点；nil → Default）。
+	Metrics *metrics.Registry
+
+	// ProtoMin/ProtoMax 本端握手协议区间（成员键承载——node.Start 启动
+	// 代际检查的数据面；组装根注入 wire.HandshakeVersion*）。
+	ProtoMin uint16
+	ProtoMax uint16
 }
 
 // Liveness 节点存活信号：成员键值 = JSON{addr, kinds, draining, epoch}
@@ -81,20 +91,26 @@ type Liveness struct {
 	// 性——排空是终态动作），锁内读写、kick 即时补一轮刷新。
 	draining bool
 
-	// epoch 节点代际：首写成员键前经 Reg.NextNodeEpoch 取号一次（仅存活
-	// 信号循环这一条 goroutine 触达，无竞争），此后全程携带——NodeInfo.
-	// Epoch 恒为该值。0 = 未取号（Start 前或取号未成功——未取号不写成员
-	// 键，取号失败与写失败同纪律：Warn 下轮重试）。
+	// epoch 节点代际（已发布：新键写成功才推进——新激活永不携带「键缺席
+	// 的代际」）；next 待发布代际（取号成功、写键未确认：RegisterNode
+	// 服务端成功而客户端报错时下轮重试同值，不得误判 Superseded 也不得
+	// 退回旧代际续期）。两者仅存活信号循环触达，无竞争。0 = 无值。
 	epoch atomic.Uint64
+	next  atomic.Uint64
+	// stopped 循环停写标记（Superseded 让位/排空中失主：不再注册——
+	// 让位进程的成员键属于占据者）。
+	stopped atomic.Bool
 
 	// 自围栏半边（SelfFence>0 激活）：lastWriteOk 最近成功写时刻（0 = 首写
 	// 前不触发）；fenced 本失败幕已触发标记（写恢复复位）。
-	selfFence   time.Duration
-	lastWriteOk atomic.Int64
-	fenced      atomic.Bool
-	fence       func(id rans.ID)
-	localIDs    func() []rans.ID
-	onSFLost    func(ctx context.Context, id rans.ID) error
+	selfFence    time.Duration
+	lastWriteOk  atomic.Int64
+	fenced       atomic.Bool
+	fence        func(keepEpoch uint64) int
+	onSuperseded func()
+	metrics      *metrics.Registry
+	protoMin     uint16
+	protoMax     uint16
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -110,7 +126,7 @@ type Liveness struct {
 	done    chan struct{}
 }
 
-// defaultHeartbeatInterval 存活刷新缺省周期（续租面拆除后由本文件承载）。
+// defaultHeartbeatInterval 存活刷新缺省周期（由本文件承载）。
 const defaultHeartbeatInterval = 30 * time.Second
 
 // NewLiveness 构造节点存活信号。Reg 必填（nil 报错——无注册能力的目录不
@@ -133,28 +149,35 @@ func NewLiveness(cfg LivenessConfig) (*Liveness, error) {
 	} else if sf < 0 {
 		sf = 0
 	}
-	fence, ids, sfl := cfg.Fence, cfg.LocalIDs, cfg.OnSelfFenceLost
+	fence, sup := cfg.Fence, cfg.OnSuperseded
 	if fence == nil {
-		fence = func(rans.ID) {}
+		fence = func(uint64) int { return 0 }
 	}
-	if ids == nil {
-		ids = func() []rans.ID { return nil }
-	}
-	if sfl == nil {
-		sfl = func(context.Context, rans.ID) error { return nil }
+	if sup == nil {
+		sup = func() {}
 	}
 	return &Liveness{
-		reg:       cfg.Reg,
-		self:      cfg.Self,
-		interval:  interval,
-		selfFence: sf,
-		fence:     fence,
-		localIDs:  ids,
-		onSFLost:  sfl,
-		stop:      make(chan struct{}),
-		kick:      make(chan struct{}, 1),
-		done:      make(chan struct{}),
+		reg:          cfg.Reg,
+		self:         cfg.Self,
+		interval:     interval,
+		selfFence:    sf,
+		fence:        fence,
+		onSuperseded: sup,
+		metrics:      cfg.Metrics,
+		protoMin:     cfg.ProtoMin,
+		protoMax:     cfg.ProtoMax,
+		stop:         make(chan struct{}),
+		kick:         make(chan struct{}, 1),
+		done:         make(chan struct{}),
 	}, nil
+}
+
+// metricsReg 观测注册表（注入优先、Default 兜底）。
+func (l *Liveness) metricsReg() *metrics.Registry {
+	if l.metrics != nil {
+		return l.metrics
+	}
+	return metrics.Default()
 }
 
 // PublishSelf 一次性发布本节点成员键载体（键在=节点活、值=在哪：地址发现即读成员键）。
@@ -171,14 +194,12 @@ func (l *Liveness) PublishSelf(addr string, kinds []string) {
 	l.mu.Unlock()
 }
 
-// BeginDraining 置位节点排空标记（spec §5.1 第 9 点；运行期状态命令而非
-// 配置注入，一次性置位不复位：排空是终态动作，进程随后即停）。置位后节点成员键值携带
-// draining（聚合视图过滤——放置/迁移不再选中本节点），**租约续租不受
-// 影响**（归同包 LeaseKeeper：排空阶段②的逐实体 Retire 期间续租照常——
-// 长排空不过租约 TTL）。置位即 kick 立即补写一轮成员键——标记不等下一
-// 周期就进入放置视图（注销前的可见窗口就是它的效用窗口）。排空停序的
-// 消费示范见 node.Shutdown / testkit.Cluster.Shutdown（标记 → 排空 →
-// flush → 停续租/存活 → 节点注销）。
+// BeginDraining 置位节点排空标记（spec §5.1 第 9 点；运行期状态命令，
+// 一次性——排空是终态动作，进程随后即停）：成员键值携带 draining，聚合
+// 视图过滤（放置/迁移不再选中本节点）。置位即 kick 立即补写一轮——标记
+// 不等下一周期就进入放置视图（注销前的可见窗口就是它的效用窗口）。排空
+// 中成员键照常续期（长排空不过成员 TTL）。停序消费示范见 node.Shutdown /
+// testkit.Cluster.Shutdown。
 func (l *Liveness) BeginDraining() {
 	l.mu.Lock()
 	l.draining = true
@@ -205,11 +226,71 @@ func (l *Liveness) Start(ctx context.Context) error {
 	return nil
 }
 
+// StartSync 同步首写 + 起循环（票 14 的 Start 次序面）：首写（含必要的
+// 同步取号）在本方法内完成——返回即成员键在场、代际已发布，循环此后只
+// 续期。首写/取号失败原样上抛（Start 即终态，不启动循环、不发布代际）。
+// 与 Start（异步首写形态）互斥——同一 started 守卫，装配只走其一。
+func (l *Liveness) StartSync(ctx context.Context) error {
+	if !l.started.CompareAndSwap(false, true) {
+		return errors.New("rans: start: liveness already started (single-use; rebuild instead of restarting)")
+	}
+	if err := l.firstWriteSync(ctx); err != nil {
+		return err
+	}
+	go func() {
+		defer close(l.done)
+		l.loop(ctx)
+	}()
+	return nil
+}
+
+// EnsureEpoch 同步取号（票 14：Start 次序的第一步，绑定之前）：已发布或
+// 已取号 → no-op；否则取号入 next（写键成功才发布——次序不变量不变，
+// 代际发布仍在首写内）。失败原样返回。
+func (l *Liveness) EnsureEpoch(ctx context.Context) error {
+	if l.epoch.Load() != 0 || l.next.Load() != 0 {
+		return nil
+	}
+	n, err := l.allocEpoch(ctx, l.epoch.Load())
+	if err != nil {
+		return err
+	}
+	l.next.Store(n)
+	return nil
+}
+
+// firstWriteSync 同步首写一次：已发布（幂等重入）即返回；地址未发布（裸
+// 形态误用）返回 nil——循环接管；否则确保已取号 → RegisterNode → 成功
+// 才发布代际（发布语义与 publishNext 一致；失败上抛而非下轮重试——
+// Start 终态语义）。
+func (l *Liveness) firstWriteSync(ctx context.Context) error {
+	if l.epoch.Load() != 0 {
+		return nil
+	}
+	l.mu.Lock()
+	addr := l.nodeAddr
+	kinds := l.nodeKinds
+	draining := l.draining
+	l.mu.Unlock()
+	if addr == "" {
+		return errors.New("rans: membership: sync start before PublishSelf (address unknown; bind+publish first)")
+	}
+	if err := l.EnsureEpoch(ctx); err != nil {
+		return fmt.Errorf("rans: membership: epoch allocation: %w", err)
+	}
+	nx := l.next.Load()
+	now := time.Now()
+	if err := l.publishKey(ctx, addr, kinds, draining, nx, now); err != nil {
+		return fmt.Errorf("rans: membership: first key write: %w", err)
+	}
+	return nil
+}
+
 // loop 节点存活信号循环：独立 goroutine（node 经 go Run 驱动），永不执行
 // 实体级工作、用户回调或目录批量 IO——实体侧任何阻塞都不能冻结节点存活
 // 信号。
 func (l *Liveness) loop(ctx context.Context) {
-	l.registerSelf(ctx)
+	l.tick(ctx)
 	ticker := time.NewTicker(l.interval)
 	defer ticker.Stop()
 	for {
@@ -219,19 +300,22 @@ func (l *Liveness) loop(ctx context.Context) {
 		case <-l.stop:
 			return
 		case <-l.kick:
-			l.registerSelf(ctx)
+			l.tick(ctx)
 		case <-ticker.C:
-			l.registerSelf(ctx)
+			l.tick(ctx)
 		}
 	}
 }
 
-// registerSelf 无条件写/续期本节点的成员键（每周期一次 + Run 启动一次 +
-// BeginDraining kick 一次）。地址未发布时跳过；代际未取号先取号（取号失
-// 败本轮不写——成员键值必携代际，宁可让节点晚一拍可见；同一不可达的目
-// 录上写键也必然失败，无额外可见性代价）；写失败仅 Warn（下轮重试）
-// ——成员键与租约是两个独立半边。
-func (l *Liveness) registerSelf(ctx context.Context) {
+// tick 存活节拍状态机（每周期一次 + Start 启动一次 + BeginDraining kick
+// 一次）：未发布代际先取号写键（RegisterNode，成功才发布）；已发布走
+// RenewNode 比对续期——Absent 即失主重取号（一死永死），Superseded 即
+// 让位停写。地址未发布时跳过（空地址入键只会产出必然拨号失败的解析
+// 候选）。写失败 Warn 下轮重试（SelfFence 记账）。
+func (l *Liveness) tick(ctx context.Context) {
+	if l.stopped.Load() {
+		return
+	}
 	l.mu.Lock()
 	addr := l.nodeAddr
 	kinds := l.nodeKinds
@@ -240,108 +324,20 @@ func (l *Liveness) registerSelf(ctx context.Context) {
 	if addr == "" {
 		return
 	}
-	if l.epoch.Load() == 0 {
-		e, err := l.reg.NextNodeEpoch(ctx)
+	now := time.Now()
+	if l.epoch.Load() == 0 && l.next.Load() == 0 {
+		n, err := l.allocEpoch(ctx, 0)
 		if err != nil {
 			log.Warn("rans/membership: node epoch allocation failed, retry next tick (node stays invisible until it succeeds)",
 				"self", l.self, "err", err)
-			l.noteWriteOutcome(false, time.Now())
+			l.noteWriteOutcome(false, now)
 			return
 		}
-		l.epoch.Store(e)
+		l.next.Store(n)
 	}
-	info := directory.NodeInfo{
-		Addr:     addr,
-		Kinds:    kinds,
-		Draining: draining,
-		Epoch:    l.epoch.Load(),
-	}
-	err := l.reg.RegisterNode(ctx, l.self, info)
-	if err != nil {
-		log.Warn("rans/membership: node membership key write failed, retry next tick (node may be invisible to placement until it succeeds)",
-			"self", l.self, "err", err)
-	}
-	l.noteWriteOutcome(err == nil, time.Now())
-}
-
-// noteWriteOutcome 存活节拍失败记账（成员键写失败与节点代际取号失败同一
-// 入账——两形态经 Warn 日志可区分，记账统一按真实时刻推进同一 SelfFence
-// 时钟）；持续失败超 SelfFence 触发自围栏（成功复位失败幕；首次失败起算
-// 基准；零值入参时刻按当下真实时刻入账——垃圾时刻既不得生成垃圾基线也不
-// 得豁免入账；fence CAS 保证每幕恰一次；止损销毁独立 goroutine——本循环
-// 永不等待实体级工作，INV5）。
-func (l *Liveness) noteWriteOutcome(ok bool, now time.Time) {
-	if l.selfFence <= 0 {
+	if l.next.Load() != 0 {
+		l.publishNext(ctx, addr, kinds, draining, now)
 		return
 	}
-	if now.IsZero() {
-		now = time.Now() // 零值时刻按当下入账：失败既不豁免也不产生垃圾基线
-	}
-	if ok {
-		l.fenced.Store(false)
-		l.lastWriteOk.Store(now.UnixNano())
-		return
-	}
-	last := l.lastWriteOk.Load()
-	if last == 0 {
-		l.lastWriteOk.Store(now.UnixNano()) // 以首失败时刻起算
-		return
-	}
-	if now.Sub(time.Unix(0, last)) < l.selfFence {
-		return
-	}
-	if !l.fenced.CompareAndSwap(false, true) {
-		return
-	}
-	ids := l.localIDs()
-	log.Error("rans/membership: self-fence triggered (membership key writes failing past threshold; fencing all local entities)",
-		"self", l.self, "entities", len(ids))
-	for _, id := range ids {
-		l.fence(id)
-	}
-	go func(ids []rans.ID) {
-		for _, id := range ids {
-			// 例外②：止损销毁预算（selfFenceDestroyTimeout 集中定义——存活
-			// 循环不等待本 goroutine，INV5）。
-			ctx, cancel := context.WithTimeout(context.Background(), selfFenceDestroyTimeout)
-			_ = l.onSFLost(ctx, id)
-			cancel()
-		}
-	}(ids)
-}
-
-// selfFenceDestroyTimeout 自围栏止损销毁单实体预算（实体已 fence，超时
-// 放弃等待无正确性影响）。
-const selfFenceDestroyTimeout = 30 * time.Second
-
-// NodeEpoch 返回本节点代际（启动取号的单调值，成员键全程携带）：目录条
-// 目记录 {node, nodeEpoch, inc} 三元组的代际来源（激活/迁移调用点经本面
-// 取值）。0 = 未取号（Start 前或取号未成功）。同节点号重启必得严格更大
-// 的代际（{reg} 全局计数器保证）；优雅停机不影响计数器——重启后的新存活
-// 期自然取到更大的值。
-func (l *Liveness) NodeEpoch() uint64 { return l.epoch.Load() }
-
-// Close 立即终止循环（幂等；不等待退出——在途一轮刷新，含慢目录 IO，仍
-// 可能运行片刻；停序要确定性收口，如 Close 后立刻注销节点键，用 Shutdown）。
-// Close 先于 Start 调用亦有效：循环首轮 select 即见关闭的 stop 通道。不
-// 阻塞；并发安全；返回值恒 nil（本面无错误来源，统一动词签名）。
-func (l *Liveness) Close() error {
-	l.stopOnce.Do(func() { close(l.stop) })
-	return nil
-}
-
-// Shutdown 优雅停机：停止并等待循环退出——返回 nil 即在途成员键写已结束
-// （node 停序保证先停信号、再注销节点键）。ctx 耗尽返回 ctx.Err()。幂等；
-// 阻塞到循环退出或 ctx 耗尽；不得在实体 Handle 内调用。
-func (l *Liveness) Shutdown(ctx context.Context) error {
-	l.Close()
-	if !l.started.Load() {
-		return nil // Start 未启动：无可等待者（stop 已关，迟到的 Start 首轮即退）
-	}
-	select {
-	case <-l.done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	l.renew(ctx, addr, kinds, draining, now)
 }

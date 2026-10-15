@@ -105,7 +105,7 @@ func mkRedisNode(t *testing.T, dir directory.Directory, id rans.NodeID, mut func
 		NodeID: id, ClusterName: "node-test", Security: SecurityConfig{Insecure: true},
 		Directory: DirectoryConfig{Injected: dir},
 		Kinds:     testKinds(),
-		Lease:     LeaseConfig{Interval: time.Second},
+		Liveness:  LivenessConfig{Interval: time.Second},
 		Calls:     CallConfig{Default: 5 * time.Second},
 	}
 	if mut != nil {
@@ -266,14 +266,22 @@ func newManualNode(t *testing.T, opts redis.Options, policy rpc.Placement, id ra
 	// 节点存活（手工装配形态；续租面已随 H13 拆除——自围栏兜底接管）。
 	lv, lvErr := membership.NewLiveness(membership.LivenessConfig{
 		Reg: dir, Self: id, Interval: time.Second,
-		Fence:    m.Fence,
-		LocalIDs: m.LocalIDs,
-		OnSelfFenceLost: func(ctx context.Context, fid rans.ID) error {
-			if o, ok := m.InstanceOwner(fid); ok {
-				return lifecycle.DestroyInstance(ctx, m, fid, o.Incarnation)
+		Fence: func(keep uint64) int {
+			pred := func(*directory.Owner) bool { return true }
+			if keep != 0 {
+				pred = func(o *directory.Owner) bool { return o.Epoch != keep }
 			}
-			return nil
+			refs := m.FenceWhere(pred)
+			go func() {
+				for _, r := range refs {
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					_ = lifecycle.RetirePawn(ctx, m, r.ID, r.Pawn)
+					cancel()
+				}
+			}()
+			return len(refs)
 		},
+		OnSuperseded: m.Seal,
 	})
 	if lvErr != nil {
 		t.Fatalf("manual node %d liveness: %v", id, lvErr)
@@ -329,7 +337,7 @@ func mkKindNode(t *testing.T, dir directory.Directory, id rans.NodeID, kinds map
 	cfg := Config{
 		NodeID: id, ClusterName: "node-kind", Security: SecurityConfig{Insecure: true},
 		Directory: DirectoryConfig{Injected: dir},
-		Lease:     LeaseConfig{Interval: time.Second},
+		Liveness:  LivenessConfig{Interval: time.Second},
 		Calls:     CallConfig{Default: 5 * time.Second},
 		Kinds:     kinds,
 	}
@@ -390,17 +398,18 @@ func TestKindAwarePlacementNonHostNeverPicked(t *testing.T) {
 		t.Fatalf("NodesByKind(greet) = %v (%v), want [2 3] (n2 and n3 host it)", got, err)
 	}
 
-	// 放置轮：三个源节点 × 各 5 个新鲜身份。n1 排除自身后唯一候选是 2
-	//（确定性）；n2 对称必落 1；n3 不承载 counter 不自排（exclude=3），候选
-	// {1,2} 随机——三者共同的不变量：owner ∈ {1,2}，永不 3。
+	// 放置轮：三个源节点 × 各 5 个新鲜身份。票 03 起首激活候选含本节点：
+	// 全部源的不变量收敛为 owner ∈ 承载集 {1,2}，永不 3（非承载节点不进
+	// kind 候选——kind 过滤是排除面，self 纳入是分布面）。
 	type src struct {
 		n    *Node
 		want func(owner rans.NodeID) bool
 	}
+	isHost := func(o rans.NodeID) bool { return o == 1 || o == 2 }
 	for round, s := range []src{
-		{n1, func(o rans.NodeID) bool { return o == 2 }},
-		{n2, func(o rans.NodeID) bool { return o == 1 }},
-		{n3, func(o rans.NodeID) bool { return o == 1 || o == 2 }},
+		{n1, isHost},
+		{n2, isHost},
+		{n3, isHost},
 	} {
 		for i := 0; i < 5; i++ {
 			id := mustID(t, "counter", fmt.Sprintf("kind-place-r%d-%d", round, i))

@@ -15,7 +15,6 @@ import (
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/ctxkey"
 	"github.com/cyinx/rans_golang/internal/log"
-	"github.com/cyinx/rans_golang/internal/pawnite"
 	"github.com/cyinx/rans_golang/internal/protocol"
 	"github.com/cyinx/rans_golang/internal/routing"
 	"github.com/cyinx/rans_golang/internal/wire"
@@ -51,12 +50,15 @@ func (r *Remote) CallOpts(ctx context.Context, id rans.ID, req any, opts routing
 	// 重试与环内 attempt 共用同一次追加，不重复计跳（追加面见 outboundCausal）。
 	ctx = r.outboundCausal(ctx)
 	v, err := r.callOnce(ctx, id, req, opts)
-	if isLocalActivationRetryable(err) {
-		// 本地激活失败重试一次：ErrActivationFailed
-		// 发生在请求执行前（register-first：注册后失败一律 Unavailable 双哨兵
-		// 回绝——同步窗 ErrActivationFailed 单哨兵、异步窗双哨兵链均可
-		// 判），重试不破坏恰好一次语义；重试重新走路由梯子——仲裁输家的
-		// 缓存已被钩子③指向赢家，翻转为远程路径自然把请求送到赢家。
+	// 本地激活失败/仲裁落败重试：都发生在请求执行前（register-first：
+	// 注册后失败一律 Unavailable 双哨兵回绝——同步窗 ErrActivationFailed
+	// 单哨兵、异步窗（在箱投递被终局排空回绝）ArbitrationLost 双哨兵均可
+	// 判），重试不破坏恰好一次语义。异步窗的陈旧 self 正缓存未被钩子③
+	// 改写（同步窗才有）——重试前就地失效，路由梯子重新收敛到赢家（票
+	// 01 时移暴露的存量缺口）。有界两试：陈旧缓存与视图空窗可能连环
+	//（Form4 实证一次重试仍落同败路），可重试类零执行代价，多试收敛。
+	for attempt := 0; attempt < 2 && isLocalActivationRetryable(err); attempt++ {
+		r.invalidateOnFailure(id, err)
 		v, err = r.callOnce(ctx, id, req, opts)
 	}
 	return v, err
@@ -68,10 +70,11 @@ func (r *Remote) callOnce(ctx context.Context, id rans.ID, req any, opts routing
 	var out any
 	err := r.invokeRouted(ctx, id, opts,
 		func(c context.Context) error {
-			bctx, cancel := r.callBudget(c, opts)
-			if cancel != nil {
-				defer cancel()
-			}
+			// 本地腿不随返回释放预算 ctx（票 08）：ReenterAfter 的 work 挂
+			// Handle ctx 链存活到请求 deadline/调用方取消——发送腿的 defer
+			// cancel 会杀掉在飞 work（远端腿的 work 在对端 detached 让出面上，
+			// 不受本腿释放影响）。预算 ctx 自带 deadline，释放由到期兜底。
+			bctx, _ := r.callBudget(c, opts)
 			v, lerr := r.callLocal(bctx, id, req)
 			if lerr != nil {
 				// 本地错误形态（折叠后的 CodeError+ReasonHandler 与
@@ -174,9 +177,37 @@ func (r *Remote) invokeRouted(ctx context.Context, id rans.ID, opts routing.Invo
 // callLocal 本地路径：mgr.InvokeLocal 直调，零重试（激活失败重试一次在外层
 // CallOpts/SendOneWayOpts 的接线层）。Handle 错误已在投递边界折叠为
 // CodeError+ReasonHandler，回绝错误保留
-// (Code, Reason) 面——两类经分类唯一表裁决。
+// (Code, Reason) 面——两类经分类唯一表裁决。StrictLocalCodec（票 10）开启
+// 时：请求先往返再投递（实体持有副本、未注册类型本地即败），应答在返回前
+// 往返（调用方持有副本，含延迟应答——都经本方法返回）；错误形态与远端
+// buildRequest/decodeResponse 同构。
 func (r *Remote) callLocal(ctx context.Context, id rans.ID, req any) (any, error) {
-	return r.cfg.Manager.InvokeLocal(ctx, id, req)
+	if r.cfg.StrictLocalCodec {
+		var err error
+		req, err = strictRoundTrip(req, "request value")
+		if err != nil {
+			return nil, err
+		}
+	}
+	v, err := r.cfg.Manager.InvokeLocal(ctx, id, req)
+	if err != nil || !r.cfg.StrictLocalCodec {
+		return v, err
+	}
+	return strictRoundTrip(v, "response value")
+}
+
+// strictRoundTrip 本地严格编解码的一次往返（票 10）：错误文本与远端
+// buildRequest/decodeResponse 逐字对齐（同构判据）。
+func strictRoundTrip(v any, what string) (any, error) {
+	name, payload, err := codec.Encode(v)
+	if err != nil {
+		return nil, fmt.Errorf("rans: encode: %s: %w", what, err)
+	}
+	nv, err := codec.Decode(name, payload)
+	if err != nil {
+		return nil, fmt.Errorf("rans: decode: %s (type %q): %w", what, name, err)
+	}
+	return nv, nil
 }
 
 // isLocalActivationRetryable 报告本地错误是否属于「执行前确定性失败」可
@@ -185,7 +216,14 @@ func (r *Remote) callLocal(ctx context.Context, id rans.ID, req any) (any, error
 // 落败即返回 *ArbitrationLostError，无「无赢家可转发」竞态）。其余本地错
 // 误（handler 错误、ErrBusy/ErrTimeout 等）一律上抛。
 func isLocalActivationRetryable(err error) bool {
-	return errors.Is(err, activation.ErrActivationFailed)
+	if errors.Is(err, activation.ErrActivationFailed) {
+		return true
+	}
+	// 异步窗孪生形态（票 01 时移暴露的存量缺口）：在箱本地投递被 pawnite
+	// 终局排空回绝的 Unavailable+ArbitrationLost——与同步窗的
+	// ErrActivationFailed 同为「确定未执行且归属已在赢家」，重试经路由
+	// 梯子自然送达。
+	return rans.CodeOf(err) == rans.CodeUnavailable && rans.ReasonOf(err) == rans.ReasonArbitrationLost
 }
 
 // invalidateOnFailure 可重试类发送失败后的缓存失效（钩子④调用点 + NotFound
@@ -212,6 +250,7 @@ func (r *Remote) SendOneWay(ctx context.Context, id rans.ID, req any) error {
 func (r *Remote) SendOneWayOpts(ctx context.Context, id rans.ID, req any, opts routing.InvokeOptions) error {
 	err := r.sendOneWayOnce(ctx, id, req, opts)
 	if isLocalActivationRetryable(err) {
+		r.invalidateOnFailure(id, err) // 同 CallOpts：异步窗陈旧 self 缓存就地失效
 		err = r.sendOneWayOnce(ctx, id, req, opts)
 	}
 	return err
@@ -403,76 +442,4 @@ func (r *Remote) decodeResponse(page []byte) (any, error) {
 		return nil, fmt.Errorf("rans: decode: response value (type %q): %w", env.TypeName, err)
 	}
 	return v, nil
-}
-
-// sendLocalOneWay 本地 OneWay：激活编排 + 收件箱准入即返回，实体在 Pawnite
-// loop goroutine 上串行执行（localOneWay 只留痕结果）。
-func (r *Remote) sendLocalOneWay(ctx context.Context, id rans.ID, req any) error {
-	p, err := r.cfg.Manager.GetOrActivate(ctx, id)
-	if err != nil {
-		return err // ErrUnknownKind / ErrActivationFailed 透传
-	}
-	ent, ok := r.cfg.Manager.EntityOf(id)
-	if !ok {
-		return activation.ErrBusy // 激活竞态极小窗：实体刚被逐出，按 busy 让调用方重试
-	}
-	if !p.ReceiveRequest(&localOneWay{
-		id:  id,
-		ent: ent,
-		// Tell 是因果链边界（H12 决策 15）：不携带调用方的路径——目标
-		// Handle ctx 无因果值，其后续 Call 视为新的链起源（远端腿同款
-		// 边界在 buildRequest 的 MsgOneWay 分野）。
-		ctx: ctxkey.RebuildPropagation(ctxkey.WithoutCausal(ctx)),
-		req: req,
-	}) {
-		return activation.ErrBusy
-	}
-	return nil
-}
-
-// localOneWay 本地单向投递：与远端投递同入箱接口（规格 §4.4 网络无关入站
-// 抽象），Deliver 在串行 loop 上执行实体，结果与错误都只留痕——OneWay
-// 无回执（规格 §8.2「一切失败记日志」）。ctx 已在 sendLocalOneWay 经传播
-// 键同语义重建（与 callDelivery 同面）。
-type localOneWay struct {
-	id  rans.ID
-	ent rans.Entity
-	ctx context.Context
-	req any
-}
-
-// 编译期断言：localOneWay 满足入站投递契约。
-var _ pawnite.InboundDelivery = (*localOneWay)(nil)
-
-// UUID 收件箱路由键。
-func (d *localOneWay) UUID() rans.ID { return d.id }
-
-// DeliveryDeadline 执行预算自描述（pawnite.Expirable）：OneWay 发送 ctx 经
-// callBudget 派生（恒带 deadline），出队据此复查过期（Reject 仅留痕）。
-func (d *localOneWay) DeliveryDeadline() (time.Time, bool) { return d.ctx.Deadline() }
-
-// Deliver 在 Pawnite loop goroutine 上执行（串行语义落点）。Handle ctx
-// 携带执行实例的 fencing 纪元（与 callDelivery/remoteDelivery 同一接线
-// 面：zombie 迟回的 Handle 续体直写消费方存储时可凭 ctx 令牌被拒；值取
-// 自实际执行投递的 pawnite，而非投递构造时刻的实例引用）与让出重入登记
-// 点（请求与单向投递均携带，ReenterAfter 不随到达路径分叉）。
-func (d *localOneWay) Deliver(p *pawnite.Pawnite) {
-	ctx := ctxkey.WithSelf(ctxkey.WithIncarnation(d.ctx, p.Incarnation()), d.id.Kind, d.id.Key)
-	// 让出面注入（H12 决策 16 后半，与 remoteDelivery 单向腿同构）：单向无
-	// 应答面，只注入 reenter 不注入 defer（远端单向同分野）；detached 腿
-	// ——投递 ctx 的取消面归发送腿（预算派生的 cancel 随入箱返回触发），
-	// wctx 脱钩派生并重挂请求 deadline（deriveWctx），与远端腿同一收场形
-	// 态。缺注入时实体 ReenterAfter panic 折叠回绝，单向无回执面即静默丢。
-	arm := p.NewReenterArm(ctx, true)
-	ctx = ctxkey.WithReenterPoint(ctx, arm)
-	if _, err := d.ent.Handle(ctx, d.req); err != nil {
-		log.Warn("rans/rpc: local one-way handler error",
-			"uuid", d.id.String(), "err", err)
-	}
-}
-
-// Reject 准入回绝（收件箱满/销毁中）：无等待方可回，留痕即收场。
-func (d *localOneWay) Reject(status rans.Code, reason rans.Reason) {
-	log.Warn("rans/rpc: local one-way rejected",
-		"uuid", d.id.String(), "status", uint8(status), "reason", reason.String())
 }

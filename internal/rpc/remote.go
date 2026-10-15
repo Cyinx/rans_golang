@@ -11,12 +11,10 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
-	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/codec"
 	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/activation"
 	"github.com/cyinx/rans_golang/internal/ctxkey"
-	"github.com/cyinx/rans_golang/internal/lifecycle"
 	"github.com/cyinx/rans_golang/internal/log"
 	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/protocol"
@@ -68,6 +66,17 @@ import (
 // 握手 schema 摘要不设配置面：New 以 codec.SchemaDigest()（生成物 init
 // 自动登记的全量形状）注入 tcp；kind 集不参与握手（异构 kind 由 kind
 // 感知放置承担）。
+// RoutingView 路由面的本地成员视图缝（票 01——node 的 membership.
+// LocalView 满足；窄化为 rpc 所需的最小面，测试注替身）。
+type RoutingView interface {
+	// Alive 严格判定：节点存活且代际一致（epoch==0 视为代际未知不过滤）。
+	// 视图不可信（未首刷/超龄）→ 保守存活。
+	Alive(node rans.NodeID, epoch uint64) bool
+	// Invalidate 拓扑信号（连接丢失/端点判停/重定向提示）→ 触发合并窗内
+	// 的一次全量刷新。
+	Invalidate()
+}
+
 type Config struct {
 	NodeID      rans.NodeID
 	ClusterName string
@@ -96,17 +105,23 @@ type Config struct {
 	// 类型注释末条）；≤0 由 New 补内部缺省。
 	DefaultCallTimeout time.Duration
 	MaxCallTimeout     time.Duration
-	// OutboxCapacity/OutboxShards 节点发件箱参数（H11 决策 11，语义见
-	// OutboxConfig）；≤0 由 New 补缺省（65536/16——与 node.DefaultOutbox*
-	// 同值），恒装配无开关。
-	OutboxCapacity  int
-	OutboxShards    int
-	Dial            func(ctx context.Context, addr string) (net.Conn, error)
-	WrapConn        func(net.Conn) net.Conn
-	Placement       Placement
-	LocationCache   *routing.LocationCache
-	CheckpointStore checkpoint.Store
-	PackageTTL      time.Duration
+	// RoutingView 本地成员视图缝（票 01）：路由有效性与地址解析的快照
+	// 优先来源；nil = 无视图形态（回落 directory.OwnerAlive/注册表实时读
+	//——单机/测试构造）。Invalidate 在端点判停/连接丢失/重定向提示时由
+	// 本包回调（拓扑信号触发视图即时刷新）。
+	RoutingView RoutingView
+
+	// StrictLocalCodec 本地严格编解码（票 10，node.Config.Calls 同名透传；
+	// 语义与成本见其文档——钩子只能落 rpc：activation 不得导入 codec）。
+	StrictLocalCodec bool
+	// OutboxCapacity 节点发件箱全箱容量（H11 决策 11 + 票 04 按目标分队
+	// 列）；≤0 由 New 补缺省，恒装配无开关。
+	OutboxCapacity int
+	Dial           func(ctx context.Context, addr string) (net.Conn, error)
+	WrapConn       func(net.Conn) net.Conn
+	Placement      Placement
+	LocationCache  *routing.LocationCache
+	PackageTTL     time.Duration
 	// Metrics 可选指标注册表（规格 §16）：nil = metrics.Default()
 	//（meter "rans"）。New 在此注册本节点的仪表（gateway pending、
 	// queue/inbox 深度、transport 重拨计数与写批量、握手摘要失配计数）——
@@ -114,17 +129,9 @@ type Config struct {
 	// 聚合（观察值求和/计数器共用——多 Remote 单进程形态即 testkit 集群）。
 	Metrics *metrics.Registry
 
-	// ---- 周期任务族（规格 §14.2/§15/§11.1）：Start 起跑、
-	// Shutdown/Close 收口，纠正面默认部署 ----
-
-	// Watchdog 可选看门狗参数（规格 §14.2 三形态）：nil = 缺省参数开跑
-	//（周期 1s、卸载/激活 60s、执行 120s，per-kind 覆盖见
-	// lifecycle.WatchdogConfig——慢实体按轮长放宽）。无关闭开关：
-	// 看门狗是规格规定的纠正面，空闲节点零成本（扫描空表）。
-	Watchdog *lifecycle.WatchdogConfig
-	// CheckpointInterval 周期 checkpoint 间隔（CheckpointStore 已配置才
-	// 接线）；≤0 取缺省 1min（lifecycle 包给定，规格 §15）。
-	CheckpointInterval time.Duration
+	// NodeEpoch 本节点当前代际读取面（停序守卫注销的入参；nil → 停序
+	// 跳过注销，成员键交给 TTL 过期）。装配根接线 Liveness.NodeEpoch。
+	NodeEpoch func() uint64
 
 	// ShutdownTeardown 停序头回调（构造期注入，无运行期选项面）：Remote.
 	// Shutdown 阶段④最先执行，先于目录节点注销与关传输。宿主组件（续租/
@@ -247,6 +254,12 @@ func New(cfg Config) (*Remote, error) {
 			if cfg.LocationCache != nil {
 				cfg.LocationCache.InvalidateNode(node)
 			}
+			if r.outbox != nil {
+				r.outbox.NotifyTargetDown(node) // 票 04：端点判停即开断
+			}
+			if cfg.RoutingView != nil {
+				cfg.RoutingView.Invalidate() // 票 01：端点判停=拓扑信号
+			}
 			r.gw.FailPendingForNode(node, fmt.Errorf("send retries exhausted for node %d", node))
 		})
 	reg.Gauge(metrics.NameGatewayPending, "in-flight request-response pairs in gateway",
@@ -271,11 +284,11 @@ func New(cfg Config) (*Remote, error) {
 	//（TryTell，满即丢）经统一调用面能力探测取用。满策略分野见决策 12。
 	ob, oerr := NewOutbox(OutboxConfig{
 		Capacity: cfg.OutboxCapacity,
-		Shards:   cfg.OutboxShards,
 		Send:     r.gw.SendOneWay,
 		SendCall: r.gw.SendOneWayBounded,
 		Metrics:  reg,
 	})
+	r.gw.SetCancelQueue(ob) // 票 12：MsgCancel 经请求同一目标队列
 	if oerr != nil {
 		r.Close()
 		return nil, fmt.Errorf("rans: new: outbox: %w", oerr)
@@ -292,6 +305,10 @@ func New(cfg Config) (*Remote, error) {
 	canceledCalls := reg.Counter(metrics.NameCallCanceled,
 		"requests dropped as canceled at dequeue (caller canceled while pending)")
 	cfg.Manager.BindCanceledHook(func() { canceledCalls.Add(1) })
+	r.disp.BindCanceledCounter(canceledCalls) // 票 12：转发前取消收场同面聚合
+	if cfg.RoutingView != nil {
+		r.disp.BindViewInvalidate(cfg.RoutingView.Invalidate) // 票 01：重定向提示触发视图刷新
+	}
 	// 传播键护栏丢弃计数（H10 决策 8）：护栏守在过线打包面（buildRequest），
 	// 丢弃 = 位置透明的降级而非失败——计数 + Warn 留痕见 notePropDrops。
 	r.propValueDropped = reg.Counter(metrics.NamePropValueDropped,

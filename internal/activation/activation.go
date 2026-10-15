@@ -15,6 +15,7 @@ import (
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
+	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/pawnite"
 )
 
@@ -34,6 +35,14 @@ var (
 	// 确定性失败）。
 	ErrActivationFailed = rans.NewError(rans.CodeUnavailable, rans.ReasonActivationFailed,
 		"rans: activate: activation failed and pawnite reached terminal state")
+	// ErrFactoryPanic：用户工厂 panic（CodeError+ActivationFailed）——确定性缺陷
+	// 不可重试（Is 先比 Code：不命中 ErrActivationFailed 的重试判据）。
+	ErrFactoryPanic = rans.NewError(rans.CodeError, rans.ReasonActivationFailed,
+		"rans: activate: entity factory panicked")
+	// ErrTableSealed：表已封（成员面让位——同 NodeID 更大代际占据成员键，
+	// 本进程停止服务）：新激活一律不可重试失败。
+	ErrTableSealed = rans.NewError(rans.CodeError, rans.ReasonNone,
+		"rans: activate: table sealed (node superseded)")
 	// ErrRestoreFailed：激活恢复失败（Store 读取 IO 错误或快照解码错误）。
 	// 作为激活失败的根因出现在日志与错误链里（非调用状态码——端口契约
 	// 错误保留普通 error 形态）；本地调用方看到的对外形态是
@@ -82,9 +91,14 @@ type instance struct {
 }
 
 type Table struct {
-	dir   directory.Directory
-	self  rans.NodeID
-	kinds map[string]rans.Factory
+	dir     directory.Directory
+	self    rans.NodeID
+	kinds   map[string]rans.Factory
+	metrics *metrics.Registry // 观测注册表（Options.Metrics；nil → Default）
+	// fencingFloorHook 宿主纪元下限钩子（Options.FencingFloor；nil = 无）。
+	fencingFloorHook func(ctx context.Context, id rans.ID) (uint64, error)
+	// sealed 封表标记（Seal 置位后新激活一律 ErrTableSealed）。
+	sealed atomic.Bool
 	// selfEpoch 节点代际读取面（BindSelfEpoch 装配期单写一次，Start 前
 	// 接线完成——Register/Transfer 写入 Owner.Epoch 的取值源；nil = 0
 	// 形态，见 BindSelfEpoch 契约）。
@@ -126,9 +140,13 @@ type Table struct {
 	// 迁移选点带 kind 维：kind = 迁移实体的
 	// id.Kind——选点与首激活共用 kind 感知 Placement（node 的
 	// placementBridge.PickForKind：候选只含声明承载该 kind 的节点）。
-	placement       func(kind string, exclude rans.NodeID) (rans.NodeID, bool)
-	store           checkpoint.Store
-	stateLoader     StateLoader
+	placement   func(kind string, exclude rans.NodeID) (rans.NodeID, bool)
+	store       checkpoint.Store
+	stateLoader StateLoader
+	// registryForm 目录是否带成员面（票 14 的 epoch-0 闸门判据：registry
+	// 形态下未取号（SelfEpoch==0）的激活直接拒绝——Start 前调用不写
+	// epoch-0 条目；registry-less 形态代际恒 0，闸门不设）。
+	registryForm    bool
 	sendPackage     func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error
 	migrationBudget time.Duration
 
@@ -191,6 +209,13 @@ type Options struct {
 	// carrier.go）。nil → 激活闭包跳过装载（Store 兜底仍独立生效）。
 	// rpc 装配形态经 BindMigrationPackages 接线。
 	StateLoader StateLoader
+	// Metrics 观测注册表（B9 所有权计数器落点）：nil → 进程级
+	// metrics.Default 共享。node 装配根注入本节点注册表。
+	Metrics *metrics.Registry
+	// FencingFloor 宿主纪元下限钩子（A2）：返回该 id 已被宿主自持存储
+	// 接受的最大纪元（0 = 无；每次激活前调用一次，阻塞受激活预算约束）。
+	// 报错 → 激活失败（可重试）。nil = 无钩子。
+	FencingFloor func(ctx context.Context, id rans.ID) (uint64, error)
 	// SendPackage 随迁包直发（规格 §13.3 E1 快路径；nil → 跳过发送）。rpc
 	// 装配形态经 BindMigrationPackages 接线。srcInc 形参是源端落库围栏
 	// incarnation（随迁包源纪元，收端恢复时与 Store 高水位比较）。
@@ -204,9 +229,13 @@ type Options struct {
 
 func New(dir directory.Directory, selfNode rans.NodeID, kinds map[string]rans.Factory, opts ...Options) *Table {
 	m := &Table{
-		dir:    dir,
-		self:   selfNode,
-		kinds:  kinds,
+		dir:   dir,
+		self:  selfNode,
+		kinds: kinds,
+		registryForm: func() bool {
+			_, ok := dir.(directory.NodeRegistry)
+			return ok
+		}(),
 		local:  make(map[rans.ID]*instance),
 		entity: make(map[rans.ID]rans.Entity),
 	}
@@ -221,6 +250,12 @@ func New(dir directory.Directory, selfNode rans.NodeID, kinds map[string]rans.Fa
 		}
 		if o.OnArbitrationLost != nil {
 			m.onArbitrationLost = o.OnArbitrationLost
+		}
+		if o.Metrics != nil {
+			m.metrics = o.Metrics
+		}
+		if o.FencingFloor != nil {
+			m.fencingFloorHook = o.FencingFloor
 		}
 		if o.OnMigrated != nil {
 			m.onMigrated = o.OnMigrated

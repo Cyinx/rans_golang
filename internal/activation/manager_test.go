@@ -3,6 +3,7 @@ package activation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -307,24 +308,36 @@ func TestGetOrActivate_ActivationFailureAsyncEvictsEntry(t *testing.T) {
 	}
 }
 
-// TestFactoryPanicDoesNotStrandCreationLock：用户工厂（rans.Factory）
-// panic 沿调用链传播（编程错误不吞），但不得滞留 m.mu——创建段若手工
-// 解锁，panic 直接跳过解锁点，后续任何激活永久死锁（爆炸半径从
-// 一个实体扩大到全表）。
-func TestFactoryPanicDoesNotStrandCreationLock(t *testing.T) {
+// TestGetOrActivate_FactoryPanicReturnsError：用户工厂（rans.Factory）panic
+// 收敛为不可重试错误（CodeError+ActivationFailed——不匹配 ErrActivationFailed
+// 的重试判据），不留本地条目、计入激活失败；且不得滞留 m.mu——后续任何激活
+// 不被挂死（爆炸半径不得从一个实体扩大到全表）。
+func TestGetOrActivate_FactoryPanicReturnsError(t *testing.T) {
 	m := New(inmem.New(), 1, map[string]rans.Factory{
 		"boom": func(_ rans.ID) rans.Entity { panic("factory bug") },
 		"ok":   func(_ rans.ID) rans.Entity { return &counterEntity{} },
 	})
-	func() {
+	before := activationFailedCounter().Value()
+	boomID, _ := rans.NewID("boom", "x")
+	err := func() (err error) {
 		defer func() {
-			if recover() == nil {
-				t.Fatal("factory panic must propagate to the caller")
+			if r := recover(); r != nil {
+				err = fmt.Errorf("GetOrActivate panicked: %v", r)
 			}
 		}()
-		boomID, _ := rans.NewID("boom", "x")
-		_, _ = m.GetOrActivate(context.Background(), boomID)
+		_, err = m.GetOrActivate(context.Background(), boomID)
+		return err
 	}()
+	if rans.CodeOf(err) != rans.CodeError || rans.ReasonOf(err) != rans.ReasonActivationFailed ||
+		errors.Is(err, ErrActivationFailed) {
+		t.Fatalf("err = %v, want non-retryable CodeError+ActivationFailed", err)
+	}
+	if _, ok := m.GetLocal(boomID); ok {
+		t.Fatal("factory panic must leave no local entry")
+	}
+	if got := activationFailedCounter().Value(); got != before+1 {
+		t.Fatalf("rans.activation.failed = %v, want %v (counted exactly once)", got, before+1)
+	}
 	done := make(chan error, 1)
 	go func() {
 		okID, _ := rans.NewID("ok", "y")

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/internal/membership"
 	"github.com/cyinx/rans_golang/internal/placement"
 )
 
@@ -67,11 +68,39 @@ var _ Placement = (*RandomPlacement)(nil)
 type placementBridge struct {
 	policy  Placement             // nil → RandomPlacement（spec：nil → 随机）
 	scanner placement.KindScanner // nil → 恒空候选（inmem 等无成员视图形态）
+	view    *membership.LocalView // 节点本地成员视图（票 01）：kind 维候选
+	// 的优先来源（周期快照）；nil/视图不可信回落 scanner 实时读。
 }
 
-// pickForKind kind 维候选计算 + 策略选点。scanner 缺席 → 空候选交策略自
-// 行收口（缺省随机与 (0,false) 同义）；候选查询失败收敛 (0, false)。
+// pickForKind 首激活面的候选计算（票 01 视图优先 + 票 03 含 self）：候选
+// 含声明承载 kind 的存活节点——含本节点（仍过滤 draining）。视图不可信
+// （超龄/未首刷）回落实时读。
 func (b *placementBridge) pickForKind(kind string, exclude rans.NodeID) (rans.NodeID, bool) {
+	policy := b.policy
+	if policy == nil {
+		policy = defaultRandomPlacement
+	}
+	if b.view != nil {
+		if cands := b.view.Candidates(kind); cands != nil {
+			return policy.Pick(kind, exclude, cands)
+		}
+	}
+	if b.scanner == nil {
+		return policy.Pick(kind, exclude, nil)
+	}
+	candidates, ok := placement.QueryCandidates(func(ctx context.Context) ([]rans.NodeID, error) {
+		return b.scanner.NodesByKind(ctx, kind)
+	}, 0) // 0 = 不排除（首激活候选含本节点；0 非法节点号）
+	if !ok {
+		return 0, false
+	}
+	return policy.Pick(kind, exclude, candidates)
+}
+
+// PickForKindMigrate 迁移选点面（activation 的 Placement 注入，票 03 两面
+// 分立）：候选排除本节点——迁移是换家不是续住。低频决策不经视图快照
+// （快照可能陈旧——迁移目标错选代价高，同接管闸门类保持实时读）。
+func (b *placementBridge) PickForKindMigrate(kind string, exclude rans.NodeID) (rans.NodeID, bool) {
 	policy := b.policy
 	if policy == nil {
 		policy = defaultRandomPlacement
@@ -112,8 +141,8 @@ func (b *placementBridge) Pick(exclude rans.NodeID) (rans.NodeID, bool) {
 	return b.pickAll(exclude)
 }
 
-// PickForKind 满足 internal/rpc.KindPlacement：候选只含声明承载 kind 的存
-// 活节点（纯接入节点不进业务 kind 候选）。
+// PickForKind 满足 internal/rpc.KindPlacement（首激活面，票 03：候选含
+// 本节点，RandomPlacement 均匀随机——本地占比 ≈ 1/N）。
 func (b *placementBridge) PickForKind(kind string, exclude rans.NodeID) (rans.NodeID, bool) {
 	return b.pickForKind(kind, exclude)
 }

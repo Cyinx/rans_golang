@@ -53,10 +53,11 @@ type Pawnite struct {
 
 	// 让出重入（H12 决策 16/17 后半，机制见 reenter.go）：续体信号 + mu 队列
 	//（then 回 loop 的串行执行序）、在飞 work 登记表与挂起交接。
-	reenterCh   chan struct{}          // 续体就绪信号（loop 消费；容量 1 非阻塞投递）
-	reenterQ    []func()               // mu：续体 FIFO 队列
-	works       map[*workUnit]struct{} // mu：实例级在飞 work 登记表
-	heldHandoff *heldHandoff           // mu：等在途 work 的挂起交接请求
+	reenterCh   chan struct{}            // 续体就绪信号（loop 消费；容量 1 非阻塞投递）
+	reenterQ    []func()                 // mu：续体 FIFO 队列
+	works       map[*workUnit]struct{}   // mu：实例级在飞 work 登记表
+	deferred    map[*deferEntry]struct{} // mu：未收场延迟应答记账（票 11；nil = 无）
+	heldHandoff *heldHandoff             // mu：等在途 work 的挂起交接请求
 
 	// 终局归一（mu 保护）：五条终局路径（优雅销毁、Start 前快路径、迁移赢、
 	// 仲裁输、看门狗强弃）的原因单点——写一次（setTerminalLocked）、迟到

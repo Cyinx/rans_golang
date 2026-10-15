@@ -2,6 +2,148 @@
 
 对外发版记录（semver tag 对应）。
 
+## v0.27.0（滚动不兼容）
+
+主题：**控制面拓扑 / 调用语义 / 持久化与目录运维 / 治理** 四域优化批
+（架构审查 B 系 + 规划期新发现）。本版为**断点版本**：握手与目录条目
+语义变更，不支持滚动升级——先停全部节点再升（操作要点见
+`docs/consumer-upgrade-notice.md` v0.27.0 节）。
+
+### 线协议与集群拓扑（破坏性）
+
+- 握手版本区间升至 **v5**（v4 及更早集群被拒）。启动代际检查沿用
+  （协议区间不相交即拒）。
+- **epoch-0 条目形态消亡**：`node.Start` 次序改为同步取号 → 绑定监听
+  （暂不接入）→ 同步首写成员键 → 开始接入——服务先于取号的 epoch-0
+  窗口不再存在；取号/首写失败即 Start 报错（终态，资源收口）。
+  `luaRegister` 分支 2 删除 `ce==0` 收养条件——遗留 epoch-0 条目经
+  CAS 接管自愈；`directory.OwnerAlive` 拆严格/提示双轨（registry 形态
+  epoch-0 目录条目判死可接管；放置提示缓存条目 epoch=0 是「未知」语
+  义不误杀）。**公开 API 变更**：`directory.OwnerAlive` 严格化（提示
+  判定走 `NodeRegistry.NodeEpoch` 存活面）。
+- **节点本地成员视图**（B1）：周期刷新（缺省 1s，`Tuning.
+  MembershipRefresh` 可调、下限 100ms）——路由有效性/放置候选/地址解析
+  读视图快照，注册表读放大收口（每跳一次 GET → 周期节奏）；死 owner
+  判定经实时坐实（决策记录 docs/decisions/2026-10-14-dual-track-
+  validity.md）。观测：`rans.membership.view_{age_ms,refresh_failed,
+  invalidations}`。
+- 发件箱重构（B3）：**按目标分队列**（跨目标互不阻塞）+ 死目标熔断
+  （开断清扫/冷却探针/入站可达闭合）+ 控制帧预留容量；**删除
+  `node.Config.Outbox.Shards`**。FIFO 承诺收窄为「同一连接内的写出序」
+  （例外清单见 README）。
+- 预算语义（B4）：扩展块 `budget_ms` 发送时刻按剩余重写（排队/转发耗
+  时扣除）；写出前过期检查（过期帧不送出）；每次发送尝试前查 deadline。
+- 连接收敛保序缓解（B5）：胜出的新连接等旧连接退役排空后才放行。
+- 位置缓存 LRU 化 + 节点二级索引 + 免分配分片哈希（S15）。
+- 发送校验握手对端身份（新发现）：解析地址被其他节点复用时帧不误投
+  （`tcp.ErrWrongPeer`）。
+- 首激活放置候选**含本节点**（对齐 README；迁移选点仍排除）——
+  `node.Placement.Pick` 的 candidates 是否含 self 取决于场景。
+
+### 调用语义（破坏性）
+
+- **`rans.ReenterAfter` 的 `then` 改签名** `func(ctx, v, err)`（破坏
+  性）：续体 ctx 以 Handle ctx 值链为底、重挂请求 deadline、无
+  DeferPoint（then 内 `rans.Defer` panic）。
+- 唯一投递信封（B6）：本地 Call/Tell/远端三条入站路径共用一个 Handle
+  ctx 构造；本地 Call 实现 CancelAware（在箱取消出队即弃并计数）；本地
+  严格编解码模式 `Calls.StrictLocalCodec`（opt-in：未注册类型本地即
+  败、引用别名切断）。
+- Deferred 终局收场（B7 轻量档）：实例终局（钝化/迁移/销毁/强弃）对未
+  Reply 的 Responder 立即回 `Timeout+Deactivated`；迟到 Reply 丢弃。
+- 取消语义收口（S1/S2）：MsgCancel 经请求同一目标队列（不超车）；重定
+  向提示改道 pending（取消跟随赢家）；输家对已取消投递不再转发。
+- 超时错误满足 `errors.Is(err, context.DeadlineExceeded)`（R9）。
+- 随迁包恢复次序（B12）：先判旧后 Restore（实体零污染）；判旧且 Store
+  未命中 → 裸激活（已删除状态不复活）；同纪元内容已删弃包。
+
+### 持久化与目录运维
+
+- `redis.Options` 扩展（B2 客户端）：`MasterName`（哨兵）/`Username`
+  （ACL）/`TLSConfig`/三个超时/`Cluster`（单种子显式集群）；
+  `ContextTimeoutEnabled` 恒开——ctx 预算真正约束 Redis IO。
+- 墓碑可选 TTL（B2 墓碑）：`TombstoneTTL`（opt-in，缺省 0=永久）；
+  开启前提 = 纪元下限来源（`node.New` 校验：`HighWaterReader` Store
+  或 `FencingFloor`）。
+- `checkpoint/contract.RunStoreSuite`（B8）：Store 可执行契约套件；
+  README 新增「宿主围栏契约」节（正确 MySQL 配方）。
+- 迁移目标代际未知即迁移失败（不再以 `{target,0}` 换锁）。
+
+### 治理与文档
+
+- 租约时代命名收口（B9 余项）：**`node.Config.Lease` → `Liveness`**
+  （`LeaseConfig` → `LivenessConfig`；字段名不变）；指标
+  `rans.lease.self_fenced` → **`rans.membership.self_fenced`**。
+- 协议金向量入库（B13 Go 侧）：`testdata/vectors/*.vec`（当前 Go 实现
+  的线形态基准，漂移即红）。
+- 内部文档回到 main 跟踪（B14）：`.scratch/`、`AGENTS.md`、
+  `docs/{superpowers,porting,decisions,agents}/` 等；公开线同步改
+  `tools/sync-oss-snapshot.sh`（临时 index plumbing）。
+- README 架构节重写到 v0.27 模型（成员视图/按目标发件箱/严格判定/
+  宿主围栏/Redis 运维前提）。
+
+## v0.26.0（滚动不兼容）
+
+主题：**review14 修复批**——成员面一死永死、纪元下限、陈旧即失主与断点
+升级防护（架构审查 A1–A9 + 耦合项 B9/B10/R11 与两处并发缺陷）。本版为
+**断点版本**：握手与注册/成员语义变更，不支持滚动升级——先停全部节点
+再升（操作要点见 `docs/consumer-upgrade-notice.md` v0.26.0 节）。
+
+### 线协议与集群拓扑（破坏性）
+
+- 握手版本区间升至 **v4**（v3 及更早集群被拒）。`node.Start` 新增**启动
+  代际检查**：成员视图存在协议区间不相交的存活节点（含未携带协议区间
+  的断点前版本节点）即拒绝启动；读注册表失败 fail-open 放行。
+- `directory.NodeRegistry` 新增 `RenewNode`（比对续期三态 Renewed/
+  Absent/Superseded）与 `Nodes`（存活节点全量信息，含 draining）；
+  `UnregisterNode` 增纪元参数（0=无条件；非 0 仅当键内代际相等才删）。
+  **第三方注册表实现须跟进补方法**。成员键值新增 `pmin`/`pmax` 协议
+  区间字段。
+- 目录 Lua：`luaRegister` 增第 6 参 `floor`（纪元下限）——三个赢分支
+  统一 `inc = max(现值, floor)+1`；新增 `luaRenew` 与
+  `luaUnregisterNodeGuard` 两个单键 Lua；inmem 同语义。
+
+### 成员面与所有权
+
+- **成员面一死永死**：Liveness 周期由无条件重写改为 `RenewNode` 比对
+  续期——成员键在节点存活期间消失（进程暂停 ≥ TTL、Redis 丢键/逐出）
+  时本代际作废：两遍围栏全部本地实例（+ 激活换代复核）并重新取号写
+  新键（写成功才发布，键不复活）；成员键被更大代际占据（NodeID 重号）
+  时本进程让位（封表 + 自关）。围栏一律按实例身份
+  （`FenceIfOwner`/`FenceWhere` + 身份守卫销毁）。
+- **陈旧即失主**：`checkpoint.ErrStaleIncarnation` 统一按所有权丢失
+  处理——周期 checkpoint 围栏止损销毁、Retire 立即停止重试、钝化按无
+  快照直接终局、迁移判输围栏销毁源实例、激活后落库遇 stale 让激活
+  失败（可重试）。
+- **纪元下限**：激活取号 = max(Store 高水位（实体可快照且 Store 实现
+  `HighWaterReader`）, `node.Config.FencingFloor`（新公开钩子——宿主
+  自持存储消费方报告该实体已接受的最大纪元）)；任一读取出错激活失败
+  （可重试）。目录键丢失/复活形态下新纪元仍高于持久层围栏水位。
+- 接管赢方 Info 日志；新增指标 `rans.ownership.{takeover_won,
+  stale_fenced,lost_sent,lost_received}` 与 `rans.membership.
+  {resurrected,superseded}`；`rans.lease.self_fenced` 改按轮计数。
+- 修复 `InstanceOwner` 与逐出的并发 map 读写（两把锁两张口径，运行时
+  fatal 级）；所有权丢失通知收端消除「比对与围栏之间换代交错 → 新化身
+  被误围栏且永久围栏」的 TOCTOU。
+
+### 调用面与生命周期
+
+- 用户工厂 panic 收敛为不可重试 `CodeError+ActivationFailed`
+  （`ErrFactoryPanic`）：远端读循环上一帧请求即崩整个进程的缺陷修复。
+- MessageID 改随机起点（`wire.NewIDGen`，零值语义保留）：同 NodeID 重启
+  后旧化身在途请求的迟到应答不再命中新化身的无关请求（错值静默交付
+  与非幂等调用无条件重放两缺陷）。
+- 本地 Tell 的 Handle ctx 与远端同构（不随发送腿取消、不携带发送方
+  Defer 登记点）。
+- 周期任务（看门狗 / checkpoint sweeper）上移 `node.Start`：**Standalone
+  形态现拥有看门狗与周期 checkpoint**（此前静默缺席）；`rpc.Config` 删除
+  `Watchdog`/`CheckpointStore`/`CheckpointInterval` 三字段。
+- 删除死配置 `node.KindOptions.Watchdog`（生效面一直是
+  `Watchdog.KindOverrides`）；构造期校验 `KindOptions` 与
+  `Watchdog.KindOverrides` 的键须属于 `Kinds`（拼错即报错）。
+- 周期 checkpoint 落库 ctx 脱离扫描轮取消（重挂原 deadline——Store
+  尊重 ctx 时不再丢该轮快照）。
+
 ## v0.25.0（2026-10-13）
 
 主题：**开源公开发布（首个 GitHub 公开 tag）**。对外 Go API、线协议、

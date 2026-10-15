@@ -103,6 +103,15 @@ func TestFault_TakeoverForm1MemberKeyDeleted(t *testing.T) {
 		t.Fatal("old owner must fence and destroy the taken entity within seconds (takeover notification)")
 	}
 
+	// B9 观测：接管赢方 takeover_won ≥1、旧 owner lost_received ≥1
+	//（节点注册表读数，懒建计数器未注册计 0）。
+	if got := nodeMetricVal(t, c.Node(1), "rans.ownership.takeover_won"); got < 1 {
+		t.Fatalf("rans.ownership.takeover_won = %v on winner, want >= 1", got)
+	}
+	if got := nodeMetricVal(t, c.Node(0), "rans.ownership.lost_received"); got < 1 {
+		t.Fatalf("rans.ownership.lost_received = %v on old owner, want >= 1", got)
+	}
+
 	// 窗口期无双服务：新旧 owner 双侧发起的调用全部收敛新 owner，计数连续。
 	for i, want := range []int{2, 3, 4, 5} {
 		node := i % 2
@@ -184,82 +193,35 @@ func TestFault_TakeoverForm2KillMembership(t *testing.T) {
 	}
 }
 
-// TestFault_TakeoverForm3EpochAllocationFailure：双节点 redis 集群，节点
-// A 装配期布防取号失败门控（先于 Start——取号仅发生在存活节拍的未取号
-// 期，成功即缓存不再取号，事后布防不可达）→ A 首个存活节拍即取号失败：
-// 不写成员键、对成员视图永不可见（取号失败按真实时刻入账 SelfFence 时钟
-// 的 e2e 承载）→ A 本地激活照常服务（激活不依赖成员可见性——不可见节点
-// 仍在服务正是双活风险的来源）→ B 对 A 的条目（epoch 0 形态）按成员键缺
-// 席判死，CAS 接管翻转归属；接管通知经成员键派生寻址解析不到 A（best-
-// effort 丢失）——止损不依赖通知，由 A 自身 SelfFence 兜底 → 止损窗关闭
-// 后双侧调用收敛新 owner，计数连续（A 的本地副本已销毁且不复活，销毁后
-// A 的调用经目录路由 B）。
-//
-// 断言分工：「止损按预期时长触发、不缺席」归本测试（e2e 观测面为本地激
-// 活表逐出）；「不提前触发」的负向断言归 internal/membership 记账缝单测
-// （TestSelfFence_EpochFailureNotEarly）——e2e 墙钟负向断言在摇测负载下
-// 不可靠，两层各有正本。
-func TestFault_TakeoverForm3EpochAllocationFailure(t *testing.T) {
+// TestFault_TakeoverForm3StartFailsOnEpochAllocation（票 14 语义重塑）：
+// 同步取号使「取号失败的不可见节点仍在服务」形态消亡——取号失败即
+// Start 终态报错：无监听残留、成员视图不可见、其余节点不受影响（原形
+// 态的本地服务/接管/止损链随 epoch-0 窗口一并退役；运行期成员面故障由
+func TestFault_TakeoverForm3StartFailsOnEpochAllocation(t *testing.T) {
 	const (
 		leaseTTL   = 2 * time.Second
 		hbInterval = 100 * time.Millisecond
-		selfFence  = 800 * time.Millisecond
 	)
 	mustRedis(t)
 	c := NewCluster(t, 2, counterKinds(nil), WithRedis(redisAddr(), leaseTTL, hbInterval),
-		WithNodeEpochFailure(0), WithNodeSelfFence(0, selfFence))
+		WithNodeEpochFailure(0))
 	ctx := context.Background()
-	dir := c.Directory()
-	id := mustID(t, "counter", "takeover-form3")
-	reg, ok := dir.(directory.NodeRegistry)
+	reg, ok := c.Directory().(directory.NodeRegistry)
 	if !ok {
 		t.Fatal("testkit: redis directory must implement NodeRegistry")
 	}
+	id := mustID(t, "counter", "start-fail-form3")
 
-	// 注入生效前提：A 取号失败不写成员键，对成员视图不可见。
-	pollUntil(t, 2*time.Second, "epoch-starved node stays invisible in member view", func() bool {
+	// 注入生效断言：节点 A 成员键永不可见（Start 失败于同步取号）。
+	pollUntil(t, 2*time.Second, "injected node stays invisible (start failed)", func() bool {
 		ns, err := reg.NodeIDs(ctx)
 		return err == nil && !slices.Contains(ns, rans.NodeID(1))
 	})
-
-	// A 本地激活照常（固定本地放置，不依赖成员视图）。
-	if v, err := c.Node(0).Call(ctx, id, 0); err != nil || v != 1 {
-		t.Fatalf("activation call on invisible node: v=%v err=%v", v, err)
-	}
-	if !c.Node(0).Holds(id) {
-		t.Fatal("precondition: node A must hold the entity")
-	}
-
-	// 接管收敛：B 的调用判死 A 的条目 → CAS 接管（新鲜身份语义：无 Store
-	// 实体计数从 1 起）。
+	// 其余节点照常服务。
 	if v, err := c.Node(1).Call(ctx, id, 0); err != nil || v != 1 {
-		t.Fatalf("takeover call: v=%v err=%v", v, err)
+		t.Fatalf("healthy node service: v=%v err=%v", v, err)
 	}
-	if !c.Node(1).Holds(id) {
-		t.Fatal("takeover must own on node B")
-	}
-	if loc, found, _ := dir.Lookup(ctx, id); !found || loc.Node != 2 {
-		t.Fatalf("ownership must move to node 2: loc=%v found=%v", loc.Node, found)
-	}
-
-	// 旧 owner 止损（本形态的独有半边——通知丢失由 SelfFence 兜底）：取
-	// 号失败持续入账，预期在首败 + SelfFence 内关准入并止损销毁。预算 =
-	// SelfFence + 两个存活节拍 + 摇测余量。
-	stopLoss := selfFence + 2*hbInterval + 3*time.Second
-	pollUntil(t, stopLoss, "self-fence stop-loss destroys the invisible node's entity", func() bool {
-		return !c.Node(0).Holds(id)
-	})
-
-	// 窗口期无双服务/路由收敛：止损窗关闭后双侧调用全部收敛新 owner，计
-	// 数连续——若 A 的本地副本残存或复活，A 侧调用将服务本地计数、破坏
-	// 连续性。
-	for i, want := range []int{2, 3, 4, 5} {
-		node := i % 2
-		if v, err := c.Node(node).Call(ctx, id, 0); err != nil || v != want {
-			t.Fatalf("post-stop-loss call from node %d: v=%v want=%d err=%v", node+1, v, want, err)
-		}
-	}
-	if c.Node(0).Holds(id) {
-		t.Fatal("stop-loss destroy must be sticky (no local revival on the epoch-starved node)")
+	if a := c.Node(0).Addr(); a != "" {
+		t.Fatalf("start-failed node must leave no listener, got %q", a)
 	}
 }

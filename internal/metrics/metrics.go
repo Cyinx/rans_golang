@@ -47,11 +47,11 @@ const (
 	// NameTransportBatchSize 最近一次写冲刷的帧数（ObservableGauge——
 	// writeLoop 队列清空即冲刷，读数即最近批量）。
 	NameTransportBatchSize = "rans.transport.batch_size"
-	// NameLeaseSelfFenced 本节点自检触发轮数累计（Counter——成员键写连续
+	// NameMembershipSelfFenced 本节点自检触发轮数累计（Counter——成员键写连续
 	// 失败超 SelfFence 阈值、对全部本地实体执行止损的轮数，每触发一轮
 	// +1）。注册在节点自有注册表（node 装配期），经 Node.Metrics() 逐节点
 	// 读数——自检是逐节点事实，进程级聚合会抹掉「哪个节点在失联」。
-	NameLeaseSelfFenced = "rans.lease.self_fenced"
+	NameMembershipSelfFenced = "rans.membership.self_fenced"
 	// NameActivationFailed 实体激活失败累计（Counter——激活流程以失败
 	// 收场、实体从未进入 Active 的次数；reason 属性区分失败面）。
 	NameActivationFailed = "rans.activation.failed"
@@ -91,6 +91,30 @@ const (
 	// NameOutboxSendFailed 发件箱发送失败累计（Counter，H11 决策 11）：
 	// worker 发送尝试以错误收场的帧数（重试耗尽/关箱取消等）。
 	NameOutboxSendFailed = "rans.outbox.send_failed"
+	// NameOutboxBreakerOpened 发件箱目标熔断开断累计（Counter，v027 票 04）：
+	// 发送重试耗尽或端点判停触发的按目标熔断次数。
+	NameOutboxBreakerOpened = "rans.outbox.breaker_opened"
+	// NameMembershipViewAge 本地成员视图快照年龄（ObservableGauge，票 01；
+	// 毫秒，-1 = 未首刷）。
+	NameMembershipViewAge = "rans.membership.view_age_ms"
+	// NameMembershipViewRefreshFailed 视图刷新失败累计（票 01；超龄保守存
+	// 活的观测面——失败必然伴随本计数）。
+	NameMembershipViewRefreshFailed = "rans.membership.view_refresh_failed"
+	// NameMembershipViewInvalidations 即时失效触发累计（票 01；含合并窗并
+	// 入的事件数）。
+	NameMembershipViewInvalidations = "rans.membership.view_invalidations"
+	// NameOwnershipTakeoverWon 死 owner CAS 接管获胜累计（B9）。
+	NameOwnershipTakeoverWon = "rans.ownership.takeover_won"
+	// NameOwnershipStaleFenced 陈旧落库拒写触发的围栏/失主止损累计（B9）。
+	NameOwnershipStaleFenced = "rans.ownership.stale_fenced"
+	// NameOwnershipLostSent 所有权丢失通知发出累计（B9）。
+	NameOwnershipLostSent = "rans.ownership.lost_sent"
+	// NameOwnershipLostReceived 所有权丢失通知收到并命中累计（B9）。
+	NameOwnershipLostReceived = "rans.ownership.lost_received"
+	// NameMembershipResurrected 存活期成员键丢失（重取号，旧代际作废）累计。
+	NameMembershipResurrected = "rans.membership.resurrected"
+	// NameMembershipSuperseded 同 NodeID 更大代际占据成员键（让位）累计。
+	NameMembershipSuperseded = "rans.membership.superseded"
 )
 
 // Registry 指标注册表：meter 名 + 仪表登记。并发安全；Counter/Gauge 可在

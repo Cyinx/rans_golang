@@ -13,17 +13,22 @@ import (
 	"github.com/cyinx/rans_golang"
 )
 
-// OwnerAlive 成员代际有效性判定（H13 决策 20：条目有效 ⟺ owner(node,
-// epoch) 在成员视图存活）——目录实现 NodeRegistry 即查（存活且 epoch 一致，
-// epoch>0 的归属同节点号重启换代即死）；读错误保守返回 true（err 无法确认
-// 成员键状态，判死会让瞬时故障触发 CAS 接管与缓存失效，真死由发送失败/
-// 重试环兜底）；键不在/已过期才判死；无成员面的目录保守返回 true（不可
-// 判死，维持既有转发语义）。激活（接管决策）与路由（陈旧收口）共用判据，
-// 归本包避免两处漂移。
+// OwnerAlive 成员代际有效性判定（H13 决策 20 + 票 15 严格化）：条目有效
+// ⟺ owner(node, epoch) 在成员视图存活**且条目代际非零**——目录实现
+// NodeRegistry 即查（存活且 epoch 一致）；epoch-0 条目在 registry 形态
+// 是遗留形态（票 14 起取号同步化不再产生）：判死→可接管（分支 3 CAS 自
+// 愈）。读错误保守返回 true（err 无法确认成员键状态，判死会让瞬时故障
+// 触发 CAS 接管与缓存失效，真死由发送失败/重试环兜底）；键不在/已过期
+// 才判死；无成员面的目录保守返回 true（不可判死，维持既有转发语义）。
+// 激活接管闸门与本判定共用。提示条目（放置提示/迁移提示缓存，epoch=0
+// 是「未知」语义）不得经本面判定——用 NodeRegistry.NodeEpoch 的存活面。
 func OwnerAlive(ctx context.Context, dir Directory, o Owner) bool {
 	reg, ok := dir.(NodeRegistry)
 	if !ok {
 		return true
+	}
+	if o.Epoch == 0 {
+		return false // registry 形态遗留 epoch-0 条目：判死可接管（票 15）
 	}
 	ep, alive, err := reg.NodeEpoch(ctx, o.Node)
 	if err != nil {
@@ -32,7 +37,7 @@ func OwnerAlive(ctx context.Context, dir Directory, o Owner) bool {
 	if !alive {
 		return false
 	}
-	return o.Epoch == 0 || ep == o.Epoch
+	return ep == o.Epoch
 }
 
 // ErrNotOwner 是 Transfer 归属校验失败的哨兵（条目在但归属不符——含墓碑；
@@ -93,16 +98,25 @@ type NodeRegistry interface {
 	// 的实现返回 0）。
 	MemberTTL() time.Duration
 
-	// UnregisterNode 成员注销：删判活键 + 总表 field（即时退出成员视图，
-	// 优雅停机停序用）。实体条目不清扫——残留由死 owner 自愈承接。
-	UnregisterNode(ctx context.Context, node rans.NodeID) error
+	// UnregisterNode 成员注销：epoch ≠ 0 时仅当键内代际 == epoch 才删
+	//（守卫注销——迟到停机不得误删已让位者的键；不匹配为 no-op）；0 =
+	// 无条件（现语义）。删判活键 + 总表 field（即时退出成员视图，优雅
+	// 停机停序用）。实体条目不清扫——残留由死 owner 自愈承接。
+	UnregisterNode(ctx context.Context, node rans.NodeID, epoch uint64) error
 
 	// RegisterNode 无条件写/续期 node 的注册（双写：总表登记 + 判活键
 	// SET PX）：值=JSON{addr,kinds,draining,epoch}（nil kinds 规范化为空
 	// 数组，draining/epoch=0 缺省不写），过期阈值与成员键同源（实现自身
 	// 的 HeartbeatTTL 配置）。幂等可重复调用（覆盖），重注册即地址/
-	// kinds/draining/epoch 更新。
+	// kinds/draining/epoch 更新。首写与换代后的重建用它——存活节拍的
+	// 周期续期走 RenewNode（比对裁定，不复活）。
 	RegisterNode(ctx context.Context, node rans.NodeID, info NodeInfo) error
+
+	// RenewNode 比对续期 node 的成员键：键缺席 → RenewAbsent 且不重建
+	//（复活须走 RegisterNode 重取代际）；键内代际 > info.Epoch →
+	// RenewSuperseded 且值不动（本进程已被顶替）；否则（相等或更小）以
+	// info 覆写并续 TTL → RenewRenewed，总表照旧双写（容忍撕裂）。
+	RenewNode(ctx context.Context, node rans.NodeID, info NodeInfo) (RenewResult, error)
 
 	// NodeEpoch 读 node 的当前代际（存活才返回）：判活键在 → 解析值 JSON
 	// 返回 (epoch, true, nil)；不在/已过期 → (0, false, nil)；值非合法
@@ -129,6 +143,10 @@ type NodeRegistry interface {
 	// 返回 map 归调用方所有。
 	NodeAddrs(ctx context.Context) (map[rans.NodeID]string, error)
 
+	// Nodes 返回存活节点全量信息（含 draining——启动代际检查不过滤排空
+	// 节点：排空中的旧版本节点同样阻断混版本启动）：判活收敛内核的完整
+	// 视图（NodeIDs/NodeAddrs/NodesByKind 的数据源）。返回 map 归调用方。
+	Nodes(ctx context.Context) (map[rans.NodeID]NodeInfo, error)
 	// NodesByKind 返回声明承载 kind 的存活节点集（升序去重，kind 感知
 	// 放置的候选面）：探活内核收敛后按 kinds 精确匹配过滤，draining 节点
 	// 不出现。空 kinds 节点不进任何 kind 视图（纯心跳节点不被业务放置
@@ -136,6 +154,18 @@ type NodeRegistry interface {
 	// 面，非错误）。
 	NodesByKind(ctx context.Context, kind string) ([]rans.NodeID, error)
 }
+
+// RenewResult 比对续期（RenewNode）结果三态。
+type RenewResult int
+
+const (
+	// RenewRenewed 续期成功：以调用方值覆写并延长 TTL。
+	RenewRenewed RenewResult = iota
+	// RenewAbsent 判活键缺席：不重建——复活走 RegisterNode 重取代际。
+	RenewAbsent
+	// RenewSuperseded 键内代际更大：本进程已让位，值不动。
+	RenewSuperseded
+)
 
 // NodeInfo 是判活键值的承载四元组（RegisterNode 入参）：监听地址 + 声明
 // 承载的 kind 集 + 排空标记 + 节点代际。Draining 置位表示节点正在
@@ -151,4 +181,9 @@ type NodeInfo struct {
 	// （未接代际面的调用方写法；值上缺省不写，NodeEpoch 读回 0——代际有
 	// 效性判定只对非零代际有意义）。
 	Epoch uint64
+	// ProtoMin/ProtoMax 本节点握手协议版本区间（wire.HandshakeVersion*）：
+	// node.Start 启动代际检查据此拒绝混版本集群（缺字段 0/0 恒不相交——
+	// 断点前版本节点按不兼容处理）。
+	ProtoMin uint16
+	ProtoMax uint16
 }

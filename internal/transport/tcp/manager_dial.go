@@ -58,6 +58,47 @@ func (m *Manager) Listen(ctx context.Context, addr string) (string, error) {
 	return l.Addr().String(), nil
 }
 
+// ListenBind 只绑定不接入（票 14 的 Start 次序面）：返回实际地址，accept
+// 循环经 StartAccept 起——绑定与接入之间的窗口内入站连接停留内核积压，
+// StartAccept 后照常握手接入。绑定即计入单 listener 限额（与 Listen 互
+// 斥）；Manager.Close 照常收口未接入的监听器。
+func (m *Manager) ListenBind(ctx context.Context, addr string) (string, error) {
+	lc := net.ListenConfig{}
+	l, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("rans: listen: %s: %w", addr, err)
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		l.Close()
+		return "", ErrManagerClosed
+	}
+	if m.listener != nil {
+		m.mu.Unlock()
+		l.Close()
+		return "", errAlreadyListening
+	}
+	if m.cfg.TLS != nil {
+		l = tls.NewListener(l, m.cfg.TLS)
+	}
+	m.listener = l
+	m.mu.Unlock()
+	return l.Addr().String(), nil
+}
+
+// StartAccept 起接入循环（ListenBind 的后半；票 14：同步首写成员键之后
+// 才开始接入）。无监听器或已起接入为 no-op（幂等）。
+func (m *Manager) StartAccept() {
+	m.mu.Lock()
+	l := m.listener
+	m.mu.Unlock()
+	if l == nil {
+		return
+	}
+	m.acceptStart.Do(func() { go m.acceptLoop(l) })
+}
+
 // acceptLoop 后台接入循环：Accept 错误三分——监听器已关闭（Manager.Close
 // 的常规收尾）静默终止；临时类（net.Error.Temporary 语义，EMFILE/ENFILE
 // 等资源耗尽形态）退避重试 + Warn 留痕——一次 fd 耗尽不得让入站永久失聪；

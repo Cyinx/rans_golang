@@ -10,7 +10,10 @@ import (
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/directory"
 	"github.com/cyinx/rans_golang/internal/lifecycle"
+	"github.com/cyinx/rans_golang/internal/log"
+	"github.com/cyinx/rans_golang/internal/wire"
 )
 
 // beginDraining 排空标记发布（nil-safe：存活面未装配时 no-op——排空标记
@@ -21,10 +24,10 @@ func (n *Node) beginDraining() {
 	}
 }
 
-// stopHeartbeat 停序头确定性收口：续租（在途一轮刷新 + 在飞销毁）与存活
+// stopHeartbeat 停序头确定性收口：存活节拍（在途一轮刷新 + 在飞销毁）
 // （在途成员键写）逐一等待。自备独立小预算（Shutdown 停序头组件收口共用
 // 常量——排空 ctx 可能已被阶段②③耗尽，等待不该因此被跳过，也不能因组件
-// 僵死挂死停序）。nil-safe：续租/存活面未装配（inmem 形态）时 no-op。
+// 僵死挂死停序）。nil-safe：存活面未装配（inmem 形态）时 no-op。
 func (n *Node) stopHeartbeat() error {
 	if n.lv == nil {
 		return nil
@@ -56,25 +59,77 @@ func (n *Node) Start(ctx context.Context) error {
 		return errors.New("rans: start: already called; Node is single-use — rebuild instead of restarting")
 	}
 	if !n.cfg.Standalone {
-		if err := n.rem.Start(ctx); err != nil {
-			n.runCancel() // 自有 ctx 家族同步收口，不留半开组合体
+		// 启动代际检查（监听前）：成员视图存在协议区间不相交的存活节点
+		//（含缺字段的断点前版本）即拒绝启动——混版本集群零容忍；读注册表
+		// 失败 fail-open（Warn 放行）。
+		if reg, ok := n.dir.(directory.NodeRegistry); ok {
+			if err := n.checkGeneration(ctx, reg); err != nil {
+				n.runCancel()
+				return fmt.Errorf("rans: start: node %d: %w", n.cfg.NodeID, err)
+			}
+		}
+		// Start 次序（票 14）：同步取号 → 绑定（暂不接入）→ 发布实际地
+		// 址/kinds → 同步首写成员键 → 开始接入。任一步失败即终态：已建
+		// 资源收口（监听、自建目录）——服务先于取号的 epoch-0 窗口随同步
+		// 化消亡。
+		if n.lv != nil {
+			if err := n.lv.EnsureEpoch(ctx); err != nil {
+				n.runCancel()
+				n.abandonStart()
+				return fmt.Errorf("rans: start: node %d: epoch allocation: %w", n.cfg.NodeID, err)
+			}
+		}
+		if err := n.rem.Bind(ctx); err != nil {
+			n.runCancel() // Bind 失败内部已 Close 收口
+			n.abandonStart()
 			return fmt.Errorf("rans: start: node %d: %w", n.cfg.NodeID, err)
 		}
 		addr := n.rem.Addr()
 		n.addr.Store(&addr)
-	}
-	if n.lv != nil {
-		// 先发布实际地址/承载 kinds 再 Start——启动即写即带真地址。成员键
-		// 承载 kinds = 本节点工厂表（kind 感知放置据此过滤候选）。
-		n.lv.PublishSelf(n.Addr(), kindNames(n.cfg.Kinds))
-		if err := n.lv.Start(n.runCtx); err != nil {
-			n.runCancel()
-			_ = n.rem.Close()
-			return fmt.Errorf("rans: start: liveness: %w", err)
+		if n.lv != nil {
+			// 成员键承载 kinds = 本节点工厂表（kind 感知放置据此过滤
+			// 候选）；键值携带刚绑定的真实地址。
+			n.lv.PublishSelf(addr, kindNames(n.cfg.Kinds))
+			if err := n.lv.StartSync(n.runCtx); err != nil {
+				n.runCancel()
+				_ = n.rem.Close()
+				n.abandonStart()
+				return fmt.Errorf("rans: start: node %d: %w", n.cfg.NodeID, err)
+			}
 		}
+		n.rem.Accept()
 	}
+	// 看门狗与周期 checkpoint 与传输形态无关：Standalone 也起跑（此前挂在
+	// Remote.Start 上，单节点形态静默缺席）。
+	n.startPeriodicTasks()
 	go n.runIdleCollection(n.runCtx)
 	return nil
+}
+
+// abandonStart Start 失败的终态收口（票 14）：关自建目录（注入目录归调
+// 用方）与传输组合体——不留半开资源。runCancel 由调用方先行（次序与
+// abandon 一致）。
+func (n *Node) abandonStart() {
+	n.addr.Store(nil) // Addr 只报告健康绑定；失败路径不残留半开地址
+	if n.closeDir {
+		if closer, ok := n.dir.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+}
+
+// startPeriodicTasks 起跑与传输无关的周期任务族（两种形态都在 Start 到达，
+// 恰一次由 started 守卫保证）：看门狗（规格 §14.2 三形态纠正面，per-kind
+// 覆盖经 watchdogConfig 换算）与周期 checkpoint sweeper（Store 已配置才
+// 接线，脏纪元门控在 lifecycle 复合体内）。共享 runCtx（Shutdown/Close
+// 收口）。
+func (n *Node) startPeriodicTasks() {
+	go lifecycle.NewWatchdog(n.mgr, *n.watchdogConfig()).Run(n.runCtx)
+	if n.cfg.Store != nil {
+		go lifecycle.NewCheckpointSweeper(n.mgr, lifecycle.CheckpointSweeperConfig{
+			Interval: n.cfg.Tuning.CheckpointInterval,
+		}).Run(n.runCtx)
+	}
 }
 
 // runIdleCollection 自动闲置回收/再平衡循环（构造期登记策略的执行面）：
@@ -184,6 +239,9 @@ func (n *Node) Close() error {
 	n.closeOnce.Do(func() {
 		if n.lv != nil {
 			_ = n.lv.Close()
+			if n.view != nil {
+				n.view.Close()
+			}
 		}
 		n.runCancel()
 		// rem.Close 关传输与网关扫描器（New 即起的 goroutine——Standalone
@@ -220,4 +278,25 @@ func (n *Node) Run(ctx context.Context) error {
 	sctx, cancel := context.WithTimeout(context.Background(), budget) // 例外②：Run 的停机预算（ShutdownBudget 配置，DefaultShutdownBudget 缺省）
 	defer cancel()
 	return n.Shutdown(sctx)
+}
+
+// checkGeneration 启动代际检查：存活节点（除自身——自身旧键是上一存活
+// 期残留）协议区间与本端不相交 → 混版本集群错误；读失败 Warn 放行。
+func (n *Node) checkGeneration(ctx context.Context, reg directory.NodeRegistry) error {
+	nodes, err := reg.Nodes(ctx)
+	if err != nil {
+		log.Warn("rans/node: member view read failed at start; generation check skipped (fail-open)",
+			"self", n.cfg.NodeID, "err", err)
+		return nil
+	}
+	for id, info := range nodes {
+		if id == n.cfg.NodeID {
+			continue
+		}
+		if !wire.HandshakeCompatible(info.ProtoMin, info.ProtoMax) {
+			return fmt.Errorf("mixed-version cluster: live node %d speaks proto [%d,%d], this build speaks [%d,%d]; a breaking upgrade requires stopping all nodes first",
+				id, info.ProtoMin, info.ProtoMax, wire.HandshakeVersionMin, wire.HandshakeVersionMax)
+		}
+	}
+	return nil
 }

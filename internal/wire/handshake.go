@@ -1,8 +1,9 @@
 package wire
 
-// 握手 v3（规格 §10.2 + §6.1 H9）：版本区间协商 +
-// 可扩展握手体 + 摘要降级为观测。v2 → v3 是同版本断点（无兼容
-// 读取：同集群双端同版本，升级先停全部再升）；此后同一 VerMax 内向后
+// 握手 v4（规格 §10.2 + §6.1 H9）：版本区间协商 +
+// 可扩展握手体 + 摘要降级为观测。v3 → v4 是同版本断点（无兼容
+// 读取：同集群双端同版本，升级先停全部再升——注册/成员语义随 v4 变更，
+// node.Start 按成员键协议区间拒绝混版本启动）；此后同一 VerMax 内向后
 // 兼容：新字段只追加字段号、旧端跳过；破坏性变更提升 VerMin 并在
 // CHANGELOG 标「滚动不兼容」。
 
@@ -17,9 +18,16 @@ import (
 // HandshakeVersionMin/Max 本端支持的握手协议版本闭区间（协商按区间——
 // 双端区间相交即可互通，同一 VerMax 内的增量演进不升级版本）。
 const (
-	HandshakeVersionMin uint16 = 3
-	HandshakeVersionMax uint16 = 3
+	HandshakeVersionMin uint16 = 5
+	HandshakeVersionMax uint16 = 5
 )
+
+// HandshakeCompatible 报告对端区间 [min, max] 与本端支持区间是否相交
+// （成员键协议区间的启动代际检查用；缺字段形态 0/0 恒不相交——旧版本
+// 节点按不兼容处理）。
+func HandshakeCompatible(min, max uint16) bool {
+	return min <= HandshakeVersionMax && max >= HandshakeVersionMin
+}
 
 // 握手扩展对象字段号正本（只追加不复用）：新字段只追加字段号，旧端按线型跳过。
 const (

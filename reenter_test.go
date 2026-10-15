@@ -18,7 +18,7 @@ type fakeReenterArm struct {
 	works int
 }
 
-func (a *fakeReenterArm) Reenter(work func(context.Context) (any, error), then func(any, error)) {
+func (a *fakeReenterArm) Reenter(work func(context.Context) (any, error), then func(context.Context, any, error)) {
 	a.works++
 }
 
@@ -37,7 +37,7 @@ func TestReenterAfter_TellFormDelegates(t *testing.T) {
 	arm := &fakeReenterArm{}
 	ctx := ctxkey.WithReenterPoint(context.Background(), arm)
 	rans.ReenterAfter(ctx,
-		func(context.Context) (any, error) { return "v", nil }, func(any, error) {})
+		func(context.Context) (any, error) { return "v", nil }, func(context.Context, any, error) {})
 	if arm.works != 1 {
 		t.Fatalf("arm Reenter calls = %d, want 1", arm.works)
 	}

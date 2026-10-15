@@ -33,7 +33,7 @@ func (p *Pawnite) NewReenterArm(hctx context.Context, detached bool) *ReenterArm
 }
 
 // Reenter 实现 rans.ReenterArm：派生 wctx、登记在飞 work 并起专属 goroutine。
-func (a *ReenterArm) Reenter(work func(ctx context.Context) (any, error), then func(v any, err error)) {
+func (a *ReenterArm) Reenter(work func(ctx context.Context) (any, error), then func(ctx context.Context, v any, err error)) {
 	wctx, cancel := a.deriveWctx()
 	u := &workUnit{cancel: cancel}
 	a.p.mu.Lock()
@@ -59,6 +59,26 @@ func (a *ReenterArm) deriveWctx() (context.Context, context.CancelFunc) {
 		cancel()
 		if deadlineCancel != nil {
 			deadlineCancel()
+		}
+	}
+}
+
+// thenCtx 派生续体 ctx（票 09；契约正本见 rans.ReenterAfter godoc 的 tctx
+// 规则节）：以 Handle ctx 值链为底脱钩其收尾 cancel、重挂原请求 deadline；
+// 无类型遮蔽延迟应答登记点（then 内 Defer 必 panic）；让出面经值链保持
+// （嵌套让出允许）。
+func (a *ReenterArm) thenCtx() (context.Context, context.CancelFunc) {
+	ctx := context.WithoutCancel(a.hctx)
+	var dcancel context.CancelFunc
+	if dl, ok := a.hctx.Deadline(); ok {
+		ctx, dcancel = context.WithDeadline(ctx, dl)
+	}
+	ctx = ctxkey.WithDeferPoint(ctx, nil)
+	ctx, cancel := context.WithCancel(ctx)
+	return ctx, func() {
+		cancel()
+		if dcancel != nil {
+			dcancel()
 		}
 	}
 }
@@ -89,11 +109,13 @@ type workUnit struct {
 // runWork work goroutine 本体：执行 work（panic 折错不杀进程），完成后单临
 // 界区摘除登记 + 续体入队，再释放 wctx 取消面。
 func (p *Pawnite) runWork(u *workUnit, arm *ReenterArm, wctx context.Context,
-	work func(ctx context.Context) (any, error), then func(v any, err error)) {
+	work func(ctx context.Context) (any, error), then func(context.Context, any, error)) {
 	v, err := p.safeWork(wctx, work)
 	task := func() {
 		if then != nil {
-			then(v, err)
+			tctx, tcancel := arm.thenCtx()
+			defer tcancel()
+			then(tctx, v, err)
 		}
 	}
 	p.completeWork(u, arm, task)

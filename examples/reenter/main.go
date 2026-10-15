@@ -77,7 +77,7 @@ func (a *aggregator) Handle(ctx context.Context, req any) (any, error) {
 				return rans.ClientFrom(wctx).Call(wctx, a.slowID, slowReq{N: r.N})
 			},
 			// then（回 loop 串行）：聚合慢结果与让出期间的 note，延迟回复。
-			func(v any, err error) {
+			func(_ context.Context, v any, err error) {
 				agg := gatherReply{Notes: a.notes}
 				if sr, ok := v.(slowReply); ok {
 					agg.Slow = sr.Value
