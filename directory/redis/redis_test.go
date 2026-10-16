@@ -427,6 +427,100 @@ func newEpochSuiteReg(t *testing.T, hbTTL time.Duration) directory.NodeRegistry 
 	return d
 }
 
+// guardRaceHook 守卫注销时序注入钩子：武装后，在守卫注销 Lua 成功返回的
+// 那一刻（单命令 eval/evalsha 面）、收尾 pipeline 执行之前，注入一次同
+// NodeID 的重注册——复现「迟到的停机注销守卫放行后、让位者节点重开」的
+// 窄窗。RegisterNode 走 pipeline 面（ProcessPipelineHook 直通），不会递归
+// 本钩子；守卫拒绝（回复非 1）不注入。
+type guardRaceHook struct {
+	dir    *Directory
+	node   rans.NodeID
+	info   directory.NodeInfo
+	armed  bool
+	fired  bool
+	regErr error
+}
+
+func (h *guardRaceHook) DialHook(next goredis.DialHook) goredis.DialHook { return next }
+
+func (h *guardRaceHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredis.ProcessPipelineHook {
+	return next
+}
+
+func (h *guardRaceHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
+	return func(ctx context.Context, cmd goredis.Cmder) error {
+		err := next(ctx, cmd)
+		if !h.armed || err != nil || !isUnregNodeGuardCmd(cmd) {
+			return err
+		}
+		if c, ok := cmd.(*goredis.Cmd); ok {
+			if v, vErr := c.Int64(); vErr != nil || v != 1 {
+				return err // 守卫拒绝：注入前提不成立
+			}
+		}
+		h.armed = false
+		h.fired = true
+		h.regErr = h.dir.RegisterNode(ctx, h.node, h.info)
+		return err
+	}
+}
+
+// isUnregNodeGuardCmd 识别守卫注销脚本的执行命令：EVALSHA 命中形态第 2 参
+// 是脚本 sha，NOSCRIPT 兜底的 EVAL 形态第 2 参是脚本原文——两者都与
+// scriptUnregNode 同源比对。
+func isUnregNodeGuardCmd(cmd goredis.Cmder) bool {
+	switch cmd.Name() {
+	case "eval", "evalsha":
+	default:
+		return false
+	}
+	args := cmd.Args()
+	if len(args) < 2 {
+		return false
+	}
+	ident, ok := args[1].(string)
+	if !ok {
+		return false
+	}
+	return ident == scriptUnregNode.Hash() || ident == luaUnregisterNodeGuard
+}
+
+// TestUnregisterNode_GuardRaceKeepsReplacedKey 守卫注销迟到重入（真 Redis）：
+// 守卫 Lua 成功删旧键后、收尾 pipeline 执行前，同 NodeID 重开节点重注册
+// 新代际成员键——收尾不得补删新键。误删后果：让位者的 RenewNode 撞缺席
+// （缺席不重建）被误判死亡。时序注入见 guardRaceHook；inmem 无守卫/收尾
+// 两段结构，此竞态不存在，不经契约套件覆盖。
+func TestUnregisterNode_GuardRaceKeepsReplacedKey(t *testing.T) {
+	mustConnect(t)
+	ctx := context.Background()
+	d := newTestDir(t, time.Minute)
+
+	if err := d.RegisterNode(ctx, 7, directory.NodeInfo{Addr: "10.0.0.7:1", Epoch: 7}); err != nil {
+		t.Fatal(err)
+	}
+	hook := &guardRaceHook{
+		dir:   d,
+		node:  7,
+		info:  directory.NodeInfo{Addr: "10.0.0.7:2", Epoch: 8},
+		armed: true,
+	}
+	d.cli.AddHook(hook)
+
+	// 迟到的停机注销：携带旧代际，守卫按键内 epoch==7 放行并删除旧键。
+	if err := d.UnregisterNode(ctx, 7, 7); err != nil {
+		t.Fatal(err)
+	}
+	if !hook.fired || hook.regErr != nil {
+		t.Fatalf("injected re-register did not run cleanly: fired=%v regErr=%v", hook.fired, hook.regErr)
+	}
+	// 让位者的新键必须存活（守卫已删旧键；收尾只清总表 field——超集惰性
+	// 收敛面，让位者的下一次续期 HSet 即自愈，与键丢失的假死亡不同级）。
+	addr, ok, err := d.NodeAddr(ctx, 7)
+	if err != nil || !ok || addr != "10.0.0.7:2" {
+		t.Fatalf("replaced key after guarded unregister = (%q,%v,%v), want (10.0.0.7:2,true,nil)", addr, ok, err)
+	}
+}
+
 // TestNodeEpoch_MonotonicAcrossRestart 节点代际单调（真 Redis）：取号全局
 // 单调，同节点号「注册 → 停（注销/判活键过期）→ 再注册」新代际严格更大，
 // 优雅停机注销不触碰计数器（契约套件平移，inmem 同型测试见 directory/inmem）。

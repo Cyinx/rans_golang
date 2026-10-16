@@ -171,6 +171,126 @@ func TestOutbox_BreakerFailsQueuedCallsFast(t *testing.T) {
 	}
 }
 
+// review15 票 04 回归锚（两处熔断修复）：半开探针的容量拒收路径与探针失
+// 败复开的计数路径此前均无覆盖。
+
+// TestOutbox_BreakerProbeCapacityFailRollsBackHalfOpen 半开探针被容量拒收
+// （全箱占满）后不得残留 probing 标记：残留让「open 且非 probing」恒不
+// 成立，新帧绕过熔断快速失败直达死目标。probing 无外部读数（仅熔断状态
+// 机内部消费），回归锚只能在包内断言状态回滚。
+func TestOutbox_BreakerProbeCapacityFailRollsBackHalfOpen(t *testing.T) {
+	dead := rans.NodeID(3)
+	hog := rans.NodeID(4)
+	gate := make(chan struct{})
+	var deadSends atomic.Int32
+	send := func(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte) error {
+		if target == dead {
+			deadSends.Add(1)
+			return errors.New("node down")
+		}
+		<-gate // hog 首帧卡在发送段，后续帧滞留在箱
+		return nil
+	}
+	reg := metrics.New("outbox-probe-rollback-test")
+	o, err := NewOutbox(OutboxConfig{Capacity: 2, Send: send, Metrics: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { close(gate); o.Close() })
+
+	// hog 占满全箱：首帧进发送段（卡死），两帧在箱 = 容量占满。
+	for i := 0; i < 3; i++ {
+		if err := o.Put(context.Background(), hog, wire.Header{}, nil); err != nil {
+			t.Fatalf("hog put %d: %v", i, err)
+		}
+	}
+	if v := waitReading(t, reg, metrics.NameOutboxDepth, 2); v != 2 {
+		t.Fatalf("depth = %v, want 2 (box full)", v)
+	}
+	// dead 判停开断，冷却期满后试入探针——满箱拒收（确定未入箱）。
+	o.NotifyTargetDown(dead)
+	time.Sleep(outboxBreakerCooldown + 50*time.Millisecond)
+	if err := o.TryPut(dead, wire.Header{MessageID: 100}, nil); !errors.Is(err, errOutboxFull) {
+		t.Fatalf("probe try-put on full box = %v, want errOutboxFull", err)
+	}
+	if n := deadSends.Load(); n != 0 {
+		t.Fatalf("dead sends = %d, want 0 (capacity-rejected probe must not reach send)", n)
+	}
+	q := o.targets[dead]
+	q.mu.Lock()
+	probing := q.probing
+	q.mu.Unlock()
+	if probing {
+		t.Fatal("half-open flag left set after capacity-rejected probe")
+	}
+}
+
+// TestOutbox_BreakerReopenNoDoubleCount 探针失败复开不得对已开断目标重复
+// 计数：openCount 漂移让 NotifyNodeAlive 的零成本快路径永久失效，
+// breakerOpened 不再反映真实开断次数。openCount 无外部读数（仅驱动上述
+// 快路径），漂移只能在包内断言。
+func TestOutbox_BreakerReopenNoDoubleCount(t *testing.T) {
+	dead := rans.NodeID(6)
+	var alive atomic.Bool
+	var delivered atomic.Int32
+	send := func(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte) error {
+		if !alive.Load() {
+			return errors.New("node down")
+		}
+		delivered.Add(1)
+		return nil
+	}
+	reg := metrics.New("outbox-reopen-test")
+	o, err := NewOutbox(OutboxConfig{Capacity: 64, Send: send, Metrics: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+
+	o.NotifyTargetDown(dead) // 首次开断：计数基线 1
+	if v := waitReading(t, reg, metrics.NameOutboxBreakerOpened, 1); v != 1 {
+		t.Fatalf("breaker openings = %v, want 1", v)
+	}
+	time.Sleep(outboxBreakerCooldown + 50*time.Millisecond)
+	// 探针帧失败（连续失败 1，不开断）；随后一帧在探针窗口照常入队，失败
+	// 计满阈值 → 复开。熔断未曾闭合：计数不得再 +1。
+	if err := o.Put(context.Background(), dead, wire.Header{MessageID: 1}, nil); err != nil {
+		t.Fatalf("probe put: %v", err)
+	}
+	if err := o.Put(context.Background(), dead, wire.Header{MessageID: 2}, nil); err != nil {
+		t.Fatalf("follow-up put: %v", err)
+	}
+	if v := waitReading(t, reg, metrics.NameOutboxSendFailed, 2); v != 2 {
+		t.Fatalf("send failures = %v, want 2 (probe + follow-up)", v)
+	}
+	if v := reading(t, reg, metrics.NameOutboxBreakerOpened); v != 1 {
+		t.Fatalf("breaker openings after reopen = %v, want 1 (circuit never closed)", v)
+	}
+	if n := o.openCount.Load(); n != 1 {
+		t.Fatalf("open target count after reopen = %d, want 1 (no double count)", n)
+	}
+	// 复开后的新帧在冷却窗内快速失败（熔断语义完好）。
+	if err := o.TryPut(dead, wire.Header{MessageID: 3}, nil); !errors.Is(err, errOutboxBreaker) {
+		t.Fatalf("try-put after reopen = %v, want errOutboxBreaker", err)
+	}
+	// NotifyNodeAlive 快路径有效（openCount 归位）且复开目标可复活。
+	o.NotifyNodeAlive(dead)
+	if n := o.openCount.Load(); n != 0 {
+		t.Fatalf("open target count after alive = %d, want 0", n)
+	}
+	alive.Store(true)
+	if err := o.Put(context.Background(), dead, wire.Header{MessageID: 4}, nil); err != nil {
+		t.Fatalf("put after revive: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for delivered.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if delivered.Load() == 0 {
+		t.Fatal("frame after revive never delivered")
+	}
+}
+
 // TestOutbox_ControlFramesReservedCapacity 数据帧占满全箱容量时，控制面帧
 // （MsgOwnershipLost）仍可入箱（独立预留容量）；数据帧继续满即丢。
 func TestOutbox_ControlFramesReservedCapacity(t *testing.T) {

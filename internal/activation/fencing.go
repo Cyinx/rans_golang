@@ -11,19 +11,22 @@ import (
 )
 
 // FenceIfOwner 条件围栏：仅当在册实例的目录归属恰为 want 时围栏，返回
-// 是否命中（无实例/owner 未落位/已换代均 miss——幂等 no-op）。
-func (m *Table) FenceIfOwner(id rans.ID, want directory.Owner) bool {
+// 被围栏实例的引用（供销毁循环按同一实例身份收场）。判据是 id + owner
+// 双维度全等——Incarnation 是 per-id 序列，owner 三元组全等不蕴含同一
+// 实体，单实体止损只比 owner 会跨实体误杀（误围即永久损伤）。无实例/
+// owner 未落位/已换代均 miss（幂等 no-op）。
+func (m *Table) FenceIfOwner(id rans.ID, want directory.Owner) (PawnRef, bool) {
 	m.readMu.RLock()
 	inst := m.local[id]
 	m.readMu.RUnlock()
 	if inst == nil {
-		return false
+		return PawnRef{}, false
 	}
 	if o := inst.owner.Load(); o == nil || *o != want {
-		return false
+		return PawnRef{}, false
 	}
 	inst.p.Fence()
-	return true
+	return PawnRef{ID: id, Pawn: inst.p}, true
 }
 
 // FenceWhere 谓词围栏：表读锁内快照命中项、锁外逐个围栏，返回被围栏的

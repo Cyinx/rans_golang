@@ -155,8 +155,9 @@ func (m *Table) fencingFloor(ctx context.Context, id rans.ID, ent rans.Entity) (
 //  4. 包纪元 > 高水位：Store 无更新写，包不旧——不弃；
 //  5. 包纪元 == 高水位：同纪元分不出快照先后（成功迁移：源端先落库后发包，
 //     同内容；判输迁移：源端同纪元续落了更新的快照）——内容比对定胜负，
-//     Store 内容不同即源端已前进，弃包；Get 失败/未命中不弃（比较是加速
-//     判定，不可用时不损快路径——Store IO 错误由恢复梯/落库面既有语义收口）。
+//     Store 内容不同即源端已前进，弃包；Get 未命中即弃（票 19：高水位
+//     存在而内容不在=宿主 Delete 撤内容留水位——已删除实体不得经随迁包复活）；
+//     Get 失败不弃（IO 错误保守回退，由恢复梯/落库面既有语义收口）。
 func (m *Table) packageStale(ctx context.Context, id rans.ID, srcInc uint64, pkg []byte) bool {
 	if srcInc == 0 || m.store == nil {
 		return false

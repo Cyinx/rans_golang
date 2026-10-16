@@ -14,10 +14,11 @@ import (
 // Placement 为新激活或迁移选择节点（约定 spec §5.4 放置——消费方唯一需要
 // 自定义的策略面）。
 //
-// candidates 是声明承载该 kind 且存活的节点（按 NodeID 升序，已排除
-// self；排空让位的候选过滤随成员视图语义演进，当前候选源未携带）。首次
-// 激活与迁移共用本策略（迁移选点带 id.Kind，经 placementBridge.PickForKind
-// 过滤候选）。自定义策略不需要也不能访问成员视图。
+// candidates 是声明承载该 kind 且存活的节点（按 NodeID 升序；排空让位
+// draining 节点已被上游过滤）。是否含 self 取决于调用场景：首激活候选含
+// 本节点（本地兜底前的正常候选），迁移选点候选排除发起节点。首次激活与
+// 迁移共用本策略（经 placementBridge 的两个面喂候选）。自定义策略不需要
+// 也不能访问成员视图。
 //
 // 返回 (0, false) 表示放弃选点：首次激活回落本地激活（本节点声明承载该
 // kind 时）或以 Unavailable+NoEligibleNode 终止；迁移失败。

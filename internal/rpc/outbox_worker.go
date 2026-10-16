@@ -46,20 +46,21 @@ func (o *Outbox) sendOutcome(q *targetQueue, target rans.NodeID, err error) {
 	o.openBreaker(q, target)
 }
 
-// openBreaker 开断（幂等重入安全）：置熔断态并清扫本目标箱内帧。
+// openBreaker 开断（幂等重入安全）：置熔断态并清扫本目标箱内帧。熔断未
+// 闭合过的再开断（探针失败复开——probing 窗口内后续帧照常入队）不重复
+// 计数，在箱帧照常清扫——开断瞬间在箱帧一律确定未送出。
 func (o *Outbox) openBreaker(q *targetQueue, target rans.NodeID) {
 	q.mu.Lock()
-	already := q.open && !q.probing
+	already := q.open // probing 蕴含 open：探针失败复开属「未闭合的再开断」
 	q.open, q.probing, q.fails = true, false, 0
 	q.openAt = time.Now()
 	pending := q.queue
 	q.queue = nil
 	q.mu.Unlock()
-	if already {
-		return // 已开断：箱内已清扫过（探针失败复开走这里，无二次计数）
+	if !already {
+		o.openCount.Add(1)
+		o.breakerOpened.Add(1)
 	}
-	o.openCount.Add(1)
-	o.breakerOpened.Add(1)
 	if n := len(pending); n > 0 {
 		o.inBox.Add(-int64(n))
 		o.signalSpace()
@@ -84,38 +85,37 @@ func (o *Outbox) failFrame(it outboxItem, cause error) {
 // sendOne 单向帧发送：预算 ctx（关箱取消贯穿）调注入面；扩展块预算按
 // 剩余重写（票 05）。
 func (o *Outbox) sendOne(q *targetQueue, it outboxItem) {
-	ctx, cancel := context.WithTimeout(o.runCtx, outboxSendBudget)
+	ctx, cancel := context.WithTimeout(o.runCtx, o.cfg.SendBudget)
 	defer cancel()
 	restampBudget(&it.hdr, it.dl)
 	o.sendOutcome(q, it.target, o.cfg.Send(ctx, it.target, it.hdr, it.body))
 }
 
-// sendCall 调用帧发送腿：ctx 受调用方取消/预算与关箱取消双面约束（票
-// 04 顺带修——原实现只挂调用方面，关箱取消不达在途发送），防御预算封
-// 顶；deadline 取派生后的 ctx。排队过期的帧在此中止——确定未送出；失
-// 败经 fail 回投（熔断清扫另有 failFrame 面不发 Send）。
+// sendCall 调用帧发送腿：发送 ctx 以防御预算封顶调用方 ctx（WithTimeout
+// 派生——deadline 自动取两者较早者，到期 Err=DeadlineExceeded 经发送面
+// 收场 Timeout/SendFailed 可重试类，而非主动取消 Canceled 丧失重试权）；
+// 关箱取消面单独看护（runCtx 结束即收掉在途发送——runCtx 不是调用方 ctx
+// 的父，取消不贯穿）。排队过期的帧在此中止——确定未送出；失败经 fail
+// 回投（熔断清扫另有 failFrame 面不发 Send）。
 func (o *Outbox) sendCall(q *targetQueue, it outboxItem) {
-	base, bcancel := context.WithCancel(it.ctx)
-	timer := time.AfterFunc(outboxSendBudget, bcancel)
+	ctx, cancel := context.WithTimeout(it.ctx, o.cfg.SendBudget)
 	done := make(chan struct{})
 	go func() { // 关箱取消面：runCtx 结束即收掉在途发送
 		select {
 		case <-o.runCtx.Done():
-			bcancel()
+			cancel()
 		case <-done:
 		}
 	}()
 	defer func() {
 		close(done)
-		timer.Stop()
-		bcancel()
+		cancel()
 	}()
-	deadline, has := base.Deadline()
-	if !has {
-		deadline = time.Now().Add(outboxSendBudget)
-	}
+	// WithTimeout 派生恒带 deadline（min(调用方, 预算)）——收端 budget_ms
+	// 重写锚与发送面中止判据同源于此。
+	deadline, _ := ctx.Deadline()
 	restampBudget(&it.hdr, deadline)
-	err := o.cfg.SendCall(base, it.target, it.hdr, it.body, deadline)
+	err := o.cfg.SendCall(ctx, it.target, it.hdr, it.body, deadline)
 	o.sendOutcome(q, it.target, err)
 	if err != nil {
 		it.fail(err)

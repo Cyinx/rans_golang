@@ -65,7 +65,7 @@ func TestTable_FenceIfOwnerSkipsNewer(t *testing.T) {
 	if !ok {
 		t.Fatal("precondition: activated instance must expose its owner")
 	}
-	if !m.FenceIfOwner(id, o1) {
+	if _, ok := m.FenceIfOwner(id, o1); !ok {
 		t.Fatal("exact owner match must fence")
 	}
 	m.evict(id, p1) // 模拟换代：旧实例逐出、同 id 重新激活
@@ -79,14 +79,14 @@ func TestTable_FenceIfOwnerSkipsNewer(t *testing.T) {
 	if o2.Incarnation <= o1.Incarnation {
 		t.Fatalf("precondition: newer incarnation %d must exceed old %d", o2.Incarnation, o1.Incarnation)
 	}
-	if m.FenceIfOwner(id, o1) {
+	if _, hit := m.FenceIfOwner(id, o1); hit {
 		t.Fatal("stale owner must not fence the newer instance")
 	}
 	stale := directory.Owner{Node: o1.Node, Epoch: o1.Epoch + 1, Incarnation: o1.Incarnation}
-	if m.FenceIfOwner(id, stale) {
+	if _, hit := m.FenceIfOwner(id, stale); hit {
 		t.Fatal("owner differing from the registered one must not fence")
 	}
-	if !m.FenceIfOwner(id, o2) {
+	if _, ok := m.FenceIfOwner(id, o2); !ok {
 		t.Fatal("current owner must still fence")
 	}
 }

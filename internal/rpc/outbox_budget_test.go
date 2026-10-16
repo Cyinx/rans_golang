@@ -6,6 +6,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/cyinx/rans_golang"
 	"github.com/cyinx/rans_golang/internal/metrics"
 	"github.com/cyinx/rans_golang/internal/protocol"
+	"github.com/cyinx/rans_golang/internal/routing"
 	"github.com/cyinx/rans_golang/internal/wire"
 )
 
@@ -172,3 +174,90 @@ type atomicInt32 struct{ n int32 }
 
 func (a *atomicInt32) add(d int32) int32 { return atomic.AddInt32(&a.n, d) }
 func (a *atomicInt32) load() int32       { return atomic.LoadInt32(&a.n) }
+
+// hangingConnSender 黑洞连接替身：SendToNode 挂住直到 ctx 收场（真实链
+// 路里拨号/写出的挂死形态）——发送面只有耗尽防御预算一条出路。
+type hangingConnSender struct{}
+
+func (hangingConnSender) SendToNode(ctx context.Context, _ rans.NodeID,
+	_ func(context.Context, rans.NodeID) (string, error), _ wire.Header, _ []byte) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// budgetExpiryProbe 发送边界观测：记录 worker 递给下层发送面的 deadline
+// 参数与发送 ctx 的 deadline（替身只观测边界，端点韧性透传真实网关面）。
+type budgetExpiryProbe struct {
+	mu    sync.Mutex
+	dl    time.Time
+	ctxDl time.Time
+	ok    bool // 发送 ctx 携带 deadline
+}
+
+func (p *budgetExpiryProbe) record(ctx context.Context, dl time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dl = dl
+	p.ctxDl, p.ok = ctx.Deadline()
+}
+
+// TestOutbox_CallBudgetExpirySettlesTimeoutNotCanceled 调用方 deadline 大于
+// 防御预算的发送拖满预算（黑洞目标）：到期收场必须是 Timeout 语义（可重
+// 试、保留重试权）而非主动取消 Canceled（NoRetry——重试权丧失）；传给下
+// 层发送的 deadline 取 min(调用方, 预算)，不是调用方完整 deadline。
+func TestOutbox_CallBudgetExpirySettlesTimeoutNotCanceled(t *testing.T) {
+	const budget = 250 * time.Millisecond
+	tgt := rans.NodeID(7)
+	gw := NewGateway(hangingConnSender{}, nil, nil, time.Minute, nil)
+	t.Cleanup(gw.Close)
+	var probe budgetExpiryProbe
+	o, err := NewOutbox(OutboxConfig{
+		Capacity:   16,
+		SendBudget: budget,
+		Send:       func(context.Context, rans.NodeID, wire.Header, []byte) error { return nil },
+		SendCall: func(ctx context.Context, _ rans.NodeID, _ wire.Header, _ []byte, dl time.Time) error {
+			probe.record(ctx, dl)
+			return gw.SendOneWayBounded(ctx, tgt, wire.Header{MessageID: 1}, nil, dl)
+		},
+		Metrics: metrics.New("outbox-budget-expiry-test"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(o.Close)
+
+	fails := make(chan error, 1)
+	cctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := o.PutCall(cctx, tgt, wire.Header{MessageID: 1}, nil, func(err error) { fails <- err }); err != nil {
+		t.Fatalf("put call: %v", err)
+	}
+
+	select {
+	case err := <-fails:
+		t.Logf("budget expiry settled: %v (class=%v)", err, routing.Classify(err))
+		if errors.Is(err, rans.ErrCanceled) || rans.CodeOf(err) == rans.CodeCanceled {
+			t.Fatalf("defensive budget expiry settled as Canceled (NoRetry): %v", err)
+		}
+		if !errors.Is(err, rans.ErrTimeout) && !errors.Is(err, errSendFailed) {
+			t.Fatalf("budget expiry settled as %v, want Timeout/SendFailed (确定未送出)", err)
+		}
+		if cls := routing.Classify(err); cls == routing.NoRetry {
+			t.Fatalf("budget expiry error %v classified NoRetry — caller loses retry rights", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("call frame never settled after defensive budget expiry")
+	}
+
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	dlCap := start.Add(budget + 100*time.Millisecond)
+	if !probe.ok {
+		t.Fatal("send ctx carries no deadline — defensive budget not derived")
+	}
+	if probe.dl.After(dlCap) || probe.ctxDl.After(dlCap) {
+		t.Fatalf("deadline passed to send face not capped by budget: param=%v ctx=%v, want <= %v",
+			probe.dl, probe.ctxDl, dlCap)
+	}
+}

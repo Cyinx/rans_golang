@@ -86,6 +86,10 @@ type OutboxConfig struct {
 	SendCall func(ctx context.Context, target rans.NodeID, hdr wire.Header, body []byte, deadline time.Time) error
 	// Metrics 指标注册表；nil → metrics.Default()。
 	Metrics *metrics.Registry
+	// SendBudget 单帧发送的防御预算（0 → outboxSendBudget；生产装配
+	// Remote.New 不设置取缺省，测试注入短预算使到期用例在一个预算窗内
+	// 收场——与网关 sweepInterval 的周期注入同形态）。
+	SendBudget time.Duration
 }
 
 // outboxItem 在箱帧：body 所有权已移交发件箱（见包注释契约）。ctx/fail
@@ -170,6 +174,9 @@ func NewOutbox(cfg OutboxConfig) (*Outbox, error) {
 	}
 	if cfg.Capacity <= 0 {
 		cfg.Capacity = defaultOutboxCapacity
+	}
+	if cfg.SendBudget <= 0 {
+		cfg.SendBudget = outboxSendBudget
 	}
 	reg := cfg.Metrics
 	if reg == nil {
@@ -341,8 +348,9 @@ const (
 
 // enqueueItem 占位入队共核（全部生产者的临界区单点）。熔断目标快速失败
 // （冷却期满转半开放行一帧探测——errOutboxBreaker 包装 errSendFailed，
-// 调用方得到「确定未投递」分类）；容量两级（全箱 CAS 占位、每目标上限
-// 在队列锁内复查）；关箱竞态回退占位。
+// 调用方得到「确定未投递」分类；容量拒收则回滚半开标记，探测资格不残
+// 留）；容量两级（全箱 CAS 占位、每目标上限在队列锁内复查）；关箱竞态
+// 回退占位。
 func (o *Outbox) enqueueItem(it outboxItem, try bool) (*targetQueue, enqueueState, error) {
 	q, ok := o.queueFor(it.target)
 	if !ok {
@@ -353,9 +361,11 @@ func (o *Outbox) enqueueItem(it outboxItem, try bool) (*targetQueue, enqueueStat
 		q.mu.Unlock()
 		return q, rejected, errOutboxClosed
 	}
+	probe := false // 本帧是否被置为探测帧（容量拒收时须回滚半开标记）
 	if q.open && !q.probing {
 		if time.Since(q.openAt) >= outboxBreakerCooldown {
 			q.probing = true // 半开：本帧即探测帧
+			probe = true
 		} else {
 			q.mu.Unlock()
 			return q, breakerOpen, fmt.Errorf("rans: outbox: node %d: %w: %w",
@@ -368,11 +378,19 @@ func (o *Outbox) enqueueItem(it outboxItem, try bool) (*targetQueue, enqueueStat
 		limit += outboxControlReserve
 	}
 	if !o.claimInBox(limit) {
+		if probe {
+			// 探测帧未入箱：回滚半开标记——残留 true 让「open 且非
+			// probing」恒不成立，新帧绕过熔断直达死目标。
+			q.probing = false
+		}
 		q.mu.Unlock()
 		return q, globalFull, nil
 	}
 	if !control && len(q.queue) >= o.perTarget {
 		o.inBox.Add(-1)
+		if probe {
+			q.probing = false // 同上：目标上限拒收同样不放行残留
+		}
 		q.mu.Unlock()
 		return q, targetFull, nil
 	}

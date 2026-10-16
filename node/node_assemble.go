@@ -27,8 +27,9 @@ import (
 // （Shutdown 时关闭）> 缺省 inmem（单节点形态）。inmem 形态的地址解析缺
 // 省 = 自解析（本节点 → Start 后实际地址；其他节点号报错——单节点形态无
 // 合法远端，多节点 in-process 测试经 TestHooks.Resolve 注入共享表）；
-// redis 形态的解析/放置/存活节拍/轮询缺省全部内置。装配失败返回错误并关闭
-// 自建目录（注入目录归调用方），不留半开组合体。不阻塞（无网络 IO——
+// redis 形态的解析/放置/存活节拍/轮询缺省全部内置。装配失败返回错误并收
+// 口自建目录与成员视图（注入目录归调用方），不留半开组合体。不阻塞（无
+// 网络 IO——
 // redis 目录的连接懒建于 Start）；非并发安全（装配期单线程约定——构造
 // 一次给全，无运行期 Set 面）。
 //
@@ -227,12 +228,18 @@ func New(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// abandon 装配失败清理：自建目录随失败关闭（注入目录归调用方）。
+// abandon 装配失败清理：自建目录随失败关闭（注入目录归调用方），成员视
+// 图一并收口（票 03）。rem 无需外层补收：remote.New 失败要么在构造前被
+// 校验拒绝（未分配任何资源），要么 NewOutbox 失败已内部 r.Close 自收口
+// ——失败路径上 n.rem 恒为 nil。
 func (n *Node) abandon(closeDir bool) {
 	if closeDir {
 		if closer, ok := n.dir.(interface{ Close() error }); ok {
 			_ = closer.Close()
 		}
+	}
+	if n.view != nil {
+		n.view.Close()
 	}
 	n.runCancel()
 }

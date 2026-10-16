@@ -50,7 +50,8 @@ func kindNames(kinds map[string]rans.Factory) []string {
 // → 续租注入实际地址后 Start → 轮询 Start → 自动闲置回收/再平衡循环。
 // ctx 只辖监听的建立；周期体挂 node
 // 自有 runCtx（Shutdown/Close 收口）。Start 恰一次（二次调用返回错误）；
-// 失败即终态（内部已自收口），重建而非重启。
+// 失败即终态（内部已自收口：成员视图/传输/自建目录全部关闭），重建而非
+// 重启。
 //
 // Standalone 形态无传输：跳过监听（其余次序不变）。阻塞到内部就绪（非
 // 优雅路径）；并发安全（单次性由 started 守卫）。
@@ -65,13 +66,14 @@ func (n *Node) Start(ctx context.Context) error {
 		if reg, ok := n.dir.(directory.NodeRegistry); ok {
 			if err := n.checkGeneration(ctx, reg); err != nil {
 				n.runCancel()
+				n.abandonStart()
 				return fmt.Errorf("rans: start: node %d: %w", n.cfg.NodeID, err)
 			}
 		}
 		// Start 次序（票 14）：同步取号 → 绑定（暂不接入）→ 发布实际地
 		// 址/kinds → 同步首写成员键 → 开始接入。任一步失败即终态：已建
-		// 资源收口（监听、自建目录）——服务先于取号的 epoch-0 窗口随同步
-		// 化消亡。
+		// 资源收口（成员视图、传输、自建目录）——服务先于取号的 epoch-0
+		// 窗口随同步化消亡。
 		if n.lv != nil {
 			if err := n.lv.EnsureEpoch(ctx); err != nil {
 				n.runCancel()
@@ -92,7 +94,6 @@ func (n *Node) Start(ctx context.Context) error {
 			n.lv.PublishSelf(addr, kindNames(n.cfg.Kinds))
 			if err := n.lv.StartSync(n.runCtx); err != nil {
 				n.runCancel()
-				_ = n.rem.Close()
 				n.abandonStart()
 				return fmt.Errorf("rans: start: node %d: %w", n.cfg.NodeID, err)
 			}
@@ -106,11 +107,18 @@ func (n *Node) Start(ctx context.Context) error {
 	return nil
 }
 
-// abandonStart Start 失败的终态收口（票 14）：关自建目录（注入目录归调
-// 用方）与传输组合体——不留半开资源。runCancel 由调用方先行（次序与
-// abandon 一致）。
+// abandonStart Start 失败的终态收口（票 14）：关成员视图与传输组合体、
+// 关自建目录（注入目录归调用方）——不留半开资源（票 03：Close 形态，失
+// 败路径无排空语义）。runCancel 由调用方先行（次序与 abandon 一致）；
+// rem.Close 幂等——Bind/StartSync 失败路径已内部收口时重复调用无害。
 func (n *Node) abandonStart() {
 	n.addr.Store(nil) // Addr 只报告健康绑定；失败路径不残留半开地址
+	if n.view != nil {
+		n.view.Close()
+	}
+	if n.rem != nil {
+		_ = n.rem.Close()
+	}
 	if n.closeDir {
 		if closer, ok := n.dir.(interface{ Close() error }); ok {
 			_ = closer.Close()
@@ -201,7 +209,8 @@ const shutdownWaitBudget = 2 * time.Second
 // 并行 Retire 全部本地实体 → 出站 flush——此三段期间续租/轮询照常）→
 // 停序头确定性收口续租与轮询（New 时经 Config.ShutdownTeardown 登记，
 // 先于节点注销——次序颠倒会被在途续租把注销过的成员键写活）→ 节点注销 +
-// 关传输 → 关闭自建目录（redis 形态；注入目录归调用方）。
+// 关传输 → 关闭本地成员视图（刷新循环退出——排空期间路由面保活，停序收
+// 尾才断）→ 关闭自建目录（redis 形态；注入目录归调用方）。
 //
 // 预算语义（spec §5.1 第 1 条）：阻塞到排空完成或 ctx 耗尽；预算耗尽返回
 // 包装 ctx.Err() 的错误（排空不回滚，停序照常收口——错误面如实上报「未在
@@ -213,6 +222,12 @@ func (n *Node) Shutdown(ctx context.Context) error {
 		var errs []error
 		n.beginDraining() // 排空标记即时发布；续租照常（排空与 flush 期间）
 		errs = append(errs, n.rem.Shutdown(ctx))
+		// 成员视图收尾关闭（票 03）：排空四段期间路由面保活（地址解析/
+		// 放置候选照常读视图），停序收尾才断刷新循环——不关则停机后循环
+		// 永续打注册表（refresh_failed 爬升 + goroutine 泄漏）。
+		if n.view != nil {
+			n.view.Close()
+		}
 		n.stopErr = errors.Join(errs...)
 		if n.closeDir && !n.crashKeepsDir() {
 			if closer, ok := n.dir.(interface{ Close() error }); ok {

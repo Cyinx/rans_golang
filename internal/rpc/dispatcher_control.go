@@ -15,8 +15,8 @@ import (
 	"github.com/cyinx/rans_golang/internal/wire"
 )
 
-// handleOwnershipLost 所有权丢失止损（H13 决策 22 收端）：归属全等 →
-// Fence + 异步销毁（幂等）；畸形载荷 warn 丢弃。
+// handleOwnershipLost 所有权丢失止损（H13 决策 22 收端）：id + owner 双
+// 维度全等 → Fence + 异步销毁（幂等）；畸形载荷 warn 丢弃。
 func (d *Dispatcher) handleOwnershipLost(hdr wire.Header, body []byte) {
 	defer func() {
 		if body != nil {
@@ -35,11 +35,13 @@ func (d *Dispatcher) handleOwnershipLost(hdr wire.Header, body []byte) {
 			"message", hdr.MessageID, "err", err)
 		return
 	}
-	// 谓词围栏原子裁定命中集（InstanceOwner 比对 + Fence 之间的换代交错
-	// 会误围新化身且销毁因纪元不符 no-op——永久围栏），销毁按实例身份守卫。
+	// 单实体止损精确到实例身份（FenceIfOwner：id + owner 全等才围）：
+	// Incarnation 是 per-id 序列，同节点同代际两个首发实体的 owner 三元组
+	// 全等——只比 owner 的谓词围栏会把无辜同胞一并误杀（误围即永久损伤）。
+	// 销毁用同一实例引用，实例身份守卫语义不变。
 	prev := directory.Owner{Node: d.self, Epoch: v.Epoch, Incarnation: v.Incarnation}
-	refs := d.mgr.FenceWhere(func(o *directory.Owner) bool { return *o == prev })
-	if len(refs) == 0 {
+	ref, ok := d.mgr.FenceIfOwner(id, prev)
+	if !ok {
 		return // 无实例/归属不符（已换代/迟到/重复）：幂等 no-op
 	}
 	d.mgr.MetricsRegistry().Counter(metrics.NameOwnershipLostReceived,
@@ -49,11 +51,9 @@ func (d *Dispatcher) handleOwnershipLost(hdr wire.Header, body []byte) {
 		// 处置无外生 ctx，读循环不等待本 goroutine）。
 		ctx, cancel := context.WithTimeout(context.Background(), ownershipLostDestroyBudget)
 		defer cancel()
-		for _, r := range refs {
-			if err := lifecycle.DestroyPawn(ctx, d.mgr, r.ID, r.Pawn); err != nil {
-				log.Warn("rans/rpc: ownership-lost destroy failed (entity stays fenced)",
-					"uuid", r.ID.String(), "err", err)
-			}
+		if err := lifecycle.DestroyPawn(ctx, d.mgr, ref.ID, ref.Pawn); err != nil {
+			log.Warn("rans/rpc: ownership-lost destroy failed (entity stays fenced)",
+				"uuid", ref.ID.String(), "err", err)
 		}
 	}()
 	log.Info("rans/rpc: ownership lost notification fenced local instance",

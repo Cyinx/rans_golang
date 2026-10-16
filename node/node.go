@@ -23,7 +23,9 @@ import (
 )
 
 // Node 一个 rans 节点进程的全部把手。New 构造即完整（全部校验在构造期，
-// 失败返回错误，无半开组合体）且不启任何 goroutine；Start 起跑，Shutdown
+// 失败返回错误，无半开组合体——失败路径内部已自收口）；New 期即启动常驻
+// goroutine（网关扫描器、成员视图刷新；发件箱 worker 按目标队列懒起——
+// 均 Close/Shutdown 收口）；Start 起跑，Shutdown
 // 按排空序优雅收口，Close 立即停止（不排空）。Start 恰一次；终态后不可
 // 复用，重建而非重启。
 type Node struct {

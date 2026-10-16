@@ -63,7 +63,7 @@ _Avoid_: 把接管闸门改读快照（双轨判定的分界——路由答错�
 _Avoid_: 用 TTL/续租判条目有效性（H13 前旧形态）；把接管闸门改成读快照（快照答错=双活——双轨判定见决策记录）；同代际复活成员键（v0.26.0 前的缺陷形态——旧代际实例永驻双服务）
 
 **接管（Takeover）**（2026-10-11 HR5 裁定，随 v0.23.0 落地；接管通知发送半边随 2026-10-13 修复批真实接线）：
-死 owner 目录条目的重占——Register 携带 `expectedOwner` 做 CAS（逐实体键单 slot Lua 原子读-比-写），赢则 inc+1 覆写；接管闸门的判活（`directory.OwnerAlive`）对注册表读错误保守判活（瞬时故障不触发接管）。接管赢方**经发件箱以 `MsgOwnershipLost`（=16）控制帧直发**旧 owner 节点（控制面优先通道；best-effort——满箱即丢、不重试），旧 owner 收端按谓词围栏（`FenceWhere`，owner 全等才围）+ 实例身份守卫销毁。通知丢失的兜底按形态分野：旧 owner 成员键仍在 → 存活续期照常，实例滞留到下一次该实体的仲裁/陈旧信号（SelfFence 只兜底成员键写失败形态——键过期 ⟹ liveness 同败 ⟹ 自动关准入，对「通知丢失但成员键健在」不成立）；成员键同时消失 → 比对续期判 Absent → 换代围栏止损。inc 围栏保 INV3（旧纪元持久写被 Store 拒）。
+死 owner 目录条目的重占——Register 携带 `expectedOwner` 做 CAS（逐实体键单 slot Lua 原子读-比-写），赢则 inc+1 覆写；接管闸门的判活（`directory.OwnerAlive`）对注册表读错误保守判活（瞬时故障不触发接管）。接管赢方**经发件箱以 `MsgOwnershipLost`（=16）控制帧直发**旧 owner 节点（控制面优先通道；best-effort——满箱即丢、不重试），旧 owner 收端按实例身份围栏（`FenceIfOwner`：id + owner 三元组全等才围——Incarnation 是 per-id 序列，owner 全等不蕴含同一实体）+ 同一实例引用销毁。通知丢失的兜底按形态分野：旧 owner 成员键仍在 → 存活续期照常，实例滞留到下一次该实体的仲裁/陈旧信号（SelfFence 只兜底成员键写失败形态——键过期 ⟹ liveness 同败 ⟹ 自动关准入，对「通知丢失但成员键健在」不成立）；成员键同时消失 → 比对续期判 Absent → 换代围栏止损。inc 围栏保 INV3（旧纪元持久写被 Store 拒）。
 _Avoid_: 无条件覆写条目（双实例无仲裁）；把接管通知当可靠投递（best-effort，SelfFence 是兜底不是冗余）
 
 **重定向提示（Redirect hint）**（2026-10-11 HR5 裁定，随 v0.23.0 落地）：
@@ -87,7 +87,7 @@ _Avoid_: 等超时收场（EX2 病根）；单向发送计入等待边
 _Avoid_: 把 floor 当 CAS 期望值（只抬高取号不参与裁决）；持久层水位与目录取号脱钩（R2 双活缺陷形态）
 
 **协议代际（Protocol generation）**（v0.26.0 新增）：
-握手协议版本区间（`wire.HandshakeVersionMin/Max`，当前 4/4）经成员键值（`pmin`/`pmax`）进入成员视图；`node.Start` 监听前读 `NodeRegistry.Nodes`，存在协议区间不相交的存活节点（含缺字段 0/0 的断点前版本节点）即拒绝启动（混版本集群零容忍）；读注册表失败 fail-open。握手本身仍是区间协商（双端区间相交即通），协议代际检查是启动面的集群拓扑防护。
+握手协议版本区间（`wire.HandshakeVersionMin/Max`，当前 5/5）经成员键值（`pmin`/`pmax`）进入成员视图；`node.Start` 监听前读 `NodeRegistry.Nodes`，存在协议区间不相交的存活节点（含缺字段 0/0 的断点前版本节点）即拒绝启动（混版本集群零容忍）；读注册表失败 fail-open。握手本身仍是区间协商（双端区间相交即通），协议代际检查是启动面的集群拓扑防护。
 _Avoid_: 依赖滚动升级窗口内的混版本互通（断点版本先停全部再升）
 
 **成员面一死永死（Membership dies forever）**（v0.26.0 新增）：

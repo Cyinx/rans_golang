@@ -6,11 +6,15 @@ package node
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cyinx/rans_golang"
+	"github.com/cyinx/rans_golang/directory"
+	"github.com/cyinx/rans_golang/directory/inmem"
 	"github.com/cyinx/rans_golang/directory/redis"
 )
 
@@ -295,4 +299,118 @@ func (c *cfCaller) Handle(ctx context.Context, _ any) (any, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// ===== review15 票 03：LocalView/New/Start 失败路径收口 =====
+
+// viewTestRefresh 视图刷新观测周期（= 刷新下限，缩短收口断言的观测窗）。
+const viewTestRefresh = 100 * time.Millisecond
+
+// countingReg 注册表 Nodes 读取计数装饰器（视图刷新循环收口断言的观测面
+// ——停机后读取数不再增长即循环已退出）。
+type countingReg struct {
+	directory.NodeRegistry
+	reads atomic.Int64
+}
+
+func (r *countingReg) Nodes(ctx context.Context) (map[rans.NodeID]directory.NodeInfo, error) {
+	r.reads.Add(1)
+	return r.NodeRegistry.Nodes(ctx)
+}
+
+// newViewNode 构造带成员视图的节点（inmem 注册表形态，免 Redis）。
+func newViewNode(t *testing.T, reg directory.NodeRegistry, listen string) *Node {
+	t.Helper()
+	n, err := New(Config{
+		NodeID:     1,
+		ListenAddr: listen,
+		Kinds:      testKinds(),
+		Security:   SecurityConfig{Insecure: true},
+		Directory:  DirectoryConfig{Injected: regDir{Directory: inmem.New(), NodeRegistry: reg}},
+		Tuning:     TuningConfig{MembershipRefresh: viewTestRefresh},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return n
+}
+
+// TestShutdownStopsViewRefreshLoop Shutdown 后成员视图刷新循环必须退出
+// （review15 泄漏面①）：刷新 goroutine 自带 stopCh、不挂 runCtx，Shutdown
+// 不收口则停机后仍按周期打注册表（refresh_failed 爬升 + goroutine 泄漏）。
+// 以注册表读取计数断言收口：停机后一个观测窗（4 个刷新周期）内读取数不
+// 再增长。
+func TestShutdownStopsViewRefreshLoop(t *testing.T) {
+	reg := &countingReg{NodeRegistry: inmem.NewNodeRegistry(time.Minute)}
+	n := newViewNode(t, reg, "127.0.0.1:0")
+	if err := n.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := n.Shutdown(sctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	before := reg.reads.Load()
+	time.Sleep(4 * viewTestRefresh)
+	if after := reg.reads.Load(); after != before {
+		t.Fatalf("view refresh loop alive after Shutdown: registry reads %d → %d within one window",
+			before, after)
+	}
+}
+
+// TestStartFailureNoResidentGoroutines Start 各失败路径后无残留 goroutine
+// （review15 泄漏面②③；契约「失败即终态、内部已自收口」——调用方弃置句
+// 柄不需要补 Close）。四个失败点（混版本预置/取号失败注入/不可绑定地址/
+// 首写失败注入）逐一触发，以进程 goroutine 总量回落基线断言收口：泄漏的
+// 视图刷新循环/网关扫描器永不退出，计数回不到基线。
+func TestStartFailureNoResidentGoroutines(t *testing.T) {
+	quiesce := func() {
+		runtime.GC()
+		time.Sleep(300 * time.Millisecond)
+	}
+	quiesce()
+	base := runtime.NumGoroutine()
+
+	mixedVersion := func() directory.NodeRegistry {
+		reg := inmem.NewNodeRegistry(time.Minute)
+		if err := reg.RegisterNode(context.Background(), 2, nodeInfoOf("10.0.0.2:1", 3, 3)); err != nil {
+			t.Fatal(err)
+		}
+		return reg
+	}
+	paths := []struct {
+		name    string
+		reg     directory.NodeRegistry
+		listen  string
+		wantErr string
+	}{
+		{"generation-check refusal", mixedVersion(), "127.0.0.1:0", "mixed-version"},
+		{"epoch allocation failure",
+			&epochFailReg{NodeRegistry: inmem.NewNodeRegistry(time.Minute), fail: true},
+			"127.0.0.1:0", "epoch"},
+		{"listen bind failure", inmem.NewNodeRegistry(time.Minute), "256.0.0.1:0", "listen"},
+		{"first key write failure",
+			&writeFailReg{NodeRegistry: inmem.NewNodeRegistry(time.Minute)},
+			"127.0.0.1:0", "register-node"},
+	}
+	for _, p := range paths {
+		n := newViewNode(t, p.reg, p.listen)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := n.Start(ctx)
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), p.wantErr) {
+			t.Fatalf("%s: Start err = %v, want containing %q", p.name, err, p.wantErr)
+		}
+		// 失败即终态：不补 Close/Shutdown（自收口契约由本断言看住）。
+	}
+	quiesce()
+	deadline := time.Now().Add(3 * time.Second)
+	for runtime.NumGoroutine() > base+2 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if left := runtime.NumGoroutine(); left > base+2 {
+		t.Fatalf("resident goroutines after failed Starts: baseline %d → %d (leak on failure paths)",
+			base, left)
+	}
 }

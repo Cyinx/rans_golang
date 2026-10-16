@@ -163,8 +163,8 @@ func parseEntry(val string) (entryJSON, bool) {
 
 // Register 注册/收养/接管原子域（luaRegister 单键四分支，KEYS/ARGV 见
 // scripts.go；directory.Directory 契约）。主键无值/墓碑 → 按墓碑残值+1
-// 写自归属；现值归属即本实例（node+epoch，含 epoch=0 未接代际条目的收养
-// 形态）→ inc+1 升写调用方纪元（返回值=落库值）；expected 与现值全等 →
+// 写自归属；现值归属即本实例（node+epoch 全等，同代际重注册）→ inc+1
+// 升写调用方纪元（返回值=落库值）；expected 与现值全等 →
 // CAS 接管 inc+1；否则输并返回现归属。self.Incarnation 作纪元下限：
 // 赢分支取号 = max(现值, 下限)+1（0 = 无下限）。
 func (d *Directory) Register(ctx context.Context, id rans.ID, self directory.Owner, expected *directory.Owner) (bool, directory.Owner, error) {
@@ -211,8 +211,11 @@ func (d *Directory) UnregisterIfOwner(ctx context.Context, id rans.ID, owner dir
 // UnregisterNode 成员注销（H13 收敛形态；directory.NodeRegistry 契约）：
 // epoch≠0 时仅当键内代际 == epoch 才删（单键比较删除 Lua；不匹配 no-op
 // ——迟到的旧代际停机不误删已让位者的键，守卫拒绝时总表 field 一并
-// 保留——总表是超集，漂移由读面探活收敛）；0 = 无条件。实体条目不清扫：
-// 残留由死 owner 自愈承接（有效性判定 + CAS 接管）。
+// 保留——总表是超集，漂移由读面探活收敛；守卫放行即键已由脚本原子删除，
+// 收尾只清总表 field、不再补 Del——守卫与收尾之间同 NodeID 重注册的新键
+// 不被误删，补删是守卫引入前的必要删除路径残留）；0 = 无条件（收尾
+// pipeline 删键 + 清总表 field，必要路径原样）。实体条目不清扫：残留由
+// 死 owner 自愈承接（有效性判定 + CAS 接管）。
 func (d *Directory) UnregisterNode(ctx context.Context, node rans.NodeID, epoch uint64) error {
 	if epoch != 0 {
 		guarded, err := scriptUnregNode.Run(ctx, d.cli,
@@ -225,6 +228,10 @@ func (d *Directory) UnregisterNode(ctx context.Context, node rans.NodeID, epoch 
 		if guarded != 1 {
 			return nil // 守卫拒绝：键已换代/缺席——零副作用
 		}
+		// 守卫放行路径收尾收窄（单键 HDel）：迟到的 HDel 只影响总表枚举
+		// 面的瞬时可见性，让位者的下一次续期 HSet 即自愈；补 Del 则删掉
+		// 重注册的新键——判活权威键丢失，让位者续期撞缺席被误判死亡。
+		return d.cli.HDel(ctx, d.rosterKey(), strconv.Itoa(int(node))).Err()
 	}
 	pipe := d.cli.Pipeline()
 	pipe.Del(ctx, d.nodeKey(node))
