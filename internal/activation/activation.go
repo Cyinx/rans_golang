@@ -97,6 +97,12 @@ type Table struct {
 	metrics *metrics.Registry // 观测注册表（Options.Metrics；nil → Default）
 	// fencingFloorHook 宿主纪元下限钩子（Options.FencingFloor；nil = 无）。
 	fencingFloorHook func(ctx context.Context, id rans.ID) (uint64, error)
+	// now/newTimer 定时器时钟注入面（Options.Now/NewTimer；nil = 真实时钟，
+	// 语义见 pawnite.Options）。
+	now      func() time.Time
+	newTimer func(d time.Duration) (c <-chan time.Time, stop func() bool, reset func(d time.Duration) bool)
+	// maxTimers 单实例定时器上限（Options.MaxTimers；≤0 → 运行时缺省）。
+	maxTimers int
 	// sealed 封表标记（Seal 置位后新激活一律 ErrTableSealed）。
 	sealed atomic.Bool
 	// selfEpoch 节点代际读取面（BindSelfEpoch 装配期单写一次，Start 前
@@ -222,6 +228,13 @@ type Options struct {
 	SendPackage func(ctx context.Context, target rans.NodeID, id rans.ID, snap []byte, srcInc uint64) error
 	// MigrationBudget 迁移总预算；零/负值回落 DefaultMigrationBudget。
 	MigrationBudget time.Duration
+	// Now/NewTimer 定时器时钟注入面（测试虚拟时钟；须同给，nil = 真实
+	// 时钟）。函数形态语义见 pawnite.Options 同名字段。
+	Now      func() time.Time
+	NewTimer func(d time.Duration) (c <-chan time.Time, stop func() bool, reset func(d time.Duration) bool)
+	// MaxTimers 单实例定时器上限（≤0 → 运行时缺省 65536；节点级护栏，
+	// 语义见 node.Config.Tuning.MaxTimers）。
+	MaxTimers int
 
 	// IdlePolicies per-kind 闲置回收策略（未登记的 kind 永不闲置）。
 	IdlePolicies map[string]IdlePolicy
@@ -274,6 +287,12 @@ func New(dir directory.Directory, selfNode rans.NodeID, kinds map[string]rans.Fa
 		}
 		if o.MigrationBudget != 0 {
 			m.migrationBudget = o.MigrationBudget
+		}
+		if o.Now != nil && o.NewTimer != nil {
+			m.now, m.newTimer = o.Now, o.NewTimer
+		}
+		if o.MaxTimers > 0 {
+			m.maxTimers = o.MaxTimers
 		}
 		for kind, p := range o.IdlePolicies {
 			if m.idlePolicies == nil {

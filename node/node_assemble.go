@@ -61,12 +61,24 @@ func New(cfg Config) (*Node, error) {
 	// kind 感知放置桥：首激活与迁移共用（Options.Placement 构造期定死；
 	// 迁移同走 PickForKind，候选只含声明承载该 kind 的节点）。
 	bridge := &placementBridge{policy: cfg.Placement, scanner: kindScannerOf(dir)}
+	// 定时器时钟注入（TestHooks；nil = 真实时钟）。函数类型与原字段逐字
+	// 相同，装配链上无需中间类型。
+	var hooksNow func() time.Time
+	var hooksNewTimer func(time.Duration) (<-chan time.Time, func() bool, func(time.Duration) bool)
+	if h := cfg.TestHooks; h != nil && h.NewTimer != nil {
+		hooksNow, hooksNewTimer = h.Now, h.NewTimer
+	}
 	opts := mgr.Options{
 		Placement: bridge.PickForKindMigrate, // 迁移选点排除 self（票 03 两面分立）
 		Store:     cfg.Store,
 		Metrics:   mreg,
 		// 宿主纪元下限钩子透传（nil = 无——语义见 Config.FencingFloor）。
 		FencingFloor: cfg.FencingFloor,
+		// 定时器时钟注入面透传（测试虚拟时钟；TestHooks 缺省 nil = 真实
+		// 时钟）。函数形态：接口跨包赋值要求签名逐字相同，函数类型可直通。
+		Now:       hooksNow,
+		NewTimer:  hooksNewTimer,
+		MaxTimers: cfg.Tuning.MaxTimers,
 		// 位置缓存失效/更新钩子（规格 §9.2/陷阱 14 六类中的本地三类；
 		// 组装根构造期直接接线）：
 		// ① 本地销毁 → Invalidate（目录注销+本地逐出完成后触发）；

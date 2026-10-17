@@ -188,6 +188,10 @@ func NewCluster(t *testing.T, n int, kinds map[string]rans.Factory, opts ...Opti
 				Resolve:  resolve,
 			},
 		}
+		if o.clock != nil {
+			// 定时器虚拟时钟（WithClock）：函数类型直通装配链。
+			cfg.TestHooks.Now, cfg.TestHooks.NewTimer = o.clock.Now, o.clock.NewTimer
+		}
 		if ca != nil {
 			cfg.Security.TLS = ca.nodeTLSConfig(t, int64(1000+i))
 		}

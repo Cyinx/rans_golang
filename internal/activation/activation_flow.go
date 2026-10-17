@@ -378,6 +378,10 @@ func (m *Table) GetOrActivate(ctx context.Context, id rans.ID) (*pawnite.Pawnite
 				OnExpired: m.onExpired,
 				// 出队取消弃置计数钩子（H10 决策 9；nil = 未接线不观测）。
 				OnCanceled: m.onCanceled,
+				// 定时器时钟注入面（测试虚拟时钟；nil = 真实时钟）与容量护栏。
+				Now:       m.now,
+				NewTimer:  m.newTimer,
+				MaxTimers: m.maxTimers,
 				// fencing 纪元不经 Options 注入：激活闭包首步的注册原子域
 				// 取号后经 AssignIncarnation 落位（Options.Incarnation 保留给
 				// 直接构造 pawnite 的用法）；checkpoint/钝化/迁移的 Store.Put

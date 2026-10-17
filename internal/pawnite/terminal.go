@@ -53,6 +53,19 @@ func (p *Pawnite) setTerminalLocked(reason TerminalReason, target rans.NodeID) {
 		p.term.reason = reason
 		p.term.target = target
 	}
+	p.clearTimersLocked()
+}
+
+// clearTimersLocked 终局清表（调用方必须已持 mu）：置空引用 + 停武装面，
+// 不遍历条目（十万级遍历会把终局临界区拖到毫秒级并卡住准入）。本方法挂在
+// setTerminalLocked 上是刻意的——五条终局路径都经那里，清表因此只有一个入口。
+// 置空后的表不会再被写：任意终局写点的 state 都已（或同一临界区内即将）为
+// Destroyed，而 AddTimer 在 Destroyed 上返回 0——loop-only 调用的可见性由
+// 同一把 mu 串行化。
+func (p *Pawnite) clearTimersLocked() {
+	p.timers.byID = nil
+	p.timers.entries = nil
+	p.disarmTimerLocked()
 }
 
 // disposeLate 迟到投递的唯一处置点（终局矩阵，按 term.reason 分流）：

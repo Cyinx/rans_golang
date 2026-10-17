@@ -159,4 +159,17 @@ type Options struct {
 	//（经 rans.Incarnation；写入面 internal/ctxkey——钩子 ctx 与 Handle ctx 都携带）；本访问面供
 	// 投递层接线（manager/rpc 的 Deliver 包装）。
 	Incarnation uint64
+	// Now/NewTimer 定时器时钟注入面（测试虚拟时钟专用；生产留 nil = 真实
+	// 时钟）。两者须同给：函数形态而非接口，是为跨包（测试注入面 → 装配根
+	// → 本包）直通而无需在公开面新增类型。NewTimer 返回触发通道、停止面与
+	// 重置面，Stop/Reset 语义同 time.Timer。
+	Now      func() time.Time
+	NewTimer func(d time.Duration) (c <-chan time.Time, stop func() bool, reset func(d time.Duration) bool)
+	// MaxTimers 单实例待触发定时器上限（≤0 → DefaultMaxTimers）。超限
+	// panic：它是「无界武装」缺陷的护栏，不是容量规划面。
+	MaxTimers int
 }
+
+// DefaultMaxTimers 单实例定时器缺省上限（约 9 MB 上界；十万级用法依
+// MaxTimers 显式抬高）。
+const DefaultMaxTimers = 65536

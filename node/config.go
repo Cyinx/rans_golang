@@ -192,6 +192,9 @@ type TuningConfig struct {
 	// 下限 100ms（小于该值构造期报错——低于此等于没有视图，退回每跳读
 	// 注册表还多一层间接）。
 	MembershipRefresh time.Duration
+	// MaxTimers 单实例待触发定时器上限（≤0 → 65536，约 9 MB 上界）。它是
+	// 「无界武装」缺陷的护栏而非容量规划面：万级/十万级用法按节点显式抬高。
+	MaxTimers int
 }
 
 // KindOptions per-kind 设置（约定 spec §5.4 第 3 条）。per-kind 看门狗阈值

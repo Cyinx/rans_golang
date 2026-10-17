@@ -5,6 +5,7 @@ import (
 
 	"github.com/cyinx/rans_golang/checkpoint"
 	"github.com/cyinx/rans_golang/directory"
+	"github.com/cyinx/rans_golang/internal/testhooks"
 	"github.com/cyinx/rans_golang/node"
 )
 
@@ -30,6 +31,7 @@ type options struct {
 	fakeDeath          bool                  // WithFakeDeath：逐节点成员写门控（FakeDeath 原语）
 	nodeSelfFences     map[int]time.Duration // WithNodeSelfFence：逐节点存活节拍自围栏阈值覆盖
 	epochFailNode      int                   // WithNodeEpochFailure：取号失败布防节点（-1 = 无）
+	clock              *VirtualClock         // 定时器虚拟时钟（WithClock；nil = 真实时钟）
 }
 
 // redisOptions redis 模式参数（WithRedis）。
@@ -185,4 +187,17 @@ func WithNodeSelfFence(i int, d time.Duration) Option {
 // 赖 NodeRegistry 能力面，无该能力的目录装配即失败）。
 func WithNodeEpochFailure(i int) Option {
 	return func(o *options) { o.epochFailNode = i }
+}
+
+// VirtualClock 可推进的虚拟时钟（实现在 internal/testhooks，装配链与白盒测试
+// 共用一份；别名导出供消费方测试使用）。
+type VirtualClock = testhooks.VirtualClock
+
+// NewVirtualClock 构造虚拟时钟（固定非零起点）。
+func NewVirtualClock() *VirtualClock { return testhooks.NewVirtualClock() }
+
+// WithTimerClock 给全部节点注入定时器虚拟时钟：定时器只在 Advance 时到期，
+// 用例以推进驱动而不 sleep。未注入 = 真实时钟。
+func WithTimerClock(c *VirtualClock) Option {
+	return func(o *options) { o.clock = c }
 }

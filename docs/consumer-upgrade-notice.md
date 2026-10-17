@@ -1,9 +1,59 @@
-# rans_golang 消费方升级通知（v0.7.0 → v0.26.0 合并稿）
+# rans_golang 消费方升级通知（v0.7.0 → v0.28.0 合并稿）
 
 > 面向：wanju_agent_server 等所有 `github.com/cyinx/rans_golang` 消费方。
 > 用途：一次性转达 v0.7.0 起的全部消费方可见变更；逐版本细节以仓库
 > `CHANGELOG.md` 与 tag 注记为准。**尚未接入的消费方直接按 v0.22.0 接入，
 > 只需读「新接入」一节。**
+
+## v0.28.0 专项升级要点（每 Pawnite 定时器，可滚动升级）
+
+本版新增定时器原语并修好「续体内再让出」，无线协议/握手/键面变更，可逐节点
+滚动升级。升级后 `go get github.com/cyinx/rans_golang@v0.28.0` 并重跑 `make test`
+即可（生成物面未变，无需重跑 `go generate`）。
+
+**新 API**：`rans.AddTimer(ctx, d, fn) int64` / `rans.RemoveTimer(ctx, id) bool`。
+单实例待触发上限缺省 65536（≈9 MB）；万级/十万级用法在 `node.Config.Tuning.
+MaxTimers` 按节点抬高（超限 panic）。
+只在 loop 任务 ctx（Handle、续体、定时器回调）内可调用，其余 ctx 调用即 panic。
+回调在实体 loop 上串行执行、可 `ReenterAfter`，`d <= 0` 表示下一轮 loop。
+
+**迁移示例（三种用法）**：
+
+```go
+// ① 防抖：取消旧定时器再排新的（loop 串行，两步天然原子）
+if rt.flushID != 0 {
+    rans.RemoveTimer(ctx, rt.flushID)
+}
+rt.flushID = rans.AddTimer(ctx, flushDebounce, func(cctx context.Context) {
+    rt.flushID = 0
+    e.requestFlush(cctx)          // 回调里可以直接做落库 IO（work）或再让出
+})
+
+// ② 周期：回调内重排自己（每次拿新 ID；d 从重排时刻起算，不补跑）
+var tick func(context.Context)
+tick = func(cctx context.Context) {
+    doStep()
+    rt.tickID = rans.AddTimer(cctx, time.Second, tick)
+}
+rt.tickID = rans.AddTimer(ctx, time.Second, tick)
+
+// ③ 立即（替代「自投一条消息」）：d = 0，下一轮 loop 执行
+rt.flushID = rans.AddTimer(ctx, 0, func(cctx context.Context) { e.requestFlush(cctx) })
+```
+
+**两条必须注意的契约**：
+
+1. **ID 不入快照**：句柄只在进程内有效（不跨重启、不复用）。把 ID 放进实体状态时，
+   `Snapshot`/`Restore` 必须把它清零——恢复后旧 ID 没有意义。
+2. **定时器不保活、不迁移**：触发不计入闲置判定（周期 tick 不会让实体永不钝化），
+   钝化/迁移/销毁会丢弃未触发的定时器。需要跨实例存活的提醒语义请等 reminder。
+
+**迁移要点（原 `time.AfterFunc` + 自投消息形态）**：持有字段从定时器句柄换成
+`int64` ID；`Deactivate` 里的手工停表可以删除（终局由运行时统一清），但「停用后
+不再重排」的业务守卫要保留；若自投消息类型再无使用方，可随迁移删除。
+
+**行为修复（复核提示）**：续体内现在可以再 `ReenterAfter`（修复前必 panic）。
+若实现里以「then 内调用会 panic」作为防御假设，需要复核；正常调用不受影响。
 
 ## v0.26.0 专项升级要点（review14 修复批，滚动不兼容）
 

@@ -11,6 +11,7 @@ package testhooks
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/cyinx/rans_golang"
 )
@@ -32,4 +33,9 @@ type Hooks struct {
 	// 目录（testkit Kill 语义——目录由测试直接持有/断言，租约自然过期）。
 	// 对注入目录无效果（本就归调用方持有）。
 	CrashKeepsDir bool
+	// Now/NewTimer 定时器时钟注入（测试虚拟时钟；二者须同给，nil = 真实
+	// 时钟）。函数形态而非接口：接口跨包赋值要求方法签名逐字相同，函数类型
+	// 只依赖标准库即可经装配链直通。NewTimer 的 Stop/Reset 语义同 time.Timer。
+	Now      func() time.Time
+	NewTimer func(d time.Duration) (c <-chan time.Time, stop func() bool, reset func(d time.Duration) bool)
 }

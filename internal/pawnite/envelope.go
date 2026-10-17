@@ -51,6 +51,6 @@ func (p *Pawnite) HandleCtx(base context.Context, id rans.ID, form EnvelopeForm,
 	if _, has := ctx.Deadline(); !has && !deadline.IsZero() {
 		ctx, cancel = context.WithDeadline(ctx, deadline)
 	}
-	arm := p.NewReenterArm(ctx, armDetached)
-	return ctxkey.WithReenterPoint(ctx, arm), cancel, arm
+	ctx, arm := p.newLoopArm(ctx, armDetached)
+	return ctx, cancel, arm
 }

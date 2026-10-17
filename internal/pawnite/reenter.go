@@ -28,8 +28,25 @@ type ReenterArm struct {
 	works map[*workUnit]struct{}
 }
 
-func (p *Pawnite) NewReenterArm(hctx context.Context, detached bool) *ReenterArm {
-	return &ReenterArm{p: p, hctx: hctx, detached: detached, works: map[*workUnit]struct{}{}}
+// newLoopArm 构造 loop 内部任务的让出执行面，返回挂好 loop 点的 ctx。ctx 与
+// arm 互相引用（arm.hctx 是续体 ctx 的派生底），唯一正确构造序是：先建 arm →
+// 把带登记点的 ctx 记回 arm.hctx。两步走（先记裸 ctx 再挂点）会让续体 ctx 链
+// 上没有登记点、then 内再让出必 panic——把次序收进构造器即该缺陷的修复。
+func (p *Pawnite) newLoopArm(base context.Context, detached bool) (context.Context, *ReenterArm) {
+	arm := &ReenterArm{p: p, detached: detached, works: map[*workUnit]struct{}{}}
+	// 挂点而不遮挡延迟应答面：Handle ctx 的 DeferPoint 是本请求的应答面
+	//（遮挡它就是杀掉 rans.Defer）；任务侧的遮挡在 loopTaskCtx。
+	ctx := ctxkey.WithTimerPoint(ctxkey.WithReenterPoint(base, arm), p)
+	arm.hctx = ctx
+	return ctx, arm
+}
+
+// loopTaskCtx loop 内部任务 ctx 的统一派生点（续体与定时器回调共用）：遮蔽
+// 延迟应答面（任务没有可应答的请求——Defer 必 panic）、挂让出登记点与定时器点。
+func (p *Pawnite) loopTaskCtx(base context.Context, arm *ReenterArm) context.Context {
+	ctx := ctxkey.WithDeferPoint(base, nil)
+	ctx = ctxkey.WithReenterPoint(ctx, arm)
+	return ctxkey.WithTimerPoint(ctx, p)
 }
 
 // Reenter 实现 rans.ReenterArm：派生 wctx、登记在飞 work 并起专属 goroutine。
@@ -44,7 +61,9 @@ func (a *ReenterArm) Reenter(work func(ctx context.Context) (any, error), then f
 }
 
 // deriveWctx 派生 work ctx（继承规则正本见 rans.ReenterAfter godoc）：脱钩腿
-// 保留值链、重挂请求 deadline；两腿统一遮蔽自身身份并挂自有取消面。
+// 保留值链、重挂请求 deadline；两腿统一遮蔽自身身份并挂自有取消面。loop 点
+// （让出与定时器）同样剥掉：work 不在 loop 上，武装定时器会丢唤醒，嵌套让出
+// 也越过 godoc 的「work 不得再让出」纪律。
 func (a *ReenterArm) deriveWctx() (context.Context, context.CancelFunc) {
 	base := a.hctx
 	var deadlineCancel context.CancelFunc
@@ -54,7 +73,8 @@ func (a *ReenterArm) deriveWctx() (context.Context, context.CancelFunc) {
 			base, deadlineCancel = context.WithDeadline(base, dl)
 		}
 	}
-	wctx, cancel := context.WithCancel(ctxkey.WithoutSelf(base))
+	masked := ctxkey.WithReenterPoint(ctxkey.WithTimerPoint(ctxkey.WithoutSelf(base), nil), nil)
+	wctx, cancel := context.WithCancel(masked)
 	return wctx, func() {
 		cancel()
 		if deadlineCancel != nil {
@@ -63,18 +83,17 @@ func (a *ReenterArm) deriveWctx() (context.Context, context.CancelFunc) {
 	}
 }
 
-// thenCtx 派生续体 ctx（票 09；契约正本见 rans.ReenterAfter godoc 的 tctx
-// 规则节）：以 Handle ctx 值链为底脱钩其收尾 cancel、重挂原请求 deadline；
-// 无类型遮蔽延迟应答登记点（then 内 Defer 必 panic）；让出面经值链保持
-// （嵌套让出允许）。
+// thenCtx 派生续体 ctx（契约正本见 rans.ReenterAfter godoc 的 tctx 规则节）：
+// 以 Handle ctx 值链为底脱钩其收尾 cancel、重挂原请求 deadline；经 loop 任务
+// 派生点重挂让出登记点（then 内可再让出）与定时器点（then 内可再定时），并
+// 遮蔽延迟应答登记点（then 内 Defer 必 panic）。
 func (a *ReenterArm) thenCtx() (context.Context, context.CancelFunc) {
 	ctx := context.WithoutCancel(a.hctx)
 	var dcancel context.CancelFunc
 	if dl, ok := a.hctx.Deadline(); ok {
 		ctx, dcancel = context.WithDeadline(ctx, dl)
 	}
-	ctx = ctxkey.WithDeferPoint(ctx, nil)
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(a.p.loopTaskCtx(ctx, a))
 	return ctx, func() {
 		cancel()
 		if dcancel != nil {
@@ -182,22 +201,22 @@ func (p *Pawnite) popReenter() (func(), bool) {
 	return fn, true
 }
 
-// continuationUnit 续体执行的在途执行槽标记（executing 槽的续体形态）：
-// 续体无投递载体，登记只为统一「执行时钟非零 ⟹ 在途槽有绑」的不变量——
-// 看门狗强弃的解绑面（unbindExecuting）对标记的回绝无悬挂调用方可解，
-// no-op 即正确语义。
-type continuationUnit struct{ p *Pawnite }
+// loopTaskUnit loop 内部任务（续体、定时器回调）的在途执行槽标记（executing
+// 槽的循环任务形态）：任务无投递载体，登记只为统一「执行时钟非零 ⟹ 在途槽
+// 有绑」的不变量——看门狗强弃的解绑面（unbindExecuting）对标记的回绝无悬挂
+// 调用方可解，no-op 即正确语义。
+type loopTaskUnit struct{ p *Pawnite }
 
-func (u *continuationUnit) UUID() rans.ID                 { return u.p.id }
-func (u *continuationUnit) Deliver(*Pawnite)              {}
-func (u *continuationUnit) Reject(rans.Code, rans.Reason) {}
+func (u *loopTaskUnit) UUID() rans.ID                 { return u.p.id }
+func (u *loopTaskUnit) Deliver(*Pawnite)              {}
+func (u *loopTaskUnit) Reject(rans.Code, rans.Reason) {}
 
-// runContinuation 续体任务的 loop 执行段：计入活动纪元（脏门控由此覆盖续
-// 体写——捕获放行判据同源双空，见 activityQuiescedLocked）与执行停驻时钟
-// + 在途执行槽（then 回 loop 后重新计入执行看门狗；强弃解绑面统一）；
-// panic 监管与 invoke 同口径（Default 服役；Isolate 销毁）。
-func (p *Pawnite) runContinuation(fn func()) {
-	marker := InboundDelivery(&continuationUnit{p: p})
+// runLoopTask loop 内部任务的统一执行段：计入活动纪元（脏门控由此覆盖任务
+// 写——捕获放行判据同源双空，见 activityQuiescedLocked）与执行停驻时钟 +
+// 在途执行槽（任务执行段计入执行看门狗；强弃解绑面统一）；panic 监管与
+// invoke 同口径（Default 服役；Isolate 销毁）。label 只进日志。
+func (p *Pawnite) runLoopTask(label string, fn func()) {
+	marker := InboundDelivery(&loopTaskUnit{p: p})
 	p.executing.Store(&marker)
 	p.executingSinceNano.Store(time.Now().UnixNano())
 	p.activityEpoch.Add(1)
@@ -205,7 +224,7 @@ func (p *Pawnite) runContinuation(fn func()) {
 	defer p.executingSinceNano.Store(0)
 	defer func() {
 		if r := recover(); r != nil {
-			log.Warn("pawnite reenter continuation panicked",
+			log.Warn("pawnite "+label+" panicked",
 				"uuid", p.id.String(), "panic", r, "policy", p.opts.PanicPolicy)
 			if p.opts.PanicPolicy == PanicPolicyIsolate {
 				p.isolateAfterPanic()
@@ -214,6 +233,9 @@ func (p *Pawnite) runContinuation(fn func()) {
 	}()
 	fn()
 }
+
+// runContinuation 续体任务的 loop 执行段（语义见 runLoopTask）。
+func (p *Pawnite) runContinuation(fn func()) { p.runLoopTask("reenter continuation", fn) }
 
 // activityQuiescedLocked 静默判据（调用方必须已持 mu）：在飞 work 与续体
 // 队列双空——交接 core 与周期捕获放行的唯一依据。works 空而 reenterQ 非

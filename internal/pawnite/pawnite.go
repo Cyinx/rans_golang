@@ -111,6 +111,17 @@ type Pawnite struct {
 	executingSinceNano atomic.Int64                    // 执行停驻时钟（执行看门狗依据）：invoke 起置位、归零=空闲
 
 	lastDeliveryNano atomic.Int64 // 闲置时钟（规格 §4.1）：invoke 入口原子更新，零值=从未投递
+
+	// timersEver 定时器是否被武装过（只升不降）：loop 的定时器分支快路径——
+	// 从未武装过定时器的实体每轮不必取 mu 探查堆（这条快路径让「不用定时器
+	// 的实体」与引入本原语之前逐字节同开销）。
+	timersEver atomic.Bool
+
+	// 定时器（机制与不变量见 timers.go）：mu 保护的堆 + 只为堆顶武装的底层
+	// 定时器（loop 的 select 直接等它的通道，因此不产生 goroutine）。
+	timers    timerHeap   // mu：ID → 待触发定时器（最小堆）
+	armed     *timerArmed // mu：当前武装的底层定时器（nil = 无）
+	maxTimers int
 }
 
 func New(id rans.ID, opts Options) *Pawnite {
@@ -118,11 +129,20 @@ func New(id rans.ID, opts Options) *Pawnite {
 	if capv <= 0 {
 		capv = InboxDepthLimit
 	}
+	maxTimers := opts.MaxTimers
+	if maxTimers <= 0 {
+		maxTimers = DefaultMaxTimers
+	}
+	if opts.Now == nil || opts.NewTimer == nil {
+		opts.Now, opts.NewTimer = time.Now, realNewTimer // 时钟注入面须同给
+	}
 	p := &Pawnite{
 		id:        id,
 		opts:      opts,
 		selfHash:  id.Hash(),
 		inboxCap:  capv,
+		maxTimers: maxTimers,
+		timers:    timerHeap{byID: make(map[int64]*timerEntry)},
 		mailCh:    make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
@@ -268,10 +288,19 @@ func (p *Pawnite) run(ctx context.Context) {
 			p.stopShutdown(hookCtx)
 			return
 		}
+		// 定时器通道视图：武装过定时器才探查（从未武装的实体零额外开销），
+		// 其余每轮按堆顶与武装项的差异重排（O(1)）；窗内或空表为 nil——select
+		// 对 nil 通道永久阻塞，该分支自动禁用。
+		var timerC <-chan time.Time
+		if p.timersEver.Load() {
+			timerC = p.timerWait()
+		}
 		select {
 		case <-p.stop:
 			p.stopShutdown(hookCtx)
 			return
+		case <-timerC:
+			p.fireTimer()
 		case req := <-p.handoffCh:
 			// 交接核心即 loop 任务（规格 §13.1 A：串行即静默；§5.1 H6 泛化
 			// 为 Migrate/Passivate/Retire 共用骨架）。select 对 mailCh 与

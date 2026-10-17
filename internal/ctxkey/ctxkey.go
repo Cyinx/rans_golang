@@ -15,6 +15,7 @@ const (
 	keyCausal
 	keyDefer
 	keyReenter
+	keyTimer
 )
 
 // self 是身份载荷（kind/key 对，rans.ID 的存储形态——叶包不依赖 rans）。
@@ -124,6 +125,21 @@ func WithReenterPoint(ctx context.Context, arm any) context.Context {
 // ReenterPointFrom 读出 ctx 上的让出重入执行面；未注入返回 (nil, false)。
 func ReenterPointFrom(ctx context.Context) (any, bool) {
 	v := ctx.Value(keyReenter)
+	if v == nil {
+		return nil, false
+	}
+	return v, true
+}
+
+// WithTimerPoint 把定时器执行面挂进 loop 任务 ctx（Handle、续体、定时器回调
+// 三类；work ctx 显式遮蔽为 nil）。载荷不透明，类型化判读归 rans.AddTimer。
+func WithTimerPoint(ctx context.Context, timers any) context.Context {
+	return context.WithValue(ctx, keyTimer, timers)
+}
+
+// TimerPointFrom 读出 ctx 上的定时器执行面；未注入或被遮蔽返回 (nil, false)。
+func TimerPointFrom(ctx context.Context) (any, bool) {
+	v := ctx.Value(keyTimer)
 	if v == nil {
 		return nil, false
 	}
